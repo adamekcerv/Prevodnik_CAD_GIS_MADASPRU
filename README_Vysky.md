@@ -2,11 +2,34 @@
 
 Python toolbox pro ArcGIS Pro specializovaný na import a zpracování **výškových regulativů** z CAD dat.
 
-## 🎯 Účel
+## Workflow diagram
+
+```mermaid
+flowchart TD
+    A[CAD soubor] --> B[Import SC vrstev<br/>301110-301115]
+    A --> C[Import VR vrstev<br/>302210, 302211]
+    
+    B --> D[Merge všech SC<br/>do jedné vrstvy]
+    D --> E[Topologické čištění<br/>Integrate 30cm]
+    
+    C --> F[Snap VR na SC<br/>tolerance 30cm]
+    E --> F
+    
+    F --> G[Buffer SC<br/>30cm na každou stranu]
+    G --> H[Spatial Join<br/>VR atributy na buffer]
+    
+    H --> I[Kolmé řezné čáry<br/>z VR pozic]
+    I --> J[Rozdělení bufferů<br/>Feature to Polygon]
+    J --> K[PolygonToCenterline<br/>Foundation Extension]
+    K --> L[AlignFeatures<br/>srovnání s původními SC]
+    L --> M[PL_SC_centerline_LN<br/>finální výstup]
+```
+
+## Účel
 
 Tento převodník je určen pro zpracování **stavebních čar (SC)** a **výškových rozhraní (VR)** s automatickým vytváření centerline linií se zachováním atributů výšek.
 
-## 📥 Vstupní vrstvy (MADASPRU)
+## Vstupní vrstvy (MADASPRU)
 
 ### Stavební čáry (SC)
 - `301110_PL_SC_uzavrena`
@@ -20,7 +43,7 @@ Tento převodník je určen pro zpracování **stavebních čar (SC)** a **výš
 - `302210_BL_VR_na_linii` (kruhy)
 - `302211_PL_VR_na_linii_rozhrani` (linie rozhraní)
 
-## 🏗️ Proces zpracování
+## Proces zpracování
 
 1. **Export a merge** všech SC vrstev do jedné
 2. **Snap VR rozhraní** na SC linie (tolerance 30 cm)
@@ -35,7 +58,7 @@ Tento převodník je určen pro zpracování **stavebních čar (SC)** a **výš
 7. **PolygonToCenterline** → vytvoří finální centerline
 8. **AlignFeatures** → srovná geometrii s původními liniemi
 
-## 📊 Hlavní výstup
+## Hlavní výstup
 
 ### `PL_SC_centerline_LN`
 Finální centerline linie s atributy výšek:
@@ -45,13 +68,13 @@ Finální centerline linie s atributy výšek:
 - **NAZEV_BLOK_12**, **DOK_NAZEV_12**, **VYSKA_VB_D_12**
 - **OZNACENI_12**, **DRUH_UP_12**, **DRUH_INFO_12**, **PODTYP_12**
 
-## ⚙️ Požadavky
+## Požadavky
 
 - **ArcGIS Pro 2.8+**
 - **Foundation/Production Mapping extension** (pro PolygonToCenterline)
 - **S-JTSK souřadnicový systém** (EPSG:5514)
 
-## 🚀 Použití
+## Použití
 
 1. Přidejte toolbox do ArcGIS Pro
 2. Spusťte **"Import CAD vrstev (Výšky)"**

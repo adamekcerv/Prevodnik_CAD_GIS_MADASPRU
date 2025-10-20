@@ -2,9 +2,9 @@
 
 Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s automatickou analýzou. Sada obsahuje **dva specializované převodníky** pro různé účely v územním plánování.
 
-## 📋 Přehled toolboxů
+## Přehled toolboxů
 
-### 🏢 **1. Převodník Řešených území** (`Prevodnik_CAD_GIS_ReseneUzemi.pyt`)
+### **1. Převodník Řešených území** (`Prevodnik_CAD_GIS_ReseneUzemi.pyt`)
 **Účel:** Import a analýza hraničních území s kontrolou bodů
 
 **Hlavní funkce:**
@@ -22,7 +22,7 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 - **204110_BL_Cast_uzemi_NB** (Point) - body nadzemních budov
 - **205110_BL_Cast_uzemi_XB** (Point) - body ostatních objektů
 
-### 🏗️ **2. Převodník Výšek** (`Prevodnik_CAD_GIS_Vysky.pyt`)
+### **2. Převodník Výšek** (`Prevodnik_CAD_GIS_Vysky.pyt`)
 **Účel:** Import a zpracování výškových regulativů - stavební čáry a výškové rozhraní
 
 **Hlavní funkce:**
@@ -37,7 +37,7 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 - **302210_BL_VR_na_linii** (kruhy) - výškové rozhraní na linii
 - **302211_PL_VR_na_linii_rozhrani** (linie) - výškové rozhraní rozhraní
 
-## 🔧 Společné funkce obou převodníků
+## Společné funkce obou převodníků
 
 ### Automatické zpracování
 - **Validace názvů** - sanitizace speciálních znaků v názvech vrstev
@@ -45,11 +45,73 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 - **Souřadnicové systémy** - automatická detekce a reprojekce (default S-JTSK EPSG:5514)
 - **Geometrické tolerance** - XY tolerance 0.01m, XY resolution 0.001m
 
+## Workflow diagramy
+
+### Převodník Řešených území - proces zpracování
+
+```mermaid
+flowchart TD
+    A[CAD soubor<br/>DWG/DXF/DGN] --> B[Import do geodatabase]
+    B --> C{Detekce vrstev}
+    
+    C --> D[Polyline vrstvy<br/>101110_PL_Resene_uzemi<br/>200000_PL_Cast_uzemi]
+    C --> E[Point vrstvy<br/>101111_BL_Resene_uzemi<br/>202110_BL_Cast_uzemi_UP<br/>203110_BL_Cast_uzemi_SB<br/>204110_BL_Cast_uzemi_NB<br/>205110_BL_Cast_uzemi_XB]
+    
+    D --> F[Merge polylines]
+    F --> G[Feature to Polygon]
+    G --> H[Integrate<br/>tolerance 30cm]
+    H --> I[Polygony území]
+    
+    E --> J[Spatial Join<br/>body → polygony]
+    I --> J
+    J --> K[Analýza kvality bodů<br/>v pořádku / bez bodu / více bodů]
+    K --> L[Split podle Layer atributu]
+    L --> M[Výstupní vrstvy<br/>s hodnocením]
+    
+    I --> N[Snap původních linií<br/>tolerance 1m]
+    N --> O[Snapped polylines<br/>s atributy bodů]
+    
+    M --> P[Finální geodatabase<br/>s analyzovanými daty]
+    O --> P
+```
+
+### Převodník Výšek - proces zpracování
+
+```mermaid
+flowchart TD
+    A[CAD soubor<br/>DWG/DXF/DGN] --> B[Import do geodatabase]
+    B --> C{Detekce vrstev}
+    
+    C --> D[Stavební čáry SC<br/>301110_PL_SC_uzavrena<br/>301111_PL_SC_otevrent<br/>301112-301115_PL_SC_*]
+    C --> E[Výškové rozhraní VR<br/>302210_BL_VR_na_linii<br/>302211_PL_VR_na_linii_rozhrani]
+    
+    D --> F[Merge všech SC vrstev]
+    F --> G[Topologické čištění<br/>integrate tolerance 30cm]
+    G --> H[Spojené stavební čáry]
+    
+    E --> I[Snap VR na SC<br/>tolerance 0.5m]
+    H --> I
+    I --> J[Buffer SC<br/>0.5m na každou stranu]
+    J --> K[Spatial Join<br/>VR atributy → buffer]
+    
+    K --> L{Rozdělení bufferů}
+    L --> M[Vytvoření kolmých<br/>řezných čar z VR]
+    M --> N[Split bufferů<br/>podle řezných čar]
+    N --> O[Rozdělené buffery<br/>s VR atributy]
+    
+    O --> P[PolygonToCenterline<br/>Foundation Extension]
+    P --> Q[Středové čáry]
+    Q --> R[AlignFeatures<br/>srovnání s původními SC]
+    R --> S[PL_SC_centerline_LN<br/>finální výšková linie]
+    
+    S --> T[Geodatabase<br/>s výškovými regulativy]
+```
+
 ---
 
-## 📊 Výstupy dle převodníku
+## Výstupy dle převodníku
 
-### 🏢 **Řešená území - Výstupní vrstvy**
+### **Řešená území - Výstupní vrstvy**
 
 #### Polygonové vrstvy
 - **ZResene_uzemi_PL** - zaplněné polygony vytvořené z linií (veškeré části území)
@@ -68,7 +130,7 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 - **Z101110_PL_Resene_uzemi_LN** - původní linie řešeného území (zachované)
 - **Z200000_PL_Cast_uzemi_LN** - původní linie částí území (zachované)
 
-### 🏗️ **Výšky - Výstupní vrstvy**
+### **Výšky - Výstupní vrstvy**
 
 #### Hlavní výstup
 - **PL_SC_centerline_LN** - finální centerline s atributy výšek a geometricky srovnaná
@@ -81,7 +143,7 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 
 ---
 
-## 🎯 Hodnocení kvality dat
+## Hodnocení kvality dat
 
 ### Řešená území - Pole hodnocení
 
@@ -125,7 +187,7 @@ Převodník výšek zachovává specifické atributy výškových regulativů:
 
 ---
 
-## 🚀 Použití
+## Použití
 
 ### Výběr správného převodníku
 
@@ -231,7 +293,7 @@ CAD soubor → Načtení vrstev → Automatický výběr → Export a zpracován
 | uvnitř řešeného území | Polygon leží kompletně uvnitř hranic řešeného území |
 | mimo řešené území | Polygon leží mimo hranice řešeného území |
 
-## ⚙️ Konfigurace
+## Konfigurace
 
 ### Tolerance a rozlišení
 - **XY Tolerance**: 0.01 m (standardní nastavení)
@@ -256,7 +318,7 @@ Oba toolboxy automaticky detekují souřadnicový systém z CAD souboru. Pokud n
 
 ---
 
-## 🛠️ Řešení problémů
+## Řešení problémů
 
 ### Společné chyby
 
@@ -299,7 +361,7 @@ Oba toolboxy automaticky detekují souřadnicový systém z CAD souboru. Pokud n
 
 ---
 
-## 📋 Výstupní logy
+## Výstupní logy
 
 Oba toolboxy poskytují detailní informace v okně zpráv:
 
@@ -319,7 +381,7 @@ Oba toolboxy poskytují detailní informace v okně zpráv:
 
 ---
 
-## 💡 Výkonnost
+## Výkonnost
 
 ### Doporučená konfigurace pro optimální výkon:
 - Použijte **SSD disk** pro geodatabázi
