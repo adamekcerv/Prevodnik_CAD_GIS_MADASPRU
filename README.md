@@ -168,7 +168,7 @@ Převodník výšek zachovává specifické atributy výškových regulativů:
 - **NAZEV_BLOK_12**, **DOK_NAZEV_12**, **VYSKA_VB_D_12**
 - **OZNACENI_12**, **DRUH_UP_12**, **DRUH_INFO_12**, **PODTYP_12**
 
-## 📥 Instalace
+##  Instalace
 
 ### Požadavky
 - **ArcGIS Pro 2.8 nebo novější**
@@ -394,27 +394,7 @@ Oba toolboxy poskytují detailní informace v okně zpráv:
 
 ---
 
-## 🆕 Novinky v poslední verzi
 
-### Řešená území
-- Automatické splitování vrstev podle Layer atributu
-- Vytváření vrstev s problematickými prvky
-- Automatické mazání bodových vrstev po analýze
-- Detekce polygonů mimo řešené území
-- Normalizace názvů s prefixem Z
-
-### Výšky  
-- Pokročilé rozdělení bufferů pomocí kolmých řezných čar
-- Inteligentní align centerline s původními liniemi
-- Zachování specifických atributů výškových regulativů
-- Fallback strategie při chybách v pokročilých operacích
-- Detailní debugging informace
-
----
-
-## 📄 Licence
-
-MIT License
 
 ---
 **Poslední aktualizace**: Říjen 2025  
