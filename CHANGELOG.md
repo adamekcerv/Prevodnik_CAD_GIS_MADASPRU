@@ -1,11 +1,43 @@
 # Changelog
 
-Všechny významné změny v tomto projektu budou dokumentovány v tomto souboru.
+Všechny významné změny v CAD to GIS Import Toolbox projektu budou zdokumentovány v tomto souboru.
 
-Formát vychází z [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-a tento projekt dodržuje [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [2.0.0] - 2025-10-20
 
-## [Unreleased]
+### ✨ Přidáno
+- **Nový převodník výšek** (`Prevodnik_CAD_GIS_Vysky.pyt`)
+  - Specializovaný na stavební čáry (SC) a výškové rozhraní (VR)
+  - Pokročilé rozdělení bufferů pomocí kolmých řezných čar
+  - PolygonToCenterline funkce s Foundation extension
+  - AlignFeatures pro srovnání geometrie s původními liniemi
+  - Zachování specifických atributů výškových regulativů (VYSKA_VB_12, NP_MIN_12, atd.)
+
+### 🔄 Změněno
+- **Přejmenování původního převodníku** z `Prevodnik_CAD_GIS_Madaspru.pyt` na `Prevodnik_CAD_GIS_ReseneUzemi.pyt`
+- **Aktualizované toolbox labels** pro lepší rozlišení:
+  - "CAD Import Tools - Řešená území" (původní)
+  - "MADASPRU CAD Import - Výšky" (nový)
+- **Kompletně přepsaná dokumentace** s pokrytím obou převodníků
+- **Nová struktura README.md** s jasným rozdělením funkcionalit
+
+### 📁 Struktura souborů
+```
+Resene_uzemi/
+├── Prevodnik_CAD_GIS_ReseneUzemi.pyt    # Převodník řešených území
+├── Prevodnik_CAD_GIS_Vysky.pyt          # Převodník výšek  
+├── README.md                             # Kompletní dokumentace
+├── README_Vysky.md                       # Stručná dokumentace výšek
+├── TECHNICAL_DOCS.md                     # Technická dokumentace
+└── CHANGELOG.md                          # Historie změn
+```
+
+### 🛠️ Technické vylepšení
+- **Společná funkce `generate_unique_name()`** pro oba převodníky
+- **Rozšířené logování** s prefixováním zpráv
+- **Fallback strategie** pro pokročilé geometrické operace
+- **Foundation extension detection** s graceful degradation
+
+---
 
 ## [1.0.0] - 2025-09-01
 
@@ -43,7 +75,7 @@ a tento projekt dodržuje [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - **Resene_uzemi_Snapped** - liniová vrstva s atributy bodu Resene_uzemi
 - **Původní vrstvy** - všechny importované vrstvy zachovány pro referenci
 
-### Technické funkce
+### 🛠️ Technické funkce
 - **Automatická detekce souřadnicových systémů** z CAD souborů
 - **Podpora reprojekce** s možností transformace
 - **Vytváření Feature Datasetů** s custom tolerance a resolution
@@ -51,16 +83,28 @@ a tento projekt dodržuje [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - **Rozsáhlé logování** - detailní zprávy o průběhu zpracování
 - **Error handling** - robustní zacházení s chybami
 
-### Optimalizace
+### ⚡ Optimalizace
 - **In-memory workspace** pro dočasné operace
 - **Automatické čištění** dočasných dat
 - **Efektivní správa paměti**
 
-### Dokumentace
+### 📚 Dokumentace
 - 📖 **README.md** - kompletní uživatelská dokumentace
 - 🔧 **TECHNICAL_DOCS.md** - technická dokumentace
 - 📋 **Mermaid flowchart** - vizualizace workflow
 - 🐛 **Troubleshooting guide** - řešení běžných problémů
+
+---
+
+## Legenda typů změn
+- ✨ **Přidáno** - nové funkce
+- 🔄 **Změněno** - změny v existující funkcionalitě  
+- ❌ **Odstraněno** - odebrané funkce
+- 🐛 **Opraveno** - opravy chyb
+- 🛠️ **Technické** - technické vylepšení
+- 📁 **Struktura** - změny ve struktuře souborů
+- 📚 **Dokumentace** - aktualizace dokumentace
+- ⚡ **Optimalizace** - výkonnostní vylepšení
 
 ## [0.9.0] - 2025-08-30 (Pre-release)
 

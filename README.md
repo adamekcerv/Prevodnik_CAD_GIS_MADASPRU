@@ -1,18 +1,19 @@
-# CAD to GIS Import Toolbox
+# CAD to GIS Import Toolbox - Kompletní sada
 
-Python toolbox pro ArcGIS Pro určený pro import a zpracování CAD dat s automatickou analýzou řešených území.
+Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s automatickou analýzou. Sada obsahuje **dva specializované převodníky** pro různé účely v územním plánování.
 
-## Přehled
+## 📋 Přehled toolboxů
 
-Toolbox automatizuje import CAD souborů (DWG, DXF, DGN) do geodatabáze s automatickým zpracováním:
+### 🏢 **1. Převodník Řešených území** (`Prevodnik_CAD_GIS_ReseneUzemi.pyt`)
+**Účel:** Import a analýza hraničních území s kontrolou bodů
+
+**Hlavní funkce:**
 - Převod polyline vrstev do polygonů se geometrickým čištěním
-- Prostorová analýza bodových vrstev a jejich propojení s polygony
+- Prostorová analýza bodových vrstev a jejich propojení s polygony  
 - Automatické vyčištění geometrie s tolerancí 30 cm (integrate operace)
 - Vytváření samostatných vrstev dle typu vrstvy a detekce problematických prvků
 
-## Hlavní funkce
-
-### Automatické zpracování vrstev
+**Vstupní vrstvy:**
 - **101110_PL_Resene_uzemi** (Polyline) - hranice řešeného území
 - **200000_PL_Cast_uzemi** (Polyline) - hranice částí území
 - **101111_BL_Resene_uzemi** (Point) - kontrolní bod řešeného území
@@ -21,33 +22,150 @@ Toolbox automatizuje import CAD souborů (DWG, DXF, DGN) do geodatabáze s autom
 - **204110_BL_Cast_uzemi_NB** (Point) - body nadzemních budov
 - **205110_BL_Cast_uzemi_XB** (Point) - body ostatních objektů
 
-### Zpracování polygonů
-- Merge všech polyline vrstev s přichycením (snap) hran
-- Převod na polygony (Feature to Polygon)
-- Geometrické vyčištění (Integrate) s tolerancí 0.3 m
-- Vytvoření zaplněných polygonů z linií
+### 🏗️ **2. Převodník Výšek** (`Prevodnik_CAD_GIS_Vysky.pyt`)
+**Účel:** Import a zpracování výškových regulativů - stavební čáry a výškové rozhraní
 
-### Prostorová analýza
-- Spatial join bodů k polygonům
-- Automatické hodnocení kvality ("v pořádku", "bez bodu", "více bodů")
-- Detekce polygonů mimo řešené území (WITHIN analýza)
-- Vytvoření samostatných vrstev pro problematické prvky
+**Hlavní funkce:**
+- Merge stavebních čar (SC) s pokročilým topologickým čištěním
+- Snap výškových rozhraní (VR) na stavební čáry
+- Inteligentní rozdělení bufferů podle rozhraní pomocí kolmých řezných čar
+- Vytvoření centerline z bufferů s zachováním atributů
+- Geometrické srovnání (align) s původními liniemi
 
-## Instalace
+**Vstupní vrstvy:**
+- **301110_PL_SC_uzavrena** až **301115_PL_SC_jina_XX** - stavební čáry různých typů
+- **302210_BL_VR_na_linii** (kruhy) - výškové rozhraní na linii
+- **302211_PL_VR_na_linii_rozhrani** (linie) - výškové rozhraní rozhraní
+
+## 🔧 Společné funkce obou převodníků
+
+### Automatické zpracování
+- **Validace názvů** - sanitizace speciálních znaků v názvech vrstev
+- **Unikátní názvy** - automatické generování jedinečných názvů pro zamezení konfliktů
+- **Souřadnicové systémy** - automatická detekce a reprojekce (default S-JTSK EPSG:5514)
+- **Geometrické tolerance** - XY tolerance 0.01m, XY resolution 0.001m
+
+---
+
+## 📊 Výstupy dle převodníku
+
+### 🏢 **Řešená území - Výstupní vrstvy**
+
+#### Polygonové vrstvy
+- **ZResene_uzemi_PL** - zaplněné polygony vytvořené z linií (veškeré části území)
+- **Z202110_BL_Cast_uzemi_UP** - polygony filtrované podle Layer atributu
+- **Z203110_BL_Cast_uzemi_SB** - polygony filtrované podle Layer atributu
+- **Z204110_BL_Cast_uzemi_NB** - polygony filtrované podle Layer atributu
+- **Z205110_BL_Cast_uzemi_XB** - polygony filtrované podle Layer atributu
+- **ZResene_uzemi_Polygon_with_Points** - polygon řešeného území s analýzou bodu
+
+#### Vrstvy s problémovými prvky
+- **ZPolygony_bez_bodu** - polygony bez připojeného bodu (Join_Count = 0)
+- **ZPolygony_vice_bodu** - polygony s více připojenými body (Join_Count > 1)
+- **ZPolygony_mimo_uzemi** - polygony mimo hranice řešeného území
+
+#### Ostatní vrstvy
+- **Z101110_PL_Resene_uzemi_LN** - původní linie řešeného území (zachované)
+- **Z200000_PL_Cast_uzemi_LN** - původní linie částí území (zachované)
+
+### 🏗️ **Výšky - Výstupní vrstvy**
+
+#### Hlavní výstup
+- **PL_SC_centerline_LN** - finální centerline s atributy výšek a geometricky srovnaná
+
+#### Mezivýstupy (mohou být zachovány)
+- **PL_SC_all_LN** - sloučené stavební čáry před zpracováním
+- **PL_SC_final_buffer** - finální buffer se správným rozdělením podle rozhraní
+- **PL_302210_VR_circles_LN** - výškové kruhy (uzavřené linie)
+- **PL_SC_buffer_with_circles** - buffer s připojenými informacemi o kruzích
+
+---
+
+## 🎯 Hodnocení kvality dat
+
+### Řešená území - Pole hodnocení
+
+#### Pole "bod" - status bodů
+| Hodnota | Podmínka | Popis |
+|---------|----------|-------|
+| v pořádku | Join_Count = 1 | Prvek má přiřazen právě jeden bod |
+| bez bodu | Join_Count = 0 | Prvek nemá žádný připojený bod |
+| více bodů | Join_Count > 1 | Prvek má připojeno více bodů |
+
+#### Pole "pozice_resene_uzemi" - poloha vůči řešenému území
+| Hodnota | Popis |
+|---------|-------|
+| uvnitř řešeného území | Polygon leží kompletně uvnitř hranic řešeného území |
+| mimo řešené území | Polygon leží mimo hranice řešeného území |
+
+### Výšky - Zachované atributy
+Převodník výšek zachovává specifické atributy výškových regulativů:
+- **Layer**, **VYSKA_VB_12**, **VYSKA_VB_I_12** 
+- **NP_MIN_12**, **NP_MAX_12**, **NUP_MAX_12**
+- **RIMSA_MIN_12**, **RIMSA_MAX_12**, **VYSKA_MAX_12**
+- **NAZEV_BLOK_12**, **DOK_NAZEV_12**, **VYSKA_VB_D_12**
+- **OZNACENI_12**, **DRUH_UP_12**, **DRUH_INFO_12**, **PODTYP_12**
+
+## 📥 Instalace
 
 ### Požadavky
-- ArcGIS Pro 2.8 nebo novější
-- Python 3.x (součást ArcGIS Pro)
-- Licenční úroveň Standard nebo Advanced (pro některé funkce)
+- **ArcGIS Pro 2.8 nebo novější**
+- **Python 3.x** (součást ArcGIS Pro)
+- **Licenční úroveň Standard nebo Advanced** (pro některé funkce)
+- **Foundation/Production Mapping extension** (pouze pro převodník výšek - centerline funkce)
 
 ### Postup instalace
-1. Stáhněte soubor `Prevodnik_CAD_GIS_Madaspru.pyt`
+1. Stáhněte požadované soubory:
+   - `Prevodnik_CAD_GIS_ReseneUzemi.pyt` (pro řešená území)
+   - `Prevodnik_CAD_GIS_Vysky.pyt` (pro výšky)
 2. Zkopírujte do složky s vaším ArcGIS Pro projektem
-3. V ArcGIS Pro přidejte toolbox:
-   - Catalog Pane → Toolboxes → Add Toolbox
-   - Vyberte `Prevodnik_CAD_GIS_Madaspru.pyt`
+3. V ArcGIS Pro přidejte toolboxy:
+   - **Catalog Pane → Toolboxes → Add Toolbox**
+   - Vyberte požadovaný `.pyt` soubor
 
-## Použití
+---
+
+## 🚀 Použití
+
+### Výběr správného převodníku
+
+| Typ dat | Použijte převodník | Toolbox Label |
+|---------|-------------------|---------------|
+| Hranice území + kontrolní body | Řešená území | "CAD Import Tools - Řešená území" |
+| Stavební čáry + výškové rozhraní | Výšky | "MADASPRU CAD Import - Výšky" |
+
+### Základní workflow
+
+```
+CAD soubor → Výběr převodníku → Načtení vrstev → Automatický výběr → Export a zpracování → Výsledné vrstvy
+```
+
+### Společné parametry toolboxů
+
+| Parametr | Typ | Popis | Výchozí hodnota |
+|----------|-----|-------|-----------------|
+| Input CAD Soubor | DEFile | Cesta k CAD souboru (DWG, DXF, DGN) | - |
+| CAD Vrstva(y) | GPString | Vrstvy pro zpracování (automaticky předvolené) | Auto |
+| Output Geodatabáze | DEWorkspace | Cílová geodatabáze | Povinný |
+| Output Feature Dataset | GPString | Cílový feature dataset (volitelný) | - |
+| XY Tolerance | GPDouble | Tolerancia XY v metrech | 0.01 |
+| XY Resolution | GPDouble | Rozlišení XY v metrech | 0.001 |
+| Output Souřadnicový Systém | GPSpatialReference | Výstupní souřadnicový systém | Auto z CAD/S-JTSK |
+| Geographic Transformation | GPString | Transformace souřadnic (volitelná) | - |
+| Prefix jména výstupu | GPString | Prefix pro názvy výstupních vrstev | Z/PL_ |
+
+### Spuštění toolboxu
+
+1. Otevřete toolbox v ArcGIS Pro
+2. Spusťte příslušný tool:
+   - **"Import CAD do GIS (Řešená území)"**
+   - **"Import CAD vrstev (Výšky)"**
+3. Nastavte parametry:
+   - Vyberte CAD soubor
+   - Zvolte výstupní geodatabázi
+   - Volitelně nastavte feature dataset a další parametry
+4. Spusťte tool - vrstvy se automaticky předvyberou
+5. Ověřte výsledky v geodatabázi
 
 ### Základní workflow
 
@@ -113,42 +231,34 @@ CAD soubor → Načtení vrstev → Automatický výběr → Export a zpracován
 | uvnitř řešeného území | Polygon leží kompletně uvnitř hranic řešeného území |
 | mimo řešené území | Polygon leží mimo hranice řešeného území |
 
-## Konfigurace
+## ⚙️ Konfigurace
 
 ### Tolerance a rozlišení
 - **XY Tolerance**: 0.01 m (standardní nastavení)
 - **XY Resolution**: 0.001 m (milimetrová přesnost)
-- **Integrate Tolerance**: 0.3 m (vyčištění geometrie)
-- **Snap Tolerance**: 1.0 m (přichycení linií k polygonům)
+- **Integrate Tolerance**: 0.3 m (vyčištění geometrie - oba převodníky)
+- **Snap Tolerance**: 0.3-1.0 m (přichycení linií - dle převodníku)
 
 ### Souřadnicový systém
-Toolbox automaticky detekuje souřadnicový systém z CAD souboru. Pokud není dostupný, používá S-JTSK (EPSG:5514). Podporuje automatickou reprojekci při změně cílového systému.
+Oba toolboxy automaticky detekují souřadnicový systém z CAD souboru. Pokud není dostupný, používají **S-JTSK (EPSG:5514)**. Podporují automatickou reprojekci při změně cílového systému.
 
-## Základní postup
+### Specifické nastavení převodníků
 
-1. Příprava CAD souboru
-   - Zajistěte, že CAD obsahuje požadované vrstvy
-   - Ověřte souřadnicový systém v CAD souboru
+#### Řešená území
+- **Buffer tolerance**: 30 cm pro geometric cleaning
+- **Spatial join**: CONTAINS logika pro body k polygonům
+- **Within analysis**: WITHIN logika pro detekci pozice vůči řešenému území
 
-2. Spuštění toolboxu
-   - Otevřete ArcGIS Pro
-   - Přidejte toolbox: Catalog Pane → Add Toolbox
-   - Spusťte "Import CAD do GIS"
+#### Výšky  
+- **Foundation extension**: Potřebná pro PolygonToCenterline operaci
+- **Cutting lines**: Kolmé řezné čáry automaticky generované v místech rozhraní
+- **Align distance**: 2.0 m pro srovnání geometrie centerline s původními liniemi
 
-3. Nastavení parametrů
-   - Vyberte CAD soubor
-   - Zvolte cílovou geodatabázi
-   - Volitelně nastavte feature dataset a jiné parametry
-   - Zkontrolujte automaticky předvolené vrstvy
+---
 
-4. Spuštění procesu
-   - Klikněte Run
-   - Sledujte průběh v Progress panelu
-   - Ověřte výsledky v Catalog panelu
+## 🛠️ Řešení problémů
 
-## Řešení problémů
-
-### Chyby při spuštění
+### Společné chyby
 
 **"ERROR 000732: Target Workspace: Dataset does not exist"**
 - Zkontrolujte cestu k geodatabázi
@@ -163,33 +273,87 @@ Toolbox automaticky detekuje souřadnicový systém z CAD souboru. Pokud není d
 - Zkontrolujte, že vrstvy obsahují data
 - Ověřte souřadnicový systém
 
-### Výstupní logy
-Toolbox poskytuje detailní informace v okně zpráv:
-- [export] - informace o exportu jednotlivých vrstev
-- [process_polylines_to_polygon] - zpracování polyline vrstev
-- [perform_spatial_join_analysis] - výsledky prostorové analýzy
-- [split_analysis_by_layer] - rozdělení vrstev podle atributu
-- [add_within_analysis] - analýza polohy vůči řešenému území
+### Specifické problémy dle převodníku
 
-## Výkonnost
+#### Řešená území
+**"Žádné polygony s body rozhraní"**
+- Zkontrolujte, zda CAD obsahuje správné bodové vrstvy
+- Ověřte spatial reference bodů a polygonů
 
-Doporučená konfigurace pro optimální výkon:
-- Použijte SSD disk pro geodatabázi
+**"Chyba při within analýze"**
+- Zkontrolujte, zda hlavní polygon řešeného území je platný
+- Ověřte topologii polygonových dat
+
+#### Výšky
+**"Foundation/Production Mapping extension není dostupná"**
+- Centerline funkce vyžaduje Foundation nebo Production Mapping extension
+- Bez této licence se vytvoří pouze buffery, ne centerline
+
+**"Chyba při rozdělování bufferu kolmicemi"**
+- Použije se fallback strategie s buffer-erase logikou
+- Zkontrolujte, zda jsou průsečíky správně detekované
+
+**"Původní SC linie nebyly nalezeny pro align"**
+- Geometrie centerline zůstane z PolygonToCenterline (může být zaoblená)
+- Zkontrolujte, zda se merge SC vrstev provedl úspěšně
+
+---
+
+## 📋 Výstupní logy
+
+Oba toolboxy poskytují detailní informace v okně zpráv:
+
+### Řešená území
+- **[export]** - informace o exportu jednotlivých vrstev
+- **[process_polylines_to_polygon]** - zpracování polyline vrstev
+- **[perform_spatial_join_analysis]** - výsledky prostorové analýzy
+- **[split_analysis_by_layer]** - rozdělení vrstev podle atributu
+- **[add_within_analysis]** - analýza polohy vůči řešenému území
+
+### Výšky
+- **[export]** - informace o exportu SC a VR vrstev
+- **SC linie snapped**, **Buffer vytvořen** - geometrické operace
+- **Kolmých řezných čar vytvořeno** - rozdělení bufferu
+- **Centerline vytvořena**, **Atributy připojeny** - finální zpracování
+- **Geometrie srovnána** - align s původními liniemi
+
+---
+
+## 💡 Výkonnost
+
+### Doporučená konfigurace pro optimální výkon:
+- Použijte **SSD disk** pro geodatabázi
 - Minimalizujte ostatní procesy během zpracování
-- Pro CAD soubory > 100 MB zvažte rozdělení na menší části
-- Typicky trvá zpracování 2-10 minut dle rozsahu dat
+- Pro CAD soubory **> 100 MB** zvažte rozdělení na menší části
 
-## Novinky v poslední verzi
+### Typické časy zpracování:
+- **Řešená území**: 3-15 minut dle počtu polygonů a bodů
+- **Výšky**: 5-25 minut dle složitosti SC sítě a počtu rozhraní
 
+---
+
+## 🆕 Novinky v poslední verzi
+
+### Řešená území
 - Automatické splitování vrstev podle Layer atributu
 - Vytváření vrstev s problematickými prvky
 - Automatické mazání bodových vrstev po analýze
 - Detekce polygonů mimo řešené území
 - Normalizace názvů s prefixem Z
 
-## Licence
+### Výšky  
+- Pokročilé rozdělení bufferů pomocí kolmých řezných čar
+- Inteligentní align centerline s původními liniemi
+- Zachování specifických atributů výškových regulativů
+- Fallback strategie při chybách v pokročilých operacích
+- Detailní debugging informace
+
+---
+
+## 📄 Licence
 
 MIT License
 
 ---
-Poslední aktualizace: Říjen 2025
+**Poslední aktualizace**: Říjen 2025  
+**Verze**: 2.0 (Kompletní sada - Řešená území + Výšky)
