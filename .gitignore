@@ -1,0 +1,81 @@
+# ArcGIS Pro files
+*.aprx.bak
+*.tbx.bak
+*.pyt.xml
+*.Tool.pyt.xml
+*.atbx
+ImportLog/
+GpMessages/
+
+# Geodatabase files
+*.gdb/
+*.sde
+*.mdb
+scratch.gdb/
+
+# CAD files (exclude from repo if large)
+*.dwg
+*.dxf
+*.dgn
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Backup files
+*.bak
+*.backup
+
+# Lock files
+*.lock
+*.sr.lock
