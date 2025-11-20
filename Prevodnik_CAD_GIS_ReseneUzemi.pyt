@@ -396,12 +396,20 @@ class CadFile(object):
                     if split_results:
                         exported_layers.extend(split_results)
                     
-                    # Extrakce problematických polygonů (bez bodu, více bodů, mimo řešené území)
-                    problem_results = self.extract_problem_polygons(
+                    # Vytvoření chybových polygonů (sloučené polygony s chybami)
+                    # 1. Chybový polygon pro špatné body (bez bodu nebo více bodů)
+                    error_bod_fc = self.create_error_polygon_bod(
                         main_analysis_fc, output_workspace, out_prefix
                     )
-                    if problem_results:
-                        exported_layers.extend(problem_results)
+                    if error_bod_fc:
+                        exported_layers.append(error_bod_fc)
+                    
+                    # 2. Chybový polygon pro polygony mimo řešené území
+                    error_resene_uzemi_fc = self.create_error_polygon_resene_uzemi(
+                        main_analysis_fc, output_workspace, out_prefix
+                    )
+                    if error_resene_uzemi_fc:
+                        exported_layers.append(error_resene_uzemi_fc)
                     
                     # Smazat původní vrstvu s body (nahrazena split výsledky)
                     try:
@@ -966,6 +974,10 @@ class CadFile(object):
                     )
                     
                     count = arcpy.GetCount_management(final_fc).getOutput(0)
+                    
+                    # Filtrovat atributy - ponechat pouze požadované
+                    self.keep_only_required_fields(final_fc)
+                    
                     split_results.append(final_fc)
                     arcpy.AddMessage(f"[split_analysis_by_layer] Vytvořena vrstva: {split_fc_name} ({count} prvků)")
                     
@@ -979,17 +991,58 @@ class CadFile(object):
         
         return split_results
 
-    def extract_problem_polygons(self, analysis_fc, output_workspace, out_prefix):
+    def keep_only_required_fields(self, feature_class):
         """
-        Extrahuje polygony s problémy:
-        1. Bez bodu (Join_Count = 0)
-        2. Více bodů (Join_Count > 1)
-        3. Mimo řešené území (pozice_resene_uzemi = "mimo")
-        Vrátí seznam vytvořených vrstev.
+        Ponechá pouze požadované atributy ve feature class.
+        Všechny ostatní atributy budou odstraněny.
         """
-        arcpy.AddMessage("[extract_problem_polygons] Začínám extrakci problematických polygonů.")
+        arcpy.AddMessage(f"[keep_only_required_fields] Filtruji atributy v: {os.path.basename(feature_class)}")
         
-        problem_results = []
+        # Seznam požadovaných atributů
+        required_fields = [
+            "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
+            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
+            "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D",
+            "bod", "pozice_resene_uzemi"
+        ]
+        
+        try:
+            # Získání seznamu všech polí
+            all_fields = arcpy.ListFields(feature_class)
+            
+            # Systémová pole, která nesmíme smazat
+            system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE"]
+            
+            # Pole ke smazání
+            fields_to_delete = []
+            
+            for field in all_fields:
+                # Přeskočit systémová pole a požadované pole
+                if field.name.upper() in [f.upper() for f in system_fields]:
+                    continue
+                if field.name in required_fields:
+                    continue
+                
+                # Pole není v požadovaných - smazat
+                if not field.required:  # Pouze pokud není povinné
+                    fields_to_delete.append(field.name)
+            
+            # Smazání nepotřebných polí
+            if fields_to_delete:
+                arcpy.AddMessage(f"[keep_only_required_fields] Mažu {len(fields_to_delete)} nepotřebných polí")
+                arcpy.management.DeleteField(feature_class, fields_to_delete)
+            else:
+                arcpy.AddMessage(f"[keep_only_required_fields] Žádná pole ke smazání")
+                
+        except Exception as e:
+            arcpy.AddWarning(f"[keep_only_required_fields] Chyba při filtrování polí: {e}")
+
+    def create_error_polygon_bod(self, analysis_fc, output_workspace, out_prefix):
+        """
+        Vytvoří sloučený polygon ze všech polygonů, kde pole 'bod' != "v pořádku".
+        Vrátí cestu k vytvořenému feature class nebo None.
+        """
+        arcpy.AddMessage("[create_error_polygon_bod] Vytvářím chybový polygon pro špatné body.")
         
         try:
             # Získání kořenové geodatabáze pro kontrolu jedinečnosti názvů
@@ -999,76 +1052,127 @@ class CadFile(object):
             else:
                 root_gdb = output_workspace
             
-            # 1. Polygony bez bodu (Join_Count = 0)
-            without_point_name = f"{out_prefix}Polygony_bez_bodu" if out_prefix else "Polygony_bez_bodu"
-            without_point_fc = os.path.join(output_workspace, generate_unique_fc_name(without_point_name, root_gdb))
+            # Kontrola, zda existuje pole 'bod'
+            field_list = [f.name for f in arcpy.ListFields(analysis_fc)]
+            if "bod" not in field_list:
+                arcpy.AddWarning("[create_error_polygon_bod] Pole 'bod' neexistuje - přeskakuji")
+                return None
             
-            arcpy.AddMessage("[extract_problem_polygons] 1. Extrahuji polygony bez bodu (Join_Count = 0)")
+            # Vytvoření dočasné vrstvy s chybnými polygony
+            temp_error = "in_memory\\temp_error_bod"
+            
+            # Where clause pro výběr polygonů s chybou
+            where_clause = "bod <> 'v pořádku'"
+            
+            arcpy.AddMessage(f"[create_error_polygon_bod] Vybírám polygony s podmínkou: {where_clause}")
             arcpy.analysis.Select(
                 in_features=analysis_fc,
-                out_feature_class=without_point_fc,
-                where_clause="Join_Count = 0"
+                out_feature_class=temp_error,
+                where_clause=where_clause
             )
             
-            without_point_count = arcpy.GetCount_management(without_point_fc).getOutput(0)
-            if int(without_point_count) > 0:
-                problem_results.append(without_point_fc)
-                arcpy.AddMessage(f"[extract_problem_polygons] Vytvořena vrstva: {os.path.basename(without_point_fc)} ({without_point_count} polygonů)")
-            else:
-                arcpy.Delete_management(without_point_fc)
-                arcpy.AddMessage("[extract_problem_polygons] Žádné polygony bez bodu")
+            # Kontrola počtu vybraných prvků
+            error_count = int(arcpy.GetCount_management(temp_error).getOutput(0))
             
-            # 2. Polygony s více body (Join_Count > 1)
-            multiple_points_name = f"{out_prefix}Polygony_vice_bodu" if out_prefix else "Polygony_vice_bodu"
-            multiple_points_fc = os.path.join(output_workspace, generate_unique_fc_name(multiple_points_name, root_gdb))
+            if error_count == 0:
+                arcpy.AddMessage("[create_error_polygon_bod] Žádné polygony s chybou bodu - přeskakuji")
+                arcpy.Delete_management(temp_error)
+                return None
             
-            arcpy.AddMessage("[extract_problem_polygons] 2. Extrahuji polygony s více body (Join_Count > 1)")
-            arcpy.analysis.Select(
-                in_features=analysis_fc,
-                out_feature_class=multiple_points_fc,
-                where_clause="Join_Count > 1"
+            arcpy.AddMessage(f"[create_error_polygon_bod] Nalezeno {error_count} polygonů s chybou bodu")
+            
+            # Dissolve (sloučení) všech chybových polygonů do jednoho
+            error_fc_name = f"{out_prefix}chyba_bod" if out_prefix else "chyba_bod"
+            error_fc = os.path.join(output_workspace, generate_unique_fc_name(error_fc_name, root_gdb))
+            
+            arcpy.AddMessage(f"[create_error_polygon_bod] Provádím dissolve do: {error_fc_name}")
+            arcpy.management.Dissolve(
+                in_features=temp_error,
+                out_feature_class=error_fc,
+                dissolve_field=[],  # Sloučit vše do jednoho polygonu
+                multi_part="MULTI_PART"
             )
             
-            multiple_points_count = arcpy.GetCount_management(multiple_points_fc).getOutput(0)
-            if int(multiple_points_count) > 0:
-                problem_results.append(multiple_points_fc)
-                arcpy.AddMessage(f"[extract_problem_polygons] Vytvořena vrstva: {os.path.basename(multiple_points_fc)} ({multiple_points_count} polygonů)")
-            else:
-                arcpy.Delete_management(multiple_points_fc)
-                arcpy.AddMessage("[extract_problem_polygons] Žádné polygony s více body")
+            # Vyčištění dočasných dat
+            arcpy.Delete_management(temp_error)
             
-            # 3. Polygony mimo řešené území (pokud pole existuje)
-            try:
-                field_list = [f.name for f in arcpy.ListFields(analysis_fc)]
-                if "pozice_resene_uzemi" in field_list:
-                    outside_territory_name = f"{out_prefix}Polygony_mimo_uzemi" if out_prefix else "Polygony_mimo_uzemi"
-                    outside_territory_fc = os.path.join(output_workspace, generate_unique_fc_name(outside_territory_name, root_gdb))
-                    
-                    arcpy.AddMessage("[extract_problem_polygons] 3. Extrahuji polygony mimo řešené území")
-                    arcpy.analysis.Select(
-                        in_features=analysis_fc,
-                        out_feature_class=outside_territory_fc,
-                        where_clause="pozice_resene_uzemi = 'mimo řešené území'"
-                    )
-                    
-                    outside_territory_count = arcpy.GetCount_management(outside_territory_fc).getOutput(0)
-                    if int(outside_territory_count) > 0:
-                        problem_results.append(outside_territory_fc)
-                        arcpy.AddMessage(f"[extract_problem_polygons] Vytvořena vrstva: {os.path.basename(outside_territory_fc)} ({outside_territory_count} polygonů)")
-                    else:
-                        arcpy.Delete_management(outside_territory_fc)
-                        arcpy.AddMessage("[extract_problem_polygons] Žádné polygony mimo řešené území")
-                else:
-                    arcpy.AddMessage("[extract_problem_polygons] Pole 'pozice_resene_uzemi' není v tabulce - skip")
-            except Exception as e:
-                arcpy.AddWarning(f"[extract_problem_polygons] Nelze extrahovat polygony mimo území: {e}")
+            dissolved_count = int(arcpy.GetCount_management(error_fc).getOutput(0))
+            arcpy.AddMessage(f"[create_error_polygon_bod] Vytvořen chybový polygon: {os.path.basename(error_fc)} ({dissolved_count} částí)")
             
-            arcpy.AddMessage(f"[extract_problem_polygons] Extrakce problematických polygonů dokončena - vytvořeno {len(problem_results)} vrstev")
+            return error_fc
             
         except Exception as e:
-            arcpy.AddError(f"[extract_problem_polygons] Chyba při extrakci: {e}")
+            arcpy.AddError(f"[create_error_polygon_bod] Chyba při vytváření chybového polygonu: {e}")
+            return None
+
+    def create_error_polygon_resene_uzemi(self, analysis_fc, output_workspace, out_prefix):
+        """
+        Vytvoří sloučený polygon ze všech polygonů, kde 'pozice_resene_uzemi' = "mimo řešené území".
+        Vrátí cestu k vytvořenému feature class nebo None.
+        """
+        arcpy.AddMessage("[create_error_polygon_resene_uzemi] Vytvářím chybový polygon pro polygony mimo řešené území.")
         
-        return problem_results
+        try:
+            # Získání kořenové geodatabáze pro kontrolu jedinečnosti názvů
+            desc_ws = arcpy.Describe(output_workspace)
+            if desc_ws.datatype == "FeatureDataset":
+                root_gdb = os.path.dirname(output_workspace)
+            else:
+                root_gdb = output_workspace
+            
+            # Kontrola, zda existuje pole 'pozice_resene_uzemi'
+            field_list = [f.name for f in arcpy.ListFields(analysis_fc)]
+            if "pozice_resene_uzemi" not in field_list:
+                arcpy.AddWarning("[create_error_polygon_resene_uzemi] Pole 'pozice_resene_uzemi' neexistuje - přeskakuji")
+                return None
+            
+            # Vytvoření dočasné vrstvy s chybnými polygony
+            temp_error = "in_memory\\temp_error_resene_uzemi"
+            
+            # Where clause pro výběr polygonů mimo území
+            where_clause = "pozice_resene_uzemi = 'mimo řešené území'"
+            
+            arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Vybírám polygony s podmínkou: {where_clause}")
+            arcpy.analysis.Select(
+                in_features=analysis_fc,
+                out_feature_class=temp_error,
+                where_clause=where_clause
+            )
+            
+            # Kontrola počtu vybraných prvků
+            error_count = int(arcpy.GetCount_management(temp_error).getOutput(0))
+            
+            if error_count == 0:
+                arcpy.AddMessage("[create_error_polygon_resene_uzemi] Žádné polygony mimo řešené území - přeskakuji")
+                arcpy.Delete_management(temp_error)
+                return None
+            
+            arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Nalezeno {error_count} polygonů mimo řešené území")
+            
+            # Dissolve (sloučení) všech chybových polygonů do jednoho
+            error_fc_name = f"{out_prefix}chyba_resene_uzemi" if out_prefix else "chyba_resene_uzemi"
+            error_fc = os.path.join(output_workspace, generate_unique_fc_name(error_fc_name, root_gdb))
+            
+            arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Provádím dissolve do: {error_fc_name}")
+            arcpy.management.Dissolve(
+                in_features=temp_error,
+                out_feature_class=error_fc,
+                dissolve_field=[],  # Sloučit vše do jednoho polygonu
+                multi_part="MULTI_PART"
+            )
+            
+            # Vyčištění dočasných dat
+            arcpy.Delete_management(temp_error)
+            
+            dissolved_count = int(arcpy.GetCount_management(error_fc).getOutput(0))
+            arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Vytvořen chybový polygon: {os.path.basename(error_fc)} ({dissolved_count} částí)")
+            
+            return error_fc
+            
+        except Exception as e:
+            arcpy.AddError(f"[create_error_polygon_resene_uzemi] Chyba při vytváření chybového polygonu: {e}")
+            return None
+
 
 
 class Toolbox(object):
