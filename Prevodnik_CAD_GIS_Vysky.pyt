@@ -951,14 +951,49 @@ class SimpleCADImport(object):
                             arcpy.AddMessage(f"✓ Všechny atributy byly připojeny do centerline")
                             arcpy.AddMessage(f"Celkem polí v centerline: {len(centerline_fields)}")
                             
+                            # DEBUG - zkontroluj která pole mají data
+                            arcpy.AddMessage("DEBUG: Kontrola polí s daty...")
+                            fields_with_data = []
+                            fields_without_data = []
+                            
+                            with arcpy.da.SearchCursor(centerline_fc, centerline_fields) as cursor:
+                                row = next(cursor, None)  # První řádek
+                                if row:
+                                    for i, field_name in enumerate(centerline_fields):
+                                        if row[i] is not None and row[i] != '':
+                                            fields_with_data.append(field_name)
+                                        else:
+                                            fields_without_data.append(field_name)
+                            
+                            arcpy.AddMessage(f"DEBUG: Pole s daty ({len(fields_with_data)}): {', '.join(fields_with_data[:30])}")  # Prvních 30
+                            if len(fields_with_data) > 30:
+                                arcpy.AddMessage(f"DEBUG: ... a dalších {len(fields_with_data) - 30} polí")
+                            
                             # PONECHÁNÍ POUZE POŽADOVANÝCH POLÍ
-                            # Seznam polí která chceme zachovat
+                            # Zachováme:
+                            # 1. Layer - identifikace původní vrstvy
+                            # 2. Pole z kruhů (Join_Count a ostatní z circles) - typicky mají suffix podle toho kolikrát se joinovalo
+                            # 3. CAD atributy které obsahují výškové informace
+                            
+                            # Začneme se základními CAD poli a Layer
                             keep_fields = [
-                                "Layer", "VYSKA_VB_12", "VYSKA_VB_I_12", "NP_MIN_12", "NP_MAX_12", 
-                                "NUP_MAX_12", "RIMSA_MIN_12", "RIMSA_MAX_12", "VYSKA_MAX_12", 
-                                "NAZEV_BLOK_12", "DOK_NAZEV_12", "VYSKA_VB_D_12", "OZNACENI_12", 
-                                "DRUH_UP_12", "DRUH_INFO_12", "PODTYP_12"
+                                "Layer",  # Identifikace vrstvy
+                                "Join_Count",  # Počet kruhů které se protínají
+                                # CAD atributy z circles (mohou mít různé suffixy _1, _12 atd.)
+                                "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
+                                "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
+                                "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
                             ]
+                            
+                            # Přidej všechny varianty s různými suffixy (_1, _12, atd.)
+                            expanded_keep_fields = set(keep_fields)
+                            for field in centerline_fields:
+                                for base_field in keep_fields:
+                                    if field.startswith(base_field):
+                                        expanded_keep_fields.add(field)
+                            
+                            keep_fields = list(expanded_keep_fields)
+                            arcpy.AddMessage(f"DEBUG: Pole k zachování: {', '.join(sorted(keep_fields))}")
                             
                             # Najdi pole ke smazání (všechna kromě keep_fields a povinných systémových)
                             all_fields = arcpy.ListFields(centerline_fc)
@@ -1052,5 +1087,105 @@ class SimpleCADImport(object):
             if not circles_fc:
                 arcpy.AddMessage("Vrstva kruhů nebyla nalezena - spatial join se neprovede")
 
+        # FINÁLNÍ SPLIT A CLEANUP - na úplném konci po všech operacích
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage("FINÁLNÍ ZPRACOVÁNÍ")
+        arcpy.AddMessage("=" * 60)
+        
+        # Najdi centerline vrstvu
+        arcpy.env.workspace = output_workspace
+        centerline_fcs = arcpy.ListFeatureClasses("*centerline*")
+        
+        if centerline_fcs:
+            centerline_fc = os.path.join(output_workspace, centerline_fcs[0])
+            arcpy.AddMessage(f"Nalezena centerline vrstva: {centerline_fcs[0]}")
+            
+            try:
+                # SPLIT BY ATTRIBUTES - rozdělení centerline podle Layer pole
+                arcpy.AddMessage("Rozdělování centerline podle atributu 'Layer'...")
+                
+                # Zkontroluj zda existuje pole Layer
+                centerline_fields = [field.name for field in arcpy.ListFields(centerline_fc)]
+                
+                if "Layer" in centerline_fields:
+                    # Vytvoř pomocné pole s prefixem Z pro validní názvy
+                    temp_field = "Layer_Z"
+                    arcpy.AddField_management(centerline_fc, temp_field, "TEXT", field_length=100)
+                    
+                    # Zkopíruj Layer s prefixem Z a použij generate_unique_name pro unikátnost
+                    unique_layer_names = {}
+                    with arcpy.da.UpdateCursor(centerline_fc, ["Layer", temp_field]) as cursor:
+                        for row in cursor:
+                            if row[0]:
+                                base_name = f"Z{row[0]}"
+                                # Pokud ještě nemáme unikátní název pro tento Layer, vytvoř ho
+                                if base_name not in unique_layer_names:
+                                    unique_layer_names[base_name] = generate_unique_name(output_gdb, base_name)
+                                row[1] = unique_layer_names[base_name]
+                                cursor.updateRow(row)
+                    
+                    arcpy.AddMessage("Vytvořeno pomocné pole Layer_Z s unikátními názvy")
+                    
+                    # Split by Layer_Z attribute
+                    arcpy.analysis.SplitByAttributes(
+                        Input_Table=centerline_fc,
+                        Target_Workspace=output_workspace,
+                        Split_Fields=[temp_field]
+                    )
+                    
+                    arcpy.AddMessage("✓ Centerline rozdělena podle atributu 'Layer_Z'")
+                    
+                    # DEBUG - výpis všech feature classes PŘED mazáním
+                    arcpy.env.workspace = output_workspace
+                    all_fcs_before = arcpy.ListFeatureClasses()
+                    arcpy.AddMessage(f"DEBUG: Celkem feature classes před cleanup: {len(all_fcs_before)}")
+                    arcpy.AddMessage(f"DEBUG: Seznam všech FC: {', '.join(sorted(all_fcs_before))}")
+                    
+                    # CLEANUP - smazání všech podpůrných vrstev
+                    arcpy.AddMessage("Mažu podpůrné vrstvy...")
+                    
+                    # Seznam všech feature classes v output workspace
+                    arcpy.env.workspace = output_workspace
+                    all_fcs = arcpy.ListFeatureClasses()
+                    
+                    deleted_count = 0
+                    kept_count = 0
+                    for fc in all_fcs:
+                        fc_path = os.path.join(output_workspace, fc)
+                        
+                        # Smaž všechny kromě těch které vznikly splitováním
+                        # Split vytváří názvy přímo podle hodnoty v poli Layer_Z
+                        # Zachováme pouze fc které začínají "Z" (výsledky split s naším prefixem)
+                        if not fc.startswith("Z"):
+                            try:
+                                arcpy.Delete_management(fc_path)
+                                deleted_count += 1
+                                arcpy.AddMessage(f"  Smazáno: {fc}")
+                            except Exception as del_error:
+                                arcpy.AddWarning(f"Nepodařilo se smazat {fc}: {del_error}")
+                        else:
+                            kept_count += 1
+                            arcpy.AddMessage(f"  Zachováno: {fc}")
+                    
+                    arcpy.AddMessage(f"✓ Smazáno {deleted_count} podpůrných vrstev")
+                    arcpy.AddMessage(f"✓ Zachováno {kept_count} výsledných vrstev")
+                    
+                    # Výpis finálních vrstev
+                    arcpy.env.workspace = output_workspace
+                    final_fcs = arcpy.ListFeatureClasses("Z*")
+                    arcpy.AddMessage(f"✓ Finální výstup: {len(final_fcs)} vrstev rozdělených podle 'Layer':")
+                    for final_fc in sorted(final_fcs):
+                        count = int(arcpy.GetCount_management(os.path.join(output_workspace, final_fc))[0])
+                        arcpy.AddMessage(f"  - {final_fc}: {count} prvků")
+                    
+                else:
+                    arcpy.AddWarning("Pole 'Layer' nebylo nalezeno v centerline - split se neprovede")
+                    arcpy.AddMessage("Dostupná pole: " + ", ".join(centerline_fields))
+                    
+            except Exception as split_error:
+                arcpy.AddWarning(f"Chyba při finálním split a cleanup: {split_error}")
+        else:
+            arcpy.AddMessage("Centerline vrstva nebyla nalezena - split se neprovede")
+
         arcpy.AddMessage(f"Hotovo! Exportováno {exported_count} vrstev.")
-        arcpy.AddMessage("✓ Finální výstup: PL_SC_centerline_LN s vybranými atributy")
+        arcpy.AddMessage("✓ Všechny podpůrné vrstvy smazány, zachovány pouze finální vrstvy rozdělené podle 'Layer'")
