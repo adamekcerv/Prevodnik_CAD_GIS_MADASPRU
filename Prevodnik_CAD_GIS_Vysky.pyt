@@ -1068,8 +1068,223 @@ class SimpleCADImport(object):
                         arcpy.CheckInExtension("Foundation")
                         
                     else:
-                        arcpy.AddWarning("Foundation/Production Mapping extension není dostupná - centerline se nevytvoří")
-                        arcpy.AddWarning("Pro vytvoření centerline je potřeba ArcGIS Production Mapping nebo Foundation extension")
+                        # FALLBACK: Použití 3rd party balíčku 'centerline' (Voronoi based)
+                        # Optimalizovaná verze pro co nejpodobnější výsledek jako PolygonToCenterline
+                        arcpy.AddWarning("Foundation/Production Mapping extension není dostupná")
+                        arcpy.AddMessage("Zkouším alternativní metodu pomocí balíčku 'centerline' (Voronoi diagram)...")
+                        
+                        try:
+                            from centerline.geometry import Centerline as VoronoiCenterline
+                            from shapely.geometry import shape, mapping, LineString, MultiLineString
+                            from shapely.ops import linemerge, unary_union
+                            import json
+                            
+                            arcpy.AddMessage("✓ Balíček 'centerline' nalezen - používám optimalizovanou Voronoi metodu")
+                            
+                            # Název pro centerline vrstvu
+                            if out_prefix:
+                                centerline_name = f"{out_prefix}SC_centerline_LN"
+                            else:
+                                centerline_name = "PL_SC_centerline_LN"
+                            
+                            centerline_name = generate_unique_name(output_gdb, centerline_name)
+                            centerline_fc = os.path.join(output_workspace, centerline_name)
+                            
+                            # Získání spatial reference z bufferu
+                            sr = arcpy.Describe(spatial_join_fc).spatialReference
+                            
+                            # Vytvoření výstupní feature class pro centerline
+                            arcpy.CreateFeatureclass_management(
+                                out_path=output_workspace,
+                                out_name=os.path.basename(centerline_fc),
+                                geometry_type="POLYLINE",
+                                spatial_reference=sr
+                            )
+                            
+                            # Přidání pole pro původní OBJECTID (pro pozdější join atributů)
+                            arcpy.AddField_management(centerline_fc, "ORIG_FID", "LONG")
+                            
+                            # Získání seznamu atributových polí z bufferu
+                            buffer_fields = [field.name for field in arcpy.ListFields(spatial_join_fc) 
+                                            if field.type not in ["OID", "Geometry"] 
+                                            and field.name.upper() not in ["SHAPE_LENGTH", "SHAPE_AREA", "OBJECTID", "SHAPE"]]
+                            
+                            total_polygons = int(arcpy.GetCount_management(spatial_join_fc)[0])
+                            arcpy.AddMessage(f"Zpracovávám {total_polygons} buffer polygonů...")
+                            
+                            # Pomocná funkce pro filtrování krátkých větví (Voronoi artefaktů)
+                            def filter_short_branches(geom, min_length=0.15):
+                                """Odstraní krátké větve které jsou Voronoi artefakty"""
+                                if geom is None or geom.is_empty:
+                                    return None
+                                
+                                if geom.geom_type == 'LineString':
+                                    return geom if geom.length >= min_length else None
+                                elif geom.geom_type == 'MultiLineString':
+                                    # Filtruj krátké segmenty
+                                    valid_lines = [line for line in geom.geoms if line.length >= min_length]
+                                    if not valid_lines:
+                                        return None
+                                    elif len(valid_lines) == 1:
+                                        return valid_lines[0]
+                                    else:
+                                        return MultiLineString(valid_lines)
+                                return geom
+                            
+                            # Pomocná funkce pro simplifikaci geometrie
+                            def simplify_centerline(geom, tolerance=0.05):
+                                """Zjednodušení geometrie pro hladší výsledek"""
+                                if geom is None or geom.is_empty:
+                                    return None
+                                return geom.simplify(tolerance, preserve_topology=True)
+                            
+                            # Zpracování každého buffer polygonu
+                            centerline_count = 0
+                            failed_count = 0
+                            
+                            with arcpy.da.SearchCursor(spatial_join_fc, ["SHAPE@", "OID@"]) as search_cursor:
+                                with arcpy.da.InsertCursor(centerline_fc, ["SHAPE@", "ORIG_FID"]) as insert_cursor:
+                                    for row in search_cursor:
+                                        polygon_geom = row[0]
+                                        oid = row[1]
+                                        
+                                        try:
+                                            # Převod ArcPy geometry na Shapely
+                                            polygon_json = polygon_geom.JSON
+                                            shapely_polygon = shape(json.loads(polygon_json))
+                                            
+                                            # Validace polygonu
+                                            if not shapely_polygon.is_valid:
+                                                shapely_polygon = shapely_polygon.buffer(0)
+                                            
+                                            # Vytvoření centerline pomocí Voronoi
+                                            # interpolation_distance=0.3 pro hustější body = přesnější Voronoi
+                                            voronoi_cl = VoronoiCenterline(shapely_polygon, interpolation_distance=0.3)
+                                            
+                                            # Získání geometrie centerline
+                                            cl_geom = voronoi_cl.geometry
+                                            
+                                            if cl_geom and not cl_geom.is_empty:
+                                                # 1. Filtrování krátkých větví (Voronoi artefakty)
+                                                # Min délka 15cm (polovina šířky bufferu 30cm)
+                                                cl_geom = filter_short_branches(cl_geom, min_length=0.15)
+                                                
+                                                if cl_geom and not cl_geom.is_empty:
+                                                    # 2. Sloučení linií do jedné pokud je to MultiLineString
+                                                    if cl_geom.geom_type == 'MultiLineString':
+                                                        merged = linemerge(cl_geom)
+                                                        cl_geom = merged
+                                                    
+                                                    # 3. Simplifikace pro hladší výsledek (tolerance 5cm)
+                                                    cl_geom = simplify_centerline(cl_geom, tolerance=0.05)
+                                                    
+                                                    if cl_geom and not cl_geom.is_empty:
+                                                        # Převod Shapely geometry zpět na ArcPy
+                                                        cl_json = mapping(cl_geom)
+                                                        arcpy_geom = arcpy.AsShape(cl_json, True)
+                                                        
+                                                        # Vložení do výstupní feature class
+                                                        insert_cursor.insertRow([arcpy_geom, oid])
+                                                        centerline_count += 1
+                                        except Exception as poly_error:
+                                            failed_count += 1
+                                            if failed_count <= 3:
+                                                arcpy.AddWarning(f"  Polygon OID {oid}: {poly_error}")
+                            
+                            if failed_count > 3:
+                                arcpy.AddWarning(f"  ... a dalších {failed_count - 3} chyb")
+                            
+                            arcpy.AddMessage(f"✓ Vytvořeno {centerline_count} centerline prvků (Voronoi metoda)")
+                            if failed_count > 0:
+                                arcpy.AddWarning(f"  {failed_count} polygonů se nepodařilo zpracovat")
+                            
+                            # Připojení atributů z bufferu pomocí JoinField
+                            if centerline_count > 0:
+                                arcpy.AddMessage("Připojuji atributy z bufferu...")
+                                
+                                arcpy.management.JoinField(
+                                    in_data=centerline_fc,
+                                    in_field="ORIG_FID",
+                                    join_table=spatial_join_fc,
+                                    join_field="OBJECTID",
+                                    fields=buffer_fields
+                                )
+                                
+                                arcpy.AddMessage(f"✓ Připojeno {len(buffer_fields)} atributových polí")
+                                
+                                # PONECHÁNÍ POUZE POŽADOVANÝCH POLÍ (stejně jako u Foundation verze)
+                                keep_fields = [
+                                    "Layer", "Join_Count", "ORIG_FID",
+                                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
+                                    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
+                                    "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
+                                ]
+                                
+                                # Rozšíření o varianty s suffixy
+                                centerline_fields = [f.name for f in arcpy.ListFields(centerline_fc)]
+                                expanded_keep_fields = set(keep_fields)
+                                for field in centerline_fields:
+                                    for base_field in keep_fields:
+                                        if field.startswith(base_field):
+                                            expanded_keep_fields.add(field)
+                                
+                                keep_fields = list(expanded_keep_fields)
+                                
+                                # Smazání nepotřebných polí
+                                all_fields = arcpy.ListFields(centerline_fc)
+                                fields_to_delete = []
+                                
+                                for field in all_fields:
+                                    if (field.type not in ["OID", "Geometry"] and 
+                                        not field.required and 
+                                        field.name not in keep_fields and
+                                        field.name.upper() not in ["OBJECTID", "SHAPE", "SHAPE_LENGTH"]):
+                                        fields_to_delete.append(field.name)
+                                
+                                if fields_to_delete:
+                                    arcpy.management.DeleteField(centerline_fc, fields_to_delete)
+                                    arcpy.AddMessage(f"✓ Zachováno pouze {len(keep_fields)} požadovaných polí")
+                                
+                                # ÚPRAVA GEOMETRIE - PŘICHYCENÍ K PŮVODNÍM LINIÍM
+                                try:
+                                    arcpy.env.workspace = output_workspace
+                                    lines_classes = arcpy.ListFeatureClasses("*SC_all*")
+                                    if not lines_classes:
+                                        lines_classes = arcpy.ListFeatureClasses("*SC_all_LN*")
+                                    
+                                    if lines_classes:
+                                        original_lines_fc = os.path.join(output_workspace, lines_classes[0])
+                                        arcpy.AddMessage(f"Srovnávám geometrii s původními liniemi: {lines_classes[0]}")
+                                        
+                                        # 1. Densifikace pro více bodů k přichycení
+                                        arcpy.edit.Densify(centerline_fc, "DISTANCE", "0.5 Meters")
+                                        
+                                        # 2. Snap k hranám a vrcholům původních linií
+                                        snap_env = [
+                                            [original_lines_fc, "EDGE", "0.4 Meters"],
+                                            [original_lines_fc, "VERTEX", "0.2 Meters"]
+                                        ]
+                                        arcpy.edit.Snap(centerline_fc, snap_env)
+                                        
+                                        # 3. Generalizace pro vyhlazení výsledku
+                                        arcpy.edit.Generalize(centerline_fc, "0.02 Meters")
+                                        
+                                        arcpy.AddMessage("✓ Geometrie centerline přichycena a vyhlazena")
+                                        arcpy.AddMessage("  - Densifikace: 0.5m")
+                                        arcpy.AddMessage("  - Snap EDGE: 0.4m, VERTEX: 0.2m")
+                                        arcpy.AddMessage("  - Generalizace: 0.02m")
+                                except Exception as snap_error:
+                                    arcpy.AddWarning(f"Úprava geometrie se nezdařila: {snap_error}")
+                            
+                            arcpy.AddMessage(f"Výsledná centerline vrstva: {centerline_name}")
+                            
+                        except ImportError:
+                            arcpy.AddWarning("Balíček 'centerline' není nainstalován.")
+                            arcpy.AddWarning("Pro instalaci spusťte: pip install centerline")
+                            arcpy.AddWarning("Nebo: conda install -c conda-forge centerline")
+                            arcpy.AddWarning("Centerline se nevytvoří - použijte ArcGIS Foundation extension nebo nainstalujte balíček 'centerline'")
+                        except Exception as fallback_error:
+                            arcpy.AddWarning(f"Chyba při vytváření centerline (Voronoi metoda): {fallback_error}")
                         
                 except Exception as e:
                     arcpy.AddWarning(f"Chyba při vytváření centerline: {e}")
