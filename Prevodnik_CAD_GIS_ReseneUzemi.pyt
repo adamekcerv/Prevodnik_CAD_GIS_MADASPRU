@@ -513,6 +513,46 @@ class CadFile(object):
                         except Exception as e:
                             arcpy.AddWarning(f"[export_layers] Nelze smazat bod Resene_uzemi: {e}")
                     
+                    # FINÁLNÍ CLEANUP - smazat nepotřebné pomocné vrstvy
+                    arcpy.AddMessage("[export_layers] Finální cleanup nepotřebných vrstev...")
+                    
+                    # Smazat původní výškové kruhy (Z302310_BL_VR_na_plochu_LN)
+                    if vyska_circles_fc:
+                        try:
+                            arcpy.Delete_management(vyska_circles_fc)
+                            arcpy.AddMessage(f"[export_layers] Smazána původní vrstva výškových kruhů: {os.path.basename(vyska_circles_fc)}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"[export_layers] Nelze smazat výškové kruhy: {e}")
+                    
+                    # Smazat filtrované kruhy (Z302310_VR_circles_LN)
+                    try:
+                        arcpy.env.workspace = output_workspace
+                        circles_classes = arcpy.ListFeatureClasses("*VR_circles*")
+                        for circles_fc in circles_classes:
+                            circles_path = os.path.join(output_workspace, circles_fc)
+                            arcpy.Delete_management(circles_path)
+                            arcpy.AddMessage(f"[export_layers] Smazána vrstva filtrovaných kruhů: {circles_fc}")
+                    except Exception as e:
+                        arcpy.AddWarning(f"[export_layers] Nelze smazat filtrované kruhy: {e}")
+                    
+                    # Smazat ZResene_uzemi_Polygon_with_Points (pokud existuje)
+                    if updated_main_polygon_fc:
+                        try:
+                            arcpy.Delete_management(updated_main_polygon_fc)
+                            arcpy.AddMessage(f"[export_layers] Smazána pomocná vrstva: {os.path.basename(updated_main_polygon_fc)}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"[export_layers] Nelze smazat pomocnou vrstvu Polygon_with_Points: {e}")
+                    
+                    # Smazat rozhraní výškových kruhů (Z302311_PL_VR_na_plochu_rozhrani_LN)
+                    if vyska_rozhrani_fc:
+                        try:
+                            arcpy.Delete_management(vyska_rozhrani_fc)
+                            arcpy.AddMessage(f"[export_layers] Smazána vrstva rozhraní výškových kruhů: {os.path.basename(vyska_rozhrani_fc)}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"[export_layers] Nelze smazat rozhraní: {e}")
+                    
+                    arcpy.AddMessage("[export_layers] ✓ Finální cleanup dokončen")
+                    
             except Exception as e:
                 arcpy.AddError(f"[export_layers] Chyba při spatial join analýze: {e}")
         
