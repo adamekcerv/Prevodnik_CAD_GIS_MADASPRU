@@ -4,6 +4,8 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 
 ## Přehled toolboxů
 
+
+
 ### 1. Převodník Řešených území (Prevodnik_CAD_GIS_ReseneUzemi.pyt)
 
 Import a analýza hraničních území s kontrolou bodů
@@ -16,6 +18,27 @@ Hlavní funkce:
 - Rozdělení polygonů podle výškových rozhraní (302311)
 - Přenos výškových atributů z kruhů (302310) na polygony s prefixem VR_
 
+Workflow Řešených území:
+```
+CAD Polylines (101110, 200000)
+    ↓ Merge + Snap (30cm)
+Feature to Polygon
+    ↓ Integrate (30cm)
+Rozdělení polygonů ←─── Rozhraní výškových kruhů (302311)
+    ↓
+Spatial Join s body (202110-205110)
+    ↓ CONTAINS
+Atributy z bodů → Polygony
+    ↓
+Spatial Join s centry výškových kruhů (302310)
+    ↓ CONTAINS
+Atributy výšek → Polygony (prefix VR_)
+    ↓
+Split podle Layer → Finální polygony podle typu
+    ↓ Zachování polí: Layer, Entity, CAD metadata
+Výstup: Z202110_UP, Z203110_SB, Z204110_NB, Z205110_XB
+```
+
 Vstupní vrstvy:
 - 101110_PL_Resene_uzemi (Polyline) - hranice řešeného území
 - 200000_PL_Cast_uzemi (Polyline) - hranice částí území
@@ -27,7 +50,7 @@ Vstupní vrstvy:
 - 302310_BL_VR_na_plochu (Polyline) - výškové kruhy na plochu
 - 302311_PL_VR_na_plochu_rozhrani (Polyline) - výškové rozhraní ploch
 
-### 2. Převodník Výšek (Prevodnik_CAD_GIS_Vysky.pyt)
+### 3. Převodník Výšek (Prevodnik_CAD_GIS_Vysky.pyt)
 
 Import a zpracování výškových regulativů na liniích
 
@@ -39,6 +62,35 @@ Hlavní funkce:
 - Vytvoření centerline z bufferů s zachováním atributů
 - Geometrické srovnání s původními liniemi
 - Fallback režim při absenci rozhraní (302211)
+
+Workflow Výšek:
+```
+CAD SC Linie (3011xx) + VR Rozhraní (302211)
+    ↓ Merge všech SC
+Topologické čištění (FeatureToLine)
+    ↓ Snap VR na SC (30cm)
+Identifikace průsečíků VR × SC
+    ↓
+┌─────────────────┴─────────────────┐
+│ S rozhraním     │ Bez rozhraní    │
+│ Spojení linií   │ Původní linie   │
+│ Buffer 30cm     │ Buffer 30cm     │
+│ Split kolmicemi │ Bez split       │
+└─────────────────┴─────────────────┘
+    ↓ Merge obou skupin
+Finální buffer
+    ↓ Spatial Join INTERSECT
+Buffer + VR kruhy (302110, 302210)
+    ├─ Join_Count (bez suffixu): počet kruhů
+    ├─ Atributy _1: rozhraní NEBO kruhy (pokud bez rozhraní)
+    └─ Atributy _12: kruhy (pokud s rozhraním)
+    ↓ PolygonToCenterline (Foundation)
+Centerline s atributy
+    ↓ Geometry Align s původními liniemi (2m)
+Srovnaná geometrie + topologie centerline
+    ↓ Split podle Layer
+Výstup: Z301110_uzavrena, Z301111_polouzavrena, ...
+```
 
 Vstupní vrstvy:
 - 3011xx_PL_SC_* - stavební čáry všech typů (automatická detekce)
@@ -82,14 +134,20 @@ Hlavní výstupy:
 - Z302110_BL_VR_na_bod - výškové kruhy na bod (pouze kruhy)
 
 Atributy zachované v centerline:
-- Layer, Join_Count (počet kruhů)
-- VYSKA_VB, VYSKA_VB_I, VYSKA_VB_D
-- NP_MIN, NP_MAX, NUP_MAX
-- RIMSA_MIN, RIMSA_MAX, VYSKA_MAX
-- NAZEV_BLOK, DOK_NAZEV
-- OZNACENI, DRUH_UP, DRUH_INFO, PODTYP
+- **Layer**: Identifikace původní SC vrstvy (301110, 301111, atd.) - potřebné pro split
+- **Join_Count**: Počet kruhů které se protínají s centerline
+- **Výškové atributy**: VYSKA_VB, VYSKA_VB_I, VYSKA_VB_D
+- **Regulační hodnoty**: NP_MIN, NP_MAX, NUP_MAX
+- **Výškové limity**: RIMSA_MIN, RIMSA_MAX, VYSKA_MAX
+- **Dokumentace**: NAZEV_BLOK, DOK_NAZEV
+- **Klasifikace**: OZNACENI, DRUH_UP, DRUH_INFO, PODTYP
 
-Suffixy: _1 (rozhraní nebo kruhy pokud bez rozhraní), _12 (kruhy pokud s rozhraním)
+Suffixy atributů:
+- **Bez suffixu**: původní atributy ze SC linie (OZNACENI, VYSKA_VB...)
+- **_1**: atributy z rozhraní (302211) NEBO z kruhů pokud linie nemá rozhraní
+- **_12**: atributy z kruhů (302110/302210) pokud linie má rozhraní
+
+Poznámka: CAD metadata (Entity, Handle, Color, Linetype, atd.) se automaticky odstraňují z finálních vrstev.
 
 ## Hodnocení kvality dat (Řešená území)
 
@@ -103,10 +161,11 @@ Pole "pozice_resene_uzemi":
 - mimo řešené území - polygon leží mimo hranice
 
 Pole výškových atributů (pokud je vrstva 302310):
-- VR_VYSKA_VB, VR_VYSKA_VB_I, VR_VYSKA_VB_D
-- VR_NP_MIN, VR_NP_MAX, VR_NUP_MAX
-- VR_RIMSA_MIN, VR_RIMSA_MAX, VR_VYSKA_MAX
-- VR_NAZEV_BLOK, VR_DOK_NAZEV, VR_OZNACENI, VR_DRUH_UP, VR_DRUH_INFO, VR_PODTYP
+- **Výškové hodnoty**: VR_VYSKA_VB, VR_VYSKA_VB_I, VR_VYSKA_VB_D
+- **Regulační limity**: VR_NP_MIN, VR_NP_MAX, VR_NUP_MAX
+- **Výškové rozsahy**: VR_RIMSA_MIN, VR_RIMSA_MAX, VR_VYSKA_MAX
+- **Dokumentace**: VR_NAZEV_BLOK, VR_DOK_NAZEV
+- **Klasifikace**: VR_OZNACENI, VR_DRUH_UP, VR_DRUH_INFO, VR_PODTYP
 
 Pozn: Výškové body (302310) se nezapočítávají do hodnocení "bod"
 
@@ -122,12 +181,43 @@ Požadavky:
   * Instalace fallback balíčku: pip install centerline (volitelné, pouze pokud nemáte Foundation)
 
 Postup:
-1. Stáhněte soubory Prevodnik_CAD_GIS_ReseneUzemi.pyt a Prevodnik_CAD_GIS_Vysky.pyt
+1. Stáhněte soubory:
+   - Prevodnik_CAD_GIS_Kompletni.pyt (univerzální - doporučeno)
+   - Prevodnik_CAD_GIS_ReseneUzemi.pyt (samostatně použitelný)
+   - Prevodnik_CAD_GIS_Vysky.pyt (samostatně použitelný)
 2. Zkopírujte do složky s ArcGIS Pro projektem
 3. V ArcGIS Pro: Catalog Pane - Toolboxes - Add Toolbox
 4. Vyberte požadovaný .pyt soubor
+5. Pro Kompletní toolbox musí být všechny tři .pyt soubory ve stejné složce
 
 ## Použití
+
+### Univerzální převodník (Kompletni)
+
+Základní workflow:
+```
+CAD soubor → Výběr režimu → Automatické zpracování → Výsledné vrstvy
+```
+
+Parametry:
+- Režim zpracování - Řešená území / Výšky / Obojí
+- Input CAD Soubor - cesta k DWG/DXF/DGN
+- Output Geodatabáze - povinný
+- Output Feature Dataset - volitelný (stejný pro oba režimy)
+- XY Tolerance - 0.01 m (default)
+- XY Resolution - 0.001 m (default)
+- Output Souřadnicový Systém - auto/S-JTSK
+- Geographic Transformation - volitelný
+- Prefix jména výstupu - Z/PL_ (default podle režimu)
+
+Režim "Obojí":
+- Spustí Řešená území s prefixem "Z"
+- Pak spustí Výšky s prefixem "PL_"
+- Obě části použijí stejnou geodatabázi a feature dataset
+- Vrstvy z Řešených území se zachovají a použijí v Výškách (pokud mají pole Layer)
+- Celkový čas: součet obou částí (cca 5-40 minut dle dat)
+
+### Samostatné toolboxy
 
 Základní workflow:
 ```
