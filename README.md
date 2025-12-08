@@ -19,24 +19,30 @@ Hlavní funkce:
 - Přenos výškových atributů z kruhů (302310) na polygony s prefixem VR_
 
 Workflow Řešených území:
-```
-CAD Polylines (101110, 200000)
-    ↓ Merge + Snap (30cm)
-Feature to Polygon
-    ↓ Integrate (30cm)
-Rozdělení polygonů ←─── Rozhraní výškových kruhů (302311)
-    ↓
-Spatial Join s body (202110-205110)
-    ↓ CONTAINS
-Atributy z bodů → Polygony
-    ↓
-Spatial Join s centry výškových kruhů (302310)
-    ↓ CONTAINS
-Atributy výšek → Polygony (prefix VR_)
-    ↓
-Split podle Layer → Finální polygony podle typu
-    ↓ Zachování polí: Layer, Entity, CAD metadata
-Výstup: Z202110_UP, Z203110_SB, Z204110_NB, Z205110_XB
+
+```mermaid
+flowchart TD
+    A[CAD Polylines<br/>101110, 200000] --> B[Merge + Snap 30cm]
+    B --> C[Feature to Polygon]
+    C --> D[Integrate 30cm]
+    
+    E[Rozhraní VR kruhů<br/>302311] -.-> F[Rozdělení polygonů]
+    D --> F
+    
+    F --> G[Spatial Join CONTAINS<br/>Body 202110-205110]
+    G --> H[Přenos atributů z bodů]
+    
+    I[VR kruhy 302310<br/>centry] --> J[Spatial Join CONTAINS]
+    H --> J
+    J --> K[Přenos VR_ atributů]
+    
+    K --> L[Split podle Layer]
+    L --> M[Finální polygony<br/>Z202110_UP, Z203110_SB<br/>Z204110_NB, Z205110_XB]
+    
+    style A fill:#e1f5ff
+    style M fill:#c8e6c9
+    style E fill:#fff9c4
+    style I fill:#fff9c4
 ```
 
 Vstupní vrstvy:
@@ -64,32 +70,55 @@ Hlavní funkce:
 - Fallback režim při absenci rozhraní (302211)
 
 Workflow Výšek:
-```
-CAD SC Linie (3011xx) + VR Rozhraní (302211)
-    ↓ Merge všech SC
-Topologické čištění (FeatureToLine)
-    ↓ Snap VR na SC (30cm)
-Identifikace průsečíků VR × SC
-    ↓
-┌─────────────────┴─────────────────┐
-│ S rozhraním     │ Bez rozhraní    │
-│ Spojení linií   │ Původní linie   │
-│ Buffer 30cm     │ Buffer 30cm     │
-│ Split kolmicemi │ Bez split       │
-└─────────────────┴─────────────────┘
-    ↓ Merge obou skupin
-Finální buffer
-    ↓ Spatial Join INTERSECT
-Buffer + VR kruhy (302110, 302210)
-    ├─ Join_Count (bez suffixu): počet kruhů
-    ├─ Atributy _1: rozhraní NEBO kruhy (pokud bez rozhraní)
-    └─ Atributy _12: kruhy (pokud s rozhraním)
-    ↓ PolygonToCenterline (Foundation)
-Centerline s atributy
-    ↓ Geometry Align s původními liniemi (2m)
-Srovnaná geometrie + topologie centerline
-    ↓ Split podle Layer
-Výstup: Z301110_uzavrena, Z301111_polouzavrena, ...
+
+```mermaid
+flowchart TD
+    A[CAD SC Linie<br/>3011xx] --> B[Merge všech SC]
+    B --> C[Topologické čištění<br/>FeatureToLine]
+    
+    D[VR Rozhraní<br/>302211] -.-> E[Snap VR na SC<br/>30cm]
+    C --> E
+    E --> F[Identifikace průsečíků<br/>VR × SC]
+    
+    F --> G{Má rozhraní?}
+    
+    G -->|Ano| H[Spojení linií]
+    G -->|Ne| I[Původní linie]
+    
+    H --> J[Buffer 30cm]
+    I --> K[Buffer 30cm]
+    
+    J --> L[Split kolmicemi]
+    K --> M[Bez split]
+    
+    L --> N[Merge obou skupin]
+    M --> N
+    
+    N --> O[Finální buffer]
+    
+    P[VR kruhy<br/>302110, 302210] --> Q[Spatial Join<br/>INTERSECT]
+    O --> Q
+    
+    Q --> R[Buffer + atributy kruhů<br/>Join_Count, _1, _12]
+    
+    R --> S[PolygonToCenterline<br/>Foundation Extension]
+    
+    S --> T[Centerline s atributy]
+    
+    U[Původní SC linie] -.-> V[Geometry Align<br/>2m tolerance]
+    T --> V
+    
+    V --> W[Srovnaná geometrie<br/>+ topologie]
+    
+    W --> X[Split podle Layer]
+    
+    X --> Y[Finální centerline<br/>Z301110_uzavrena<br/>Z301111_polouzavrena<br/>...]
+    
+    style A fill:#e1f5ff
+    style D fill:#fff9c4
+    style P fill:#fff9c4
+    style Y fill:#c8e6c9
+    style G fill:#ffe082
 ```
 
 Vstupní vrstvy:
