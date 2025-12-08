@@ -306,8 +306,38 @@ class SimpleCADImport(object):
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při merge SC vrstev: {e}")
         
+        # FALLBACK: Pokud není VR rozhraní, vytvoř buffer přímo z merged SC linií
+        if not vr_rozhrani_layer and merged_fc and arcpy.Exists(merged_fc):
+            try:
+                arcpy.AddMessage("VR rozhraní nebylo nalezeno - vytvářím buffer přímo ze všech SC linií")
+                
+                # Vytvoř buffer ze všech SC linií najednou
+                if out_prefix:
+                    simple_buffer_name = f"{out_prefix}SC_final_buffer"
+                else:
+                    simple_buffer_name = "PL_SC_final_buffer"
+                
+                simple_buffer_name = generate_unique_name(output_gdb, simple_buffer_name)
+                simple_buffer_fc = os.path.join(output_workspace, simple_buffer_name)
+                
+                arcpy.analysis.Buffer(
+                    in_features=merged_fc,
+                    out_feature_class=simple_buffer_fc,
+                    buffer_distance_or_field="0.3 Meters",
+                    line_side="FULL",
+                    line_end_type="FLAT",
+                    dissolve_option="NONE"
+                )
+                
+                buffer_count = int(arcpy.GetCount_management(simple_buffer_fc)[0])
+                arcpy.AddMessage(f"Vytvořen jednoduchý buffer ze SC linií: {simple_buffer_name}")
+                arcpy.AddMessage(f"Počet buffer prvků: {buffer_count}")
+                
+            except Exception as e:
+                arcpy.AddWarning(f"Chyba při vytváření jednoduchého bufferu: {e}")
+        
         # Snap VR rozhraní na SC merge vrstvu
-        if vr_rozhrani_layer and merged_fc and arcpy.Exists(vr_rozhrani_layer) and arcpy.Exists(merged_fc):
+        elif vr_rozhrani_layer and merged_fc and arcpy.Exists(vr_rozhrani_layer) and arcpy.Exists(merged_fc):
             try:
                 # Snap tolerance 30 cm = 0.3 metrů
                 snap_env = [[merged_fc, "EDGE", "0.3 Meters"]]
