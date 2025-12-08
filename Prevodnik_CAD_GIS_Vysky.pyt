@@ -4,12 +4,7 @@ import os
 
 # Defaultní vrstvy pro MADASPRU project
 DEFAULT_LAYERS = [
-    "301110_PL_SC_uzavrena",
-    "301111_PL_SC_polouzavrena", 
-    "301112_PL_SC_otevrena",
-    "301113_PL_SC_volna",
-    "301114_PL_SC_bez_rozliseni",
-    "301115_PL_SC_jina_XX",
+    "302110_BL_VR_na_bod",
     "302210_BL_VR_na_linii",
     "302211_PL_VR_na_linii_rozhrani"
 ]
@@ -164,7 +159,10 @@ class SimpleCADImport(object):
                     with arcpy.da.SearchCursor("Polyline", ["Layer"]) as cursor:
                         layers = sorted(set([row[0] for row in cursor]))
                         for layer in layers:
-                            if layer in DEFAULT_LAYERS:
+                            # Automaticky zahrnuj všechny SC vrstvy (301110-301119...) + ostatní z DEFAULT_LAYERS
+                            if layer.startswith("3011") and "_PL_SC_" in layer:
+                                available_layers.append(f"{layer} (Polyline)")
+                            elif layer in DEFAULT_LAYERS:
                                 available_layers.append(f"{layer} (Polyline)")
                 
                 parameters[1].filter.list = available_layers
@@ -218,6 +216,7 @@ class SimpleCADImport(object):
         sc_layers = []  # Seznam SC vrstev pro merge
         vr_rozhrani_layer = None  # Pro uložení 302211 vrstvy
         vr_na_linii_layer = None  # Pro uložení 302210 vrstvy
+        vr_na_bod_layer = None  # Pro uložení 302110 vrstvy
         
         for layer_info in selected_layers:
             if " (Polyline)" in layer_info:
@@ -266,13 +265,17 @@ class SimpleCADImport(object):
                     arcpy.AddMessage(f"Exportováno: {layer_name}")
                     exported_count += 1
                     
-                    # Kontrola zda je to SC vrstva (301110-301115) pro pozdější merge
-                    if layer_name.startswith(("301110", "301111", "301112", "301113", "301114", "301115")):
+                    # Kontrola zda je to SC vrstva (všechny 3011xx) pro pozdější merge
+                    if layer_name.startswith("3011") and "_PL_SC_" in layer_name:
                         sc_layers.append(output_fc)
                     
                     # Kontrola zda je to VR rozhraní vrstva pro snap
                     elif layer_name == "302211_PL_VR_na_linii_rozhrani":
                         vr_rozhrani_layer = output_fc
+                    
+                    # Kontrola zda je to VR na bod vrstva pro multipart processing
+                    elif layer_name == "302110_BL_VR_na_bod":
+                        vr_na_bod_layer = output_fc
                     
                     # Kontrola zda je to VR na linii vrstva pro multipart processing
                     elif layer_name == "302210_BL_VR_na_linii":
@@ -807,6 +810,63 @@ class SimpleCADImport(object):
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při snap operaci: {e}")
 
+        # Zpracování VR na bod vrstvy - multipart to singlepart a filtrování uzavřených linií (kruhy)
+        if vr_na_bod_layer and arcpy.Exists(vr_na_bod_layer):
+            try:
+                # Název pro singlepart vrstvu
+                if out_prefix:
+                    singlepart_name = f"{out_prefix}302110_VR_bod_singlepart_LN"
+                else:
+                    singlepart_name = "PL_302110_VR_bod_singlepart_LN"
+                
+                singlepart_name = generate_unique_name(output_gdb, singlepart_name)
+                singlepart_fc = os.path.join(output_workspace, singlepart_name)
+                
+                # Multipart to Singlepart
+                arcpy.management.MultipartToSinglepart(vr_na_bod_layer, singlepart_fc)
+                arcpy.AddMessage("VR na bod převedeno na singlepart")
+                
+                # Filtrování pouze uzavřených linií (kruhy)
+                # Název pro finální vrstvu s kruhy
+                if out_prefix:
+                    circles_name = f"{out_prefix}302110_VR_bod_circles_LN"
+                else:
+                    circles_name = "Z302110_BL_VR_na_bod"
+                
+                circles_name = generate_unique_name(output_gdb, circles_name)
+                circles_fc = os.path.join(output_workspace, circles_name)
+                
+                # Vytvoření prázdné kopie pro kruhy
+                arcpy.management.CreateFeatureclass(
+                    out_path=output_workspace,
+                    out_name=circles_name.split(os.sep)[-1],
+                    geometry_type="POLYLINE",
+                    template=singlepart_fc,
+                    spatial_reference=output_sr
+                )
+                
+                # Kopírování pouze uzavřených linií
+                circles_count = 0
+                # Získání seznamu polí (bez OBJECTID který se generuje automaticky)
+                field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
+                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
+                
+                with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
+                    with arcpy.da.InsertCursor(circles_fc, ["SHAPE@"] + field_names) as insert_cursor:
+                        for row in search_cursor:
+                            geometry = row[0]
+                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
+                                insert_cursor.insertRow(row)
+                                circles_count += 1
+                
+                arcpy.AddMessage(f"Nalezeno a zachováno {circles_count} uzavřených linií (kruhů) pro VR na bod")
+                
+                # Smazání dočasné singlepart vrstvy
+                arcpy.Delete_management(singlepart_fc)
+                
+            except Exception as e:
+                arcpy.AddWarning(f"Chyba při zpracování VR na bod: {e}")
+        
         # Zpracování VR na linii vrstvy - multipart to singlepart a filtrování uzavřených linií
         if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
             try:
