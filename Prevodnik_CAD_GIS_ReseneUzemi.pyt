@@ -256,6 +256,8 @@ class CadFile(object):
         polylines_for_merge = []  # Seznam pro polyline vrstvy určené k merge
         point_layers_for_join = []  # Seznam pro bodové vrstvy určené k spatial join
         resene_point_fc = None  # Bod Resene_uzemi pro speciální zpracování
+        vyska_circles_fc = None  # Výškové kruhy pro speciální zpracování
+        vyska_rozhrani_fc = None  # Rozhraní výškových kruhů pro split polygonů
 
         # Pokud nejsou vybrané konkrétní vrstvy, exportujeme všechny
         if not selected_display_names:
@@ -281,6 +283,18 @@ class CadFile(object):
             is_resene_point = (
                 cad_layer.name == "101111_BL_Resene_uzemi" and 
                 cad_layer.cad_fc == "Point"
+            )
+            
+            # Kontrola pro výškové kruhy (302310_BL_VR_na_plochu)
+            is_vyska_circles = (
+                cad_layer.name == "302310_BL_VR_na_plochu" and 
+                cad_layer.cad_fc == "Polyline"
+            )
+            
+            # Kontrola pro rozhraní výškových kruhů (302311_PL_VR_na_plochu_rozhrani)
+            is_vyska_rozhrani = (
+                cad_layer.name == "302311_PL_VR_na_plochu_rozhrani" and 
+                cad_layer.cad_fc == "Polyline"
             )
             
             if is_special_polyline:
@@ -316,6 +330,28 @@ class CadFile(object):
                 if exported:
                     resene_point_fc = exported
                     arcpy.AddMessage(f"[export_layers] Bod Resene_uzemi '{cad_layer.name}' exportován pro speciální zpracování.")
+            elif is_vyska_circles:
+                # Export výškových kruhů pro speciální zpracování
+                exported = cad_layer.export(
+                    output_workspace,
+                    spatial_ref=spatial_ref,
+                    transform_method=transform_method,
+                    out_prefix=out_prefix
+                )
+                if exported:
+                    vyska_circles_fc = exported
+                    arcpy.AddMessage(f"[export_layers] Výškové kruhy '{cad_layer.name}' exportovány pro speciální zpracování.")
+            elif is_vyska_rozhrani:
+                # Export rozhraní výškových kruhů pro split polygonů
+                exported = cad_layer.export(
+                    output_workspace,
+                    spatial_ref=spatial_ref,
+                    transform_method=transform_method,
+                    out_prefix=out_prefix
+                )
+                if exported:
+                    vyska_rozhrani_fc = exported
+                    arcpy.AddMessage(f"[export_layers] Rozhraní výškových kruhů '{cad_layer.name}' exportováno pro split polygonů.")
             else:
                 # Standardní export ostatních vrstev
                 exported = cad_layer.export(
@@ -353,7 +389,20 @@ class CadFile(object):
                 # V případě chyby ponecháme původní polyline vrstvy
                 exported_layers.extend(polylines_for_merge)
 
-        # Spatial join bodových vrstev k polygonům a analýza
+        # Zpracování výškových kruhů - převod na body (centroids)
+        # NEPŘIDÁVAT do point_layers_for_join - budou zpracovány samostatně
+        vyska_centroids_fc = None
+        if vyska_circles_fc:
+            try:
+                vyska_centroids_fc = self.process_vyska_circles_to_points(
+                    vyska_circles_fc, output_workspace, out_prefix, spatial_ref
+                )
+                if vyska_centroids_fc:
+                    arcpy.AddMessage(f"[export_layers] Centroids výškových kruhů připraveny pro samostatný spatial join.")
+            except Exception as e:
+                arcpy.AddWarning(f"[export_layers] Chyba při zpracování výškových kruhů: {e}")
+        
+        # Spatial join bodových vrstev k polygonům a analýza (BEZ výškových bodů)
         if polygon_fc and len(point_layers_for_join) > 0:
             try:
                 analysis_results = self.perform_spatial_join_analysis(
@@ -389,12 +438,34 @@ class CadFile(object):
                     except Exception as e:
                         arcpy.AddWarning(f"[export_layers] Nelze smazat původní polygon: {e}")
                     
+                    # SPLIT POLYGONŮ podle rozhraní výškových kruhů (pokud existuje)
+                    # Musí být PŘED split_analysis_by_layer a PŘED připojením výškových atributů
+                    if vyska_rozhrani_fc:
+                        try:
+                            main_analysis_fc = self.split_polygons_by_vyska_rozhrani(
+                                main_analysis_fc, vyska_rozhrani_fc, output_workspace, out_prefix
+                            )
+                            arcpy.AddMessage("[export_layers] ✓ Polygony rozděleny podle rozhraní výškových kruhů")
+                        except Exception as e:
+                            arcpy.AddWarning(f"[export_layers] Chyba při split polygonů podle rozhraní: {e}")
+                    
                     # Split Resene_uzemi_with_Points podle pole Layer
                     split_results = self.split_analysis_by_layer(
                         main_analysis_fc, output_workspace, out_prefix
                     )
                     if split_results:
                         exported_layers.extend(split_results)
+                        
+                        # SAMOSTATNÝ SPATIAL JOIN VÝŠKOVÝCH BODŮ ke splitnutým polygonům
+                        # (po rozdělení, aby se atributy připojily k finálním vrstvám)
+                        if vyska_centroids_fc:
+                            try:
+                                arcpy.AddMessage("[export_layers] Připojuji výškové atributy k finálním polygonům...")
+                                for split_fc in split_results:
+                                    self.add_vyska_attributes(split_fc, vyska_centroids_fc)
+                                arcpy.AddMessage("[export_layers] ✓ Výškové atributy připojeny ke všem finálním polygonům")
+                            except Exception as e:
+                                arcpy.AddWarning(f"[export_layers] Chyba při připojování výškových atributů: {e}")
                     
                     # Vytvoření chybových polygonů (sloučené polygony s chybami)
                     # 1. Chybový polygon pro špatné body (bez bodu nebo více bodů)
@@ -426,6 +497,14 @@ class CadFile(object):
                         except Exception as e:
                             arcpy.AddWarning(f"[export_layers] Nelze smazat bodovou vrstvu {os.path.basename(point_fc)}: {e}")
                     
+                    # Smazat výškové centroidy - již se nepoužívají
+                    if vyska_centroids_fc:
+                        try:
+                            arcpy.Delete_management(vyska_centroids_fc)
+                            arcpy.AddMessage(f"[export_layers] Smazána bodová vrstva výškových centroidů: {os.path.basename(vyska_centroids_fc)}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"[export_layers] Nelze smazat výškové centroidy: {e}")
+                    
                     # Smazat bod Resene_uzemi - již se nepoužívá
                     if resene_point_fc:
                         try:
@@ -438,6 +517,262 @@ class CadFile(object):
                 arcpy.AddError(f"[export_layers] Chyba při spatial join analýze: {e}")
         
         return exported_layers
+
+    def split_polygons_by_vyska_rozhrani(self, polygon_fc, rozhrani_fc, output_workspace, out_prefix):
+        """
+        Rozdělí polygony podle rozhraní výškových kruhů (302311_PL_VR_na_plochu_rozhrani).
+        Proces:
+        1. Snap rozhraní k hranám polygonů (tolerance 30 cm)
+        2. Polygon to Line (hrany polygonů)
+        3. Merge hran + rozhraní
+        4. Feature to Polygon (rozdělení)
+        5. Spatial join zpět k původním polygonům (přenos atributů)
+        """
+        try:
+            arcpy.AddMessage("[split_polygons_vyska] Začínám rozdělování polygonů podle rozhraní výškových kruhů")
+            
+            # 1. Snap rozhraní k hranám polygonů (30 cm tolerance)
+            arcpy.AddMessage("[split_polygons_vyska] 1. Snap rozhraní k hranám polygonů (30 cm)")
+            snap_env = [[polygon_fc, "EDGE", "0.3 Meters"]]
+            arcpy.edit.Snap(rozhrani_fc, snap_env)
+            
+            # 2. Polygon to Line - převod polygonů na linie
+            arcpy.AddMessage("[split_polygons_vyska] 2. Převod polygonů na linie")
+            polygon_lines_name = generate_unique_fc_name(f"{out_prefix}polygon_edges_temp",
+                                                        os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            polygon_lines_fc = os.path.join(output_workspace, polygon_lines_name)
+            
+            arcpy.management.PolygonToLine(
+                in_features=polygon_fc,
+                out_feature_class=polygon_lines_fc
+            )
+            
+            # 3. Merge hran polygonů + rozhraní
+            arcpy.AddMessage("[split_polygons_vyska] 3. Merge hran + rozhraní")
+            merged_lines_name = generate_unique_fc_name(f"{out_prefix}merged_split_lines_temp",
+                                                       os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            merged_lines_fc = os.path.join(output_workspace, merged_lines_name)
+            
+            arcpy.management.Merge(
+                inputs=[polygon_lines_fc, rozhrani_fc],
+                output=merged_lines_fc
+            )
+            
+            # 4. Feature to Polygon - vytvoření nových rozdělených polygonů
+            arcpy.AddMessage("[split_polygons_vyska] 4. Feature to Polygon - rozdělení")
+            split_polygons_name = generate_unique_fc_name(f"{out_prefix}split_polygons_temp",
+                                                          os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            split_polygons_fc = os.path.join(output_workspace, split_polygons_name)
+            
+            arcpy.management.FeatureToPolygon(
+                in_features=merged_lines_fc,
+                out_feature_class=split_polygons_fc,
+                cluster_tolerance="0.001 Meters"
+            )
+            
+            split_count = int(arcpy.GetCount_management(split_polygons_fc)[0])
+            arcpy.AddMessage(f"[split_polygons_vyska] Vytvořeno {split_count} rozdělených polygonů")
+            
+            # 5. Spatial Join - přenos atributů z původních polygonů
+            arcpy.AddMessage("[split_polygons_vyska] 5. Spatial join - přenos atributů")
+            final_split_name = generate_unique_fc_name(os.path.basename(polygon_fc).replace("_temp", ""),
+                                                       os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            final_split_fc = os.path.join(output_workspace, final_split_name)
+            
+            arcpy.analysis.SpatialJoin(
+                target_features=split_polygons_fc,
+                join_features=polygon_fc,
+                out_feature_class=final_split_fc,
+                join_operation="JOIN_ONE_TO_ONE",
+                join_type="KEEP_ALL",
+                match_option="HAVE_THEIR_CENTER_IN"
+            )
+            
+            final_count = int(arcpy.GetCount_management(final_split_fc)[0])
+            arcpy.AddMessage(f"[split_polygons_vyska] ✓ Finálních rozdělených polygonů: {final_count}")
+            
+            # Cleanup dočasných vrstev
+            arcpy.Delete_management(polygon_lines_fc)
+            arcpy.Delete_management(merged_lines_fc)
+            arcpy.Delete_management(split_polygons_fc)
+            arcpy.Delete_management(polygon_fc)  # Smazat původní nerozdělenou vrstvu
+            
+            arcpy.AddMessage(f"[split_polygons_vyska] Výsledná vrstva: {final_split_name}")
+            
+            return final_split_fc
+            
+        except Exception as e:
+            arcpy.AddError(f"[split_polygons_vyska] Chyba při rozdělování polygonů: {e}")
+            return polygon_fc  # V případě chyby vrátit původní
+
+    def add_vyska_attributes(self, polygon_fc, vyska_points_fc):
+        """
+        Připojí výškové atributy z bodů k polygonům pomocí spatial join.
+        Nepřepisuje existující polygony, jen přidává nová pole.
+        """
+        try:
+            arcpy.AddMessage(f"[add_vyska_attributes] Připojuji výškové atributy k: {os.path.basename(polygon_fc)}")
+            
+            # Vytvoření dočasné vrstvy se spatial join
+            temp_join_name = f"temp_vyska_join_{os.path.basename(polygon_fc)}"
+            temp_join_fc = os.path.join("in_memory", temp_join_name)
+            
+            arcpy.analysis.SpatialJoin(
+                target_features=polygon_fc,
+                join_features=vyska_points_fc,
+                out_feature_class=temp_join_fc,
+                join_operation="JOIN_ONE_TO_ONE",
+                join_type="KEEP_ALL",
+                match_option="CONTAINS"
+            )
+            
+            # Seznam výškových atributů k přenosu
+            vyska_fields = [
+                "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
+                "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
+                "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
+            ]
+            
+            # Najít která pole skutečně existují v temp_join
+            temp_fields = [f.name for f in arcpy.ListFields(temp_join_fc)]
+            fields_to_transfer = []
+            
+            for field in vyska_fields:
+                # Hledat pole s suffixem _1 (z join)
+                if f"{field}_1" in temp_fields:
+                    fields_to_transfer.append(field)
+            
+            if not fields_to_transfer:
+                arcpy.AddMessage(f"[add_vyska_attributes] Žádné výškové atributy k přenosu")
+                arcpy.Delete_management(temp_join_fc)
+                return
+            
+            # Přidat nová pole do původního polygonu (pokud neexistují)
+            for field in fields_to_transfer:
+                target_field_name = f"VR_{field}"  # Prefix VR_ pro rozlišení od klasifikačních atributů
+                
+                # Zkontrolovat zda pole už existuje
+                existing_fields = [f.name for f in arcpy.ListFields(polygon_fc)]
+                if target_field_name not in existing_fields:
+                    # Zjistit typ pole ze source
+                    source_field = [f for f in arcpy.ListFields(temp_join_fc) if f.name == f"{field}_1"][0]
+                    arcpy.AddField_management(
+                        polygon_fc,
+                        target_field_name,
+                        source_field.type,
+                        field_length=source_field.length if source_field.type == "String" else None
+                    )
+            
+            # Přenést hodnoty pomocí Update Cursor
+            poly_fields = ["OBJECTID"] + [f"VR_{field}" for field in fields_to_transfer]
+            temp_fields_to_read = ["TARGET_FID"] + [f"{field}_1" for field in fields_to_transfer]
+            
+            # Vytvoření mapy hodnot z temp_join
+            value_map = {}
+            with arcpy.da.SearchCursor(temp_join_fc, temp_fields_to_read) as cursor:
+                for row in cursor:
+                    target_fid = row[0]
+                    values = row[1:]
+                    value_map[target_fid] = values
+            
+            # Aktualizace původních polygonů
+            updated_count = 0
+            with arcpy.da.UpdateCursor(polygon_fc, poly_fields) as cursor:
+                for row in cursor:
+                    oid = row[0]
+                    if oid in value_map:
+                        # Zkopírovat hodnoty
+                        for i, value in enumerate(value_map[oid]):
+                            row[i + 1] = value
+                        cursor.updateRow(row)
+                        updated_count += 1
+            
+            arcpy.AddMessage(f"[add_vyska_attributes] ✓ Aktualizováno {updated_count} polygonů, přeneseno {len(fields_to_transfer)} atributů")
+            
+            # Cleanup
+            arcpy.Delete_management(temp_join_fc)
+            
+        except Exception as e:
+            arcpy.AddWarning(f"[add_vyska_attributes] Chyba: {e}")
+
+    def process_vyska_circles_to_points(self, circles_fc, output_workspace, out_prefix, spatial_ref):
+        """
+        Zpracuje výškové kruhy (302310_BL_VR_na_plochu):
+        1. Multipart to Singlepart (rozdělit vícenásobné geometrie)
+        2. Filtrování pouze uzavřených linií (kruhy)
+        3. Převod kruhů na body (centroids)
+        4. Výsledek: bodová vrstva se středy kruhů + všechny atributy
+        """
+        arcpy.AddMessage("[process_vyska_circles] Začínám zpracování výškových kruhů.")
+        
+        try:
+            # 1. Multipart to Singlepart
+            singlepart_name = generate_unique_fc_name(f"{out_prefix}VR_plochu_singlepart_temp", 
+                                                     os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            singlepart_fc = os.path.join(output_workspace, singlepart_name)
+            
+            arcpy.management.MultipartToSinglepart(circles_fc, singlepart_fc)
+            arcpy.AddMessage("[process_vyska_circles] Multipart to Singlepart dokončen")
+            
+            # 2. Vytvoření prázdné feature class pro kruhy
+            circles_only_name = generate_unique_fc_name(f"{out_prefix}302310_VR_circles_LN", 
+                                                        os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            circles_only_fc = os.path.join(output_workspace, circles_only_name)
+            
+            arcpy.management.CreateFeatureclass(
+                out_path=output_workspace,
+                out_name=os.path.basename(circles_only_fc),
+                geometry_type="POLYLINE",
+                template=singlepart_fc,
+                spatial_reference=spatial_ref
+            )
+            
+            # 3. Kopírování pouze uzavřených linií (kruhy)
+            circles_count = 0
+            field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
+                          if field.type != "OID" and field.name.upper() != "OBJECTID"]
+            
+            with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
+                with arcpy.da.InsertCursor(circles_only_fc, ["SHAPE@"] + field_names) as insert_cursor:
+                    for row in search_cursor:
+                        geometry = row[0]
+                        if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
+                            insert_cursor.insertRow(row)
+                            circles_count += 1
+            
+            arcpy.AddMessage(f"[process_vyska_circles] Nalezeno a zachováno {circles_count} uzavřených linií (kruhů)")
+            
+            # Smazání dočasné singlepart vrstvy
+            arcpy.Delete_management(singlepart_fc)
+            
+            if circles_count == 0:
+                arcpy.AddWarning("[process_vyska_circles] Nebyly nalezeny žádné kruhy - přeskakuji převod na body")
+                arcpy.Delete_management(circles_only_fc)
+                return None
+            
+            # 4. Převod kruhů na body (centroids)
+            circles_points_name = generate_unique_fc_name(f"{out_prefix}302310_VR_circle_centroids_PT", 
+                                                          os.path.dirname(output_workspace) if arcpy.Describe(output_workspace).datatype == "FeatureDataset" else output_workspace)
+            circles_points_fc = os.path.join(output_workspace, circles_points_name)
+            
+            arcpy.management.FeatureToPoint(
+                in_features=circles_only_fc,
+                out_feature_class=circles_points_fc,
+                point_location="INSIDE"  # Centroid uvnitř polygonu
+            )
+            
+            points_count = int(arcpy.GetCount_management(circles_points_fc)[0])
+            arcpy.AddMessage(f"[process_vyska_circles] Vytvořeno {points_count} bodů (centroidů kruhů)")
+            arcpy.AddMessage(f"[process_vyska_circles] Výsledná bodová vrstva: {circles_points_name}")
+            
+            # Smazání mezivýsledků (kruhy ponecháme pro případnou kontrolu)
+            # arcpy.Delete_management(circles_only_fc)
+            
+            return circles_points_fc
+            
+        except Exception as e:
+            arcpy.AddError(f"[process_vyska_circles] Chyba při zpracování výškových kruhů: {e}")
+            return None
 
     def process_polylines_to_polygon(self, polyline_fcs, resene_line_fc, output_workspace, out_prefix, spatial_ref):
         """
@@ -1003,7 +1338,11 @@ class CadFile(object):
             "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
             "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
             "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D",
-            "bod", "pozice_resene_uzemi"
+            "bod", "pozice_resene_uzemi",
+            # Výškové atributy s prefixem VR_
+            "VR_OZNACENI", "VR_NAZEV_BLOK", "VR_DRUH_UP", "VR_DRUH_INFO", "VR_DOK_NAZEV",
+            "VR_RIMSA_MIN", "VR_RIMSA_MAX", "VR_VYSKA_VB", "VR_VYSKA_VB_I", "VR_PODTYP",
+            "VR_NP_MIN", "VR_NP_MAX", "VR_NUP_MAX", "VR_VYSKA_MAX", "VR_VYSKA_VB_D"
         ]
         
         try:
@@ -1224,7 +1563,9 @@ class ExportLayer(object):
                     "202110_BL_Cast_uzemi_UP": ["Point"],
                     "203110_BL_Cast_uzemi_SB": ["Point"], 
                     "204110_BL_Cast_uzemi_NB": ["Point"],
-                    "205110_BL_Cast_uzemi_XB": ["Point"]
+                    "205110_BL_Cast_uzemi_XB": ["Point"],
+                    "302310_BL_VR_na_plochu": ["Polyline"],  # Výškové kruhy na plochu
+                    "302311_PL_VR_na_plochu_rozhrani": ["Polyline"]  # Rozhraní výškových kruhů
                 }
                 
                 # Najít odpovídající vrstvy v CAD souboru
