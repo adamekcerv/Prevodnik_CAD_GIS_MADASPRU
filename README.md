@@ -2,6 +2,25 @@
 
 Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s automatickou analýzou. Sada obsahuje dva specializované převodníky pro územní plánování.
 
+## Hlavní vlastnosti
+
+✅ **Profesionální architektura**
+- Centralizácia konstant pro všechny geometrické tolerance
+- Automatický cleanup manager pro dočasné vrstvy
+- Komplexní error handling s validací vstupů
+- Detailní dokumentace všech geometrických operací
+
+✅ **Robustní zpracování**
+- Validace a oprava geometrie před zpracováním
+- Fallback strategie při selhání primárních metod
+- Context managery pro bezpečnou práci s workspace
+- Automatické čištění i při chybách
+
+✅ **Konfigurovatelnost**
+- Všechny tolerance jako konstanty (jednoduchá změna)
+- Jasně definované geometrické parametry
+- Flexibilní nastavení pro různé typy dat
+
 ## Přehled toolboxů
 
 
@@ -211,78 +230,137 @@ Požadavky:
 
 Postup:
 1. Stáhněte soubory:
-   - Prevodnik_CAD_GIS_Kompletni.pyt (univerzální - doporučeno)
-   - Prevodnik_CAD_GIS_ReseneUzemi.pyt (samostatně použitelný)
-   - Prevodnik_CAD_GIS_Vysky.pyt (samostatně použitelný)
+   - Prevodnik_CAD_GIS_ReseneUzemi.pyt (řešená území)
+   - Prevodnik_CAD_GIS_Vysky.pyt (výšky)
 2. Zkopírujte do složky s ArcGIS Pro projektem
 3. V ArcGIS Pro: Catalog Pane - Toolboxes - Add Toolbox
-4. Vyberte požadovaný .pyt soubor
-5. Pro Kompletní toolbox musí být všechny tři .pyt soubory ve stejné složce
+4. Vyberte požadovaný .pyt soubor (jeden nebo oba)
+5. Oba převodníky mohou být použity nezávisle nebo kombinovaně
 
 ## Použití
 
-### Univerzální převodník (Kompletni)
-
-Základní workflow:
-```
-CAD soubor → Výběr režimu → Automatické zpracování → Výsledné vrstvy
-```
-
-Parametry:
-- Režim zpracování - Řešená území / Výšky / Obojí
-- Input CAD Soubor - cesta k DWG/DXF/DGN
-- Output Geodatabáze - povinný
-- Output Feature Dataset - volitelný (stejný pro oba režimy)
-- XY Tolerance - 0.01 m (default)
-- XY Resolution - 0.001 m (default)
-- Output Souřadnicový Systém - auto/S-JTSK
-- Geographic Transformation - volitelný
-- Prefix jména výstupu - Z/PL_ (default podle režimu)
-
-Režim "Obojí":
-- Spustí Řešená území s prefixem "Z"
-- Pak spustí Výšky s prefixem "PL_"
-- Obě části použijí stejnou geodatabázi a feature dataset
-- Vrstvy z Řešených území se zachovají a použijí v Výškách (pokud mají pole Layer)
-- Celkový čas: součet obou částí (cca 5-40 minut dle dat)
-
-### Samostatné toolboxy
+### Převodník Řešených území
 
 Základní workflow:
 ```
 CAD soubor → Načtení vrstev → Automatický výběr → Export a zpracování → Výsledné vrstvy
 ```
 
-Parametry toolboxů:
+Parametry:
 - Input CAD Soubor - cesta k DWG/DXF/DGN
-- CAD Vrstva(y) - automaticky předvolené
+- CAD Vrstva(y) - automaticky předvolené (101110, 200000, 101111, 202110-205110, 302310, 302311)
 - Output Geodatabáze - povinný
 - Output Feature Dataset - volitelný
 - XY Tolerance - 0.01 m (default)
 - XY Resolution - 0.001 m (default)
 - Output Souřadnicový Systém - auto/S-JTSK
 - Geographic Transformation - volitelný
-- Prefix jména výstupu - Z/PL_
+- Prefix jména výstupu - Z (default)
 
-Spuštění:
-1. Otevřete toolbox v ArcGIS Pro
-2. Spusťte příslušný tool
+### Převodník Výšek
+
+Základní workflow:
+```
+CAD soubor → Načtení vrstev → Automatický výběr → Export a zpracování → Výsledné vrstvy
+```
+
+Parametry:
+- Input CAD Soubor - cesta k DWG/DXF/DGN
+- CAD Vrstva(y) - automaticky předvolené (3011xx SC vrstvy, 302110, 302210, 302211)
+- Output Geodatabáze - povinný
+- Output Feature Dataset - volitelný
+- XY Tolerance - 0.01 m (default)
+- XY Resolution - 0.001 m (default)
+- Output Souřadnicový Systém - auto/S-JTSK
+- Geographic Transformation - volitelný
+- Prefix jména výstupu - PL_ (default)
+
+### Kombinované použití obou převodníků
+
+Pokud potřebujete zpracovat oba typy dat (podrobný postup):
+
+1. **Nejprve spusťte Převodník Řešených území:**
+   - Input CAD: váš DWG/DXF soubor
+   - Output GDB: vaše geodatabáze
+   - Output FD: např. "Resene_uzemi"
+   - Prefix: "Z"
+   - Výsledek: polygony Z202110_UP, Z203110_SB atd.
+
+2. **Poté spusťte Převodník Výšek:**
+   - Input CAD: stejný DWG/DXF soubor
+   - Output GDB: stejná geodatabáze
+   - Output FD: stejný nebo jiný (např. "Vysky")
+   - Prefix: "PL_"
+   - Výsledek: centerline PL_Z301110, PL_Z301111 atd.
+
+3. **Výsledek:**
+   - Obě sady vrstev v jedné geodatabázi
+   - Možnost použít stejný nebo odlišný feature dataset
+   - Vrstvy se navzájem neovlivní
+
+### Spuštění toolboxů
+### Spuštění toolboxů
+
+1. Otevřete příslušný toolbox v ArcGIS Pro
+2. Spusťte tool (Export Layer)
 3. Nastavte parametry (CAD soubor, geodatabáze)
-4. Spusťte - vrstvy se automaticky předvyberou
-5. Ověřte výsledky
+4. Vrstvy se automaticky předvyberou dle typu
+5. Spusťte a ověřte výsledky
 
 ## Konfigurace
 
-Tolerance a rozlišení:
-- XY Tolerance: 0.01 m (standardní nastavení)
-- XY Resolution: 0.001 m (milimetrová přesnost)
-- Integrate Tolerance: 0.3 m (vyčištění geometrie)
-- Snap Tolerance: 0.3-1.0 m (přichycení linií)
+### Geometrické konstanty (GeometryConstants)
 
-Souřadnicový systém:
-Automatická detekce z CAD souboru. Pokud není dostupný, používá se S-JTSK (EPSG:5514). Podporována automatická reprojekce.
+**Řešená území:**
+```python
+SNAP_TOLERANCE = 0.3        # metry - tolerance pro snap operace
+BUFFER_DISTANCE = 0.3       # metry - vzdálenost bufferu
+BUFFER_SEARCH = 0.35        # metry - tolerance pro vyhledávání v bufferu
+XY_TOLERANCE_DEFAULT = 0.01 # metry - defaultní XY tolerance
+XY_RESOLUTION_DEFAULT = 0.001 # metry - defaultní XY rozlišení
+CLUSTER_TOLERANCE = 0.001   # metry - cluster tolerance pro Feature to Polygon
+INTEGRATE_TOLERANCE = 0.001 # metry - integrate tolerance
+```
 
-Specifické nastavení:
+**Výšky:**
+```python
+BUFFER_DISTANCE = 0.3       # metry - šířka bufferu ze SC linií
+BUFFER_SEARCH = 0.35        # metry - tolerance pro vyhledávání v bufferu
+SNAP_TOLERANCE = 0.3        # metry - tolerance pro snap operace (edge)
+SNAP_VERTEX_TOLERANCE = 0.2 # metry - tolerance pro snap na vrcholy
+SNAP_SEARCH_RADIUS = 0.1    # metry - radius pro spatial join intersect
+XY_TOLERANCE_DEFAULT = 0.01 # metry - defaultní XY tolerance
+XY_RESOLUTION_DEFAULT = 0.001 # metry - defaultní XY rozlišení
+CLUSTER_TOLERANCE = 0.001   # metry - cluster tolerance pro Feature to Polygon
+DENSIFY_DISTANCE = 0.5      # metry - vzdálenost pro densifikaci
+GENERALIZE_TOLERANCE = 0.02 # metry - tolerance pro generalizaci
+CUTTING_LINE_LENGTH = 1.0   # metry - délka kolmých řezných čar (na každou stranu)
+```
+
+### Souřadnicové systémy
+
+Defaultní: S-JTSK / Krovak East North (EPSG:5514)
+
+Automatická detekce z CAD souboru. Pokud není dostupný, používá se S-JTSK. Podporována automatická reprojekce.
+
+### Error Handling a Cleanup
+
+**CleanupManager:**
+- Automaticky registruje všechny dočasné vrstvy
+- Garanční mazání i při chybách
+- Logování smazání a selhání
+
+**Managed Workspace:**
+- Context manager pro bezpečnou práci s workspace
+- Automatické obnovení původního nastavení
+- Zajistí overwriteOutput i při chybě
+
+**Validace geometrie:**
+- RepairGeometry před každou významnou operací
+- Detekce a odstranění null geometrií
+- Kontrola validity polygonů (plocha > 0)
+
+### Specifické nastavení
 
 Řešená území:
 - Buffer tolerance: 30 cm pro geometric cleaning
@@ -295,6 +373,85 @@ Výšky:
 - Cutting lines: kolmé řezné čáry automaticky generované v místech rozhraní
 - Align distance: 2.0 m pro srovnání geometrie centerline
 - Fallback: simple buffer pokud chybí vrstva 302211
+
+## Architektura a kvalita kódu
+
+### Organizácia kódu
+
+**Konstanty:**
+- `GeometryConstants` - všechny geometrické tolerance a vzdálenosti
+- `SpatialReferenceConstants` - EPSG kódy souřadnicových systémů
+- `LayerNames` - názvy speciálních vrstev (Řešená území)
+- `DEFAULT_LAYERS` - předvolené vrstvy (Výšky)
+
+**Pomocné třídy:**
+- `CleanupManager` - správa dočasných vrstev s automatickým čištěním
+- `CadFile` - reprezentace CAD souboru a jeho vrstev
+- `CadLayer` - reprezentace jedné CAD vrstvy s geometrií
+
+**Context managery:**
+- `managed_workspace()` - bezpečná práce s workspace
+- Automatické obnovení původního nastavení
+
+**Pomocné funkce:**
+- `validate_geometry()` - validace a oprava geometrie
+- `generate_unique_fc_name()` - generování unikátních názvů
+- `sanitize_fc_name()` - čištění názvů podle ArcGIS pravidel
+
+### Dokumentace
+
+**Docstringy obsahují:**
+- Popis funkce/metody
+- Args: Detailní popis všech parametrů
+- Returns: Co metoda vrací
+- Raises: Jaké výjimky může vyvolat
+- Technické poznámky: Speciální detaily implementace
+
+**Komplexní geometrické operace:**
+- `process_polylines_to_polygon()` - 10 kroků zpracování polyline
+- `split_polygons_by_vyska_rozhrani()` - rozdělení polygonů podle rozhraňí
+- Kolmé řezné čáry - 350+ řádků s detailními komentáři
+- `execute()` metody - komplexní přehled procesu
+
+### Error Handling
+
+**Vstupní validace:**
+```python
+if not input_cad or not arcpy.Exists(input_cad):
+    arcpy.AddError("Vstupní CAD soubor neexistuje")
+    return
+```
+
+**Try-except bloky:**
+- Vyčerpné logování chyb
+- Informativní chybové hlášky
+- Fallback strategie při selhání
+
+**Cleanup garance:**
+```python
+try:
+    # Zpracování dat
+    results = process_data(...)
+finally:
+    cleanup_manager.cleanup_all()
+```
+
+### Testování a validace
+
+**Před zpracováním:**
+- Kontrola existence vstupních souborů
+- Validace geodatabáze
+- Kontrola dostupnosti vrstev v CAD
+
+**Během zpracování:**
+- RepairGeometry na klikových místech
+- Kontrola počtu záznamů po každé operaci
+- Logování průběžných stavů
+
+**Po zpracování:**
+- Vypečetí počtu finlních vrstev
+- Kontrola integrity výstupů
+- Výpis shrnutí výsledků
 
 ## Řešení problémů
 
@@ -326,16 +483,67 @@ Výšky:
 - "Původní SC linie nebyly nalezeny" - geometrie centerline zůstane z PolygonToCenterline
 - "VR rozhraní nebylo nalezeno" - vytvoří se jednoduchý buffer přímo ze všech SC linií bez rozdělení
 
-## Výkonnost
+## Výkonnost a optimalizace
 
-Doporučená konfigurace:
+### Doporučená konfigurace
 - Použijte SSD disk pro geodatabázi
 - Minimalizujte ostatní procesy během zpracování
 - Pro CAD soubory větší než 100 MB zvažte rozdělení na menší části
+- Použijte lokální geodatabázi (ne síťovou)
 
-Typické časy zpracování:
+### Typické časy zpracování
 - Řešená území: 3-15 minut dle počtu polygonů a bodů
-- Výšky: 5-25 minut dle složitosti SC sítě a počtu rozhraní
+- Výšky: 5-25 minut dle složitosti SC sítě a počtu rozhraňí
+
+### Optimalizace
+
+**Memory management:**
+- CleanupManager automaticky maže dočasné vrstvy
+- Použití in_memory workspace pro menší vrstvy
+- Postupné zpracování místo všeho najednou
+
+**Geometrické operace:**
+- RepairGeometry pouze kdy je nutné
+- Integrate pouze na finální polygony
+- Spatial join s vhodným match_option
+
+**Logování:**
+- Průběžný výpis stavu zpracování
+- Počítače prvků po každé operaci
+- Warnings místo Errors kde je to vhodné
+
+## Changelog
+
+### Verze 2.1 (Prosinec 2025)
+
+**Nové funkce:**
+- ✨ Centralizácia všech geometrických konstant
+- ✨ CleanupManager pro automatické čištění dočasných vrstev
+- ✨ Context managery pro bezpečnou práci s workspace
+- ✨ Funkce validate_geometry() pro opravu geometrie
+
+**Vylepšení:**
+- 📝 Komplexní dokumentace všech geometrických operací
+- 📝 Docstringy s Args, Returns, Raises pro všechny metody
+- 🔒 Rozšířený error handling s validací vstupů
+- 🔒 Try-except bloky s informativními hláškami
+- 🛠 Použití konstant místo hardcoded hodnot
+- 🛠 Lepší správa paměti a cleanup
+
+**Technické změny:**
+- Refactoring: všechny tolerance jako konstanty
+- Refactoring: cleanup logika centralizována
+- Refactoring: validace geometrie před klkovými operacemi
+- Dokumentace: 350+ řádků komentářů ke kolmým řezným čárám
+
+### Verze 2.0 (Listopad 2025)
+- Přidání převodníku Výšek
+- Komplexní zpracování výškových regulativů
+- Centerline generování
+
+### Verze 1.0 (2024)
+- Původní převodník Řešených území
+- Základní geometrické operace
 
 Poslední aktualizace: Prosinec 2025
 Verze: 2.1

@@ -1,6 +1,105 @@
 # -*- coding: utf-8 -*-
+"""
+CAD Import Tools - Řešená území
+
+Tento převodník zpracovává CAD data řešených území a provádí:
+- Import a export CAD vrstev do geodatabáze
+- Konverzi polyline na polygony s integrací
+- Spatial join bodových vrstev k polygonům
+- Zpracování výškových kruhů a jejich atributů
+- Detekci a signalizaci chyb v datech
+"""
+
 import arcpy
 import os
+import logging
+from contextlib import contextmanager
+
+# ============================================================================
+# KONSTANTY
+# ============================================================================
+
+class GeometryConstants:
+    """Geometrické konstanty pro zpracování CAD dat"""
+    SNAP_TOLERANCE = 0.3        # metry - tolerance pro snap operace
+    BUFFER_DISTANCE = 0.3       # metry - vzdálenost bufferu
+    BUFFER_SEARCH = 0.35        # metry - tolerance pro vyhledávání v bufferu
+    XY_TOLERANCE_DEFAULT = 0.01 # metry - defaultní XY tolerance
+    XY_RESOLUTION_DEFAULT = 0.001 # metry - defaultní XY rozlišení
+    CLUSTER_TOLERANCE = 0.001   # metry - cluster tolerance pro Feature to Polygon
+    INTEGRATE_TOLERANCE = 0.001 # metry - integrate tolerance
+
+class SpatialReferenceConstants:
+    """Konstanty souřadnicových systémů"""
+    SJTSK_EPSG = 5514  # S-JTSK / Krovak East North
+
+class LayerNames:
+    """Názvy speciálních vrstev pro zpracování"""
+    RESENE_UZEMI_POLYLINE = "101110_PL_Resene_uzemi"
+    RESENE_UZEMI_POINT = "101111_BL_Resene_uzemi"
+    CAST_UZEMI_POLYLINE = "200000_PL_Cast_uzemi"
+    CAST_UZEMI_UP = "202110_BL_Cast_uzemi_UP"
+    CAST_UZEMI_SB = "203110_BL_Cast_uzemi_SB"
+    CAST_UZEMI_NB = "204110_BL_Cast_uzemi_NB"
+    CAST_UZEMI_XB = "205110_BL_Cast_uzemi_XB"
+    VYSKA_CIRCLES = "302310_BL_VR_na_plochu"
+    VYSKA_ROZHRANI = "302311_PL_VR_na_plochu_rozhrani"
+
+# ============================================================================
+# POMOCNÉ TŘÍDY
+# ============================================================================
+
+class CleanupManager:
+    """Správce pro automatické čištění dočasných vrstev"""
+    
+    def __init__(self):
+        self.temp_layers = []
+        self.logger = logging.getLogger(__name__)
+    
+    def register(self, layer_path):
+        """Registruje vrstvu pro pozdější smazání"""
+        if layer_path and layer_path not in self.temp_layers:
+            self.temp_layers.append(layer_path)
+        return layer_path
+    
+    def cleanup_all(self):
+        """Smaže všechny registrované dočasné vrstvy"""
+        deleted_count = 0
+        failed_count = 0
+        
+        for layer in self.temp_layers:
+            try:
+                if arcpy.Exists(layer):
+                    arcpy.Delete_management(layer)
+                    deleted_count += 1
+            except Exception as e:
+                self.logger.warning(f"Nelze smazat dočasnou vrstvu {layer}: {e}")
+                failed_count += 1
+        
+        self.temp_layers.clear()
+        
+        if deleted_count > 0:
+            arcpy.AddMessage(f"[Cleanup] Smazáno {deleted_count} dočasných vrstev")
+        if failed_count > 0:
+            arcpy.AddWarning(f"[Cleanup] Nepodařilo se smazat {failed_count} vrstev")
+
+@contextmanager
+def managed_workspace(workspace_path):
+    """Context manager pro práci s workspace - automaticky obnoví původní nastavení"""
+    original_workspace = arcpy.env.workspace
+    original_overwrite = arcpy.env.overwriteOutput
+    
+    try:
+        arcpy.env.workspace = workspace_path
+        arcpy.env.overwriteOutput = True
+        yield workspace_path
+    finally:
+        arcpy.env.workspace = original_workspace
+        arcpy.env.overwriteOutput = original_overwrite
+
+# ============================================================================
+# POMOCNÉ FUNKCE
+# ============================================================================
 
 def parameter(displayName, name, datatype,
               parameterType='Required',
@@ -100,6 +199,19 @@ class CadLayer(object):
                out_prefix=""):
         """
         Exportuje jednu CAD vrstvu do geodatabáze.
+        
+        Args:
+            output_workspace: Cílový workspace (geodatabáze nebo feature dataset)
+            new_name: Nový název feature class (volitelné)
+            spatial_ref: Cílový souřadnicový systém (volitelné)
+            transform_method: Metoda transformace (volitelné)
+            out_prefix: Prefix pro název výstupní vrstvy (volitelné)
+            
+        Returns:
+            str: Cesta k exportované feature class nebo None při chybě
+            
+        Raises:
+            None - chyby jsou logovány jako warnings
         """
         if not new_name:
             base_name = self.name
@@ -170,6 +282,20 @@ class CadLayer(object):
     def define_and_project(self, fc, spatial_ref, transform_method=None):
         """
         Definuje souřadnicový systém a provede reprojekci pokud je potřeba.
+        
+        Proces:
+        1. Kontrola existujícího souřadnicového systému
+        2. Definice souřadnicového systému pokud není definován
+        3. Reprojekce pokud se liší od cílového systému
+        4. Cleanup dočasných dat
+        
+        Args:
+            fc: Cesta k feature class
+            spatial_ref: Cílový souřadnicový systém
+            transform_method: Metoda geografické transformace (volitelné)
+            
+        Returns:
+            str: Cesta k feature class (může být nová po reprojekci)
         """
         try:
             desc = arcpy.Describe(fc)
@@ -824,6 +950,14 @@ class CadFile(object):
         """
         arcpy.AddMessage("[process_polylines_to_polygon] Začínám speciální zpracování polyline vrstev.")
         
+        if not polyline_fcs:
+            arcpy.AddWarning("[process_polylines_to_polygon] Žádné polyline vrstvy k zpracování")
+            return None, None
+            
+        if not resene_line_fc or not arcpy.Exists(resene_line_fc):
+            arcpy.AddError("[process_polylines_to_polygon] Linie řešeného území neexistuje")
+            return None, None
+        
         try:
             # Získání kořenové geodatabáze pro kontrolu jedinečnosti názvů
             desc_ws = arcpy.Describe(output_workspace)
@@ -840,8 +974,9 @@ class CadFile(object):
             arcpy.management.Merge(polyline_fcs, merged_fc)  # Všechny včetně resene_line_fc
             
             # 2. Snap linií k sobě navzájem s tolerancí 30 cm pro spojení neuzavřených konců
-            arcpy.AddMessage("[process_polylines_to_polygon] 2. Snap linií k hranám (EDGE) - tolerance 30 cm")
-            snap_env = [[merged_fc, "EDGE", "0.3 Meters"]]
+            snap_tolerance = f"{GeometryConstants.SNAP_TOLERANCE} Meters"
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 2. Snap linií k hranám (EDGE) - tolerance {snap_tolerance}")
+            snap_env = [[merged_fc, "EDGE", snap_tolerance]]
             arcpy.edit.Snap(merged_fc, snap_env)
             
             # 3. Feature to Polygon z VŠECH mergnutých linií (zaplněný polygon)
@@ -886,8 +1021,9 @@ class CadFile(object):
             arcpy.management.Merge([temp_filled_polygons, temp_main_polygon], all_polygons_temp)
             
             # 7. Integrate na všechny polygony najednou - zaručí správné geometrické napojení
-            arcpy.AddMessage("[process_polylines_to_polygon] 6. Integrate všech polygonů s tolerancí 30 cm")
-            arcpy.management.Integrate([all_polygons_temp], "0.3 Meters")
+            integrate_tolerance = f"{GeometryConstants.SNAP_TOLERANCE} Meters"
+            arcpy.AddMessage(f"[process_polylines_to_polygon] 6. Integrate všech polygonů s tolerancí {integrate_tolerance}")
+            arcpy.management.Integrate([all_polygons_temp], integrate_tolerance)
             
             # 8. Oddělení finálních polygonů (BEZ hlavního polygonu řešeného území)
             parts_polygon_name = f"{out_prefix}Resene_uzemi_PL" if out_prefix else "Resene_uzemi_PL"

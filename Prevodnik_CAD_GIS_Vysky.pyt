@@ -1,6 +1,43 @@
 # -*- coding: utf-8 -*-
+"""
+CAD Import Tools - Výšky (MADASPRU)
+
+Tento převodník zpracovává CAD data výškových vrstev a provádí:
+- Import SC vrstev (strukturní čáry) z CAD
+- Merge a topologické čištění SC linií
+- Detekci rozhraní pomocí průsečíků
+- Vytváření bufferů a jejich rozdělení podle rozhraní
+- Spatial join s výškovými kruhy
+- Generování centerline (střední čáry polygonů)
+- Split výsledků podle Layer atributu
+"""
+
 import arcpy
 import os
+import logging
+from contextlib import contextmanager
+
+# ============================================================================
+# KONSTANTY
+# ============================================================================
+
+class GeometryConstants:
+    """Geometrické konstanty pro zpracování výškových dat"""
+    BUFFER_DISTANCE = 0.3       # metry - šířka bufferu ze SC linií
+    BUFFER_SEARCH = 0.35        # metry - tolerance pro vyhledávání v bufferu
+    SNAP_TOLERANCE = 0.3        # metry - tolerance pro snap operace (edge)
+    SNAP_VERTEX_TOLERANCE = 0.2 # metry - tolerance pro snap na vrcholy
+    SNAP_SEARCH_RADIUS = 0.1    # metry - radius pro spatial join intersect
+    XY_TOLERANCE_DEFAULT = 0.01 # metry - defaultní XY tolerance
+    XY_RESOLUTION_DEFAULT = 0.001 # metry - defaultní XY rozlišení
+    CLUSTER_TOLERANCE = 0.001   # metry - cluster tolerance pro Feature to Polygon
+    DENSIFY_DISTANCE = 0.5      # metry - vzdálenost pro densifikaci
+    GENERALIZE_TOLERANCE = 0.02 # metry - tolerance pro generalizaci
+    CUTTING_LINE_LENGTH = 1.0   # metry - délka kolmých řezných čar (na každou stranu)
+
+class SpatialReferenceConstants:
+    """Konstanty souřadnicových systémů"""
+    SJTSK_EPSG = 5514  # S-JTSK / Krovak East North
 
 # Defaultní vrstvy pro MADASPRU project
 DEFAULT_LAYERS = [
@@ -8,6 +45,82 @@ DEFAULT_LAYERS = [
     "302210_BL_VR_na_linii",
     "302211_PL_VR_na_linii_rozhrani"
 ]
+
+# ============================================================================
+# POMOCNÉ TŘÍDY
+# ============================================================================
+
+class CleanupManager:
+    """Správce pro automatické čištění dočasných vrstev"""
+    
+    def __init__(self):
+        self.temp_layers = []
+        self.logger = logging.getLogger(__name__)
+    
+    def register(self, layer_path):
+        """Registruje vrstvu pro pozdější smazání"""
+        if layer_path and layer_path not in self.temp_layers:
+            self.temp_layers.append(layer_path)
+        return layer_path
+    
+    def cleanup_all(self):
+        """Smaže všechny registrované dočasné vrstvy"""
+        deleted_count = 0
+        failed_count = 0
+        
+        for layer in self.temp_layers:
+            try:
+                if arcpy.Exists(layer):
+                    arcpy.Delete_management(layer)
+                    deleted_count += 1
+            except Exception as e:
+                self.logger.warning(f"Nelze smazat dočasnou vrstvu {layer}: {e}")
+                failed_count += 1
+        
+        self.temp_layers.clear()
+        
+        if deleted_count > 0:
+            arcpy.AddMessage(f"[Cleanup] Smazáno {deleted_count} dočasných vrstev")
+        if failed_count > 0:
+            arcpy.AddWarning(f"[Cleanup] Nepodařilo se smazat {failed_count} vrstev")
+
+@contextmanager
+def managed_workspace(workspace_path):
+    """Context manager pro práci s workspace - automaticky obnoví původní nastavení"""
+    original_workspace = arcpy.env.workspace
+    original_overwrite = arcpy.env.overwriteOutput
+    
+    try:
+        arcpy.env.workspace = workspace_path
+        arcpy.env.overwriteOutput = True
+        yield workspace_path
+    finally:
+        arcpy.env.workspace = original_workspace
+        arcpy.env.overwriteOutput = original_overwrite
+
+def validate_geometry(fc, operation_name=""):
+    """
+    Validuje a opravuje geometrii feature class.
+    
+    Args:
+        fc: Cesta k feature class
+        operation_name: Název operace pro logging
+        
+    Returns:
+        bool: True pokud je geometrie validní/opravena, False při chybě
+    """
+    try:
+        arcpy.RepairGeometry_management(fc, "DELETE_NULL")
+        if operation_name:
+            arcpy.AddMessage(f"[{operation_name}] Geometrie validována a opravena")
+        return True
+    except Exception as e:
+        arcpy.AddWarning(f"[{operation_name}] Chyba při validaci geometrie: {e}")
+        return False
+
+# ============================================================================
+# POMOCNÉ FUNKCE
+# ============================================================================
 
 def generate_unique_name(gdb_path, base_name):
     """Generuje unikátní název pro feature class v geodatabázi"""
@@ -180,11 +293,52 @@ class SimpleCADImport(object):
         return
 
     def execute(self, parameters, messages):
+        """
+        Hlavní execute metoda pro zpracování výškových dat z CAD.
+        
+        PROCES:
+        1. Export CAD vrstev (SC strukturní čáry)
+        2. Merge a topologické čištění SC linií
+        3. Snap VR rozhraní na SC linie
+        4. Detekce průsečíků (rozhraní mezi výškovými pásmy)
+        5. Vytvoření bufferů ze SC linií
+        6. Rozdělení bufferů podle rozhraní pomocí kolmých řezných čar
+        7. Spatial join bufferů s výškovými kruhy (přenos atributů)
+        8. Generování centerline (střední čáry polygonů)
+        9. Split výsledků podle Layer atributu
+        
+        KLÍČOVÉ GEOMETRICKÉ OPERACE:
+        - Feature To Line: Topologické čištění linií
+        - Dissolve: Spojení linií do souvislých segmentů
+        - Snap: Přichycení rozhraní k SC liniím (tolerance 30 cm)
+        - Intersect: Detekce průsečíků pro identifikaci rozhraní
+        - Buffer: Vytvoření polygonů ze SC linií (šířka 30 cm)
+        - Perpendicular Cutting Lines: Kolmé řezné čáry pro přesné rozdělení
+        - Feature To Polygon: Rozdělení bufferů na samostatné polygony
+        - Spatial Join: Přenos atributů z výškových kruhů
+        - Polygon Collapse: Generování centerline (střední čáry)
+        
+        Args:
+            parameters: Seznam ArcGIS parametrů toolboxu
+            messages: ArcGIS messages objekt
+            
+        Raises:
+            Exception: Při kritických chybách v geometrických operacích
+        """
         arcpy.env.overwriteOutput = True
         
+        # Validace vstupních parametrů
         input_cad = parameters[0].valueAsText
+        if not input_cad or not arcpy.Exists(input_cad):
+            arcpy.AddError("Vstupní CAD soubor neexistuje")
+            return
+            
         selected_layers = parameters[1].values if parameters[1].values else []
         output_gdb = parameters[2].valueAsText
+        
+        if not arcpy.Exists(output_gdb):
+            arcpy.AddError(f"Výstupní geodatabáze neexistuje: {output_gdb}")
+            return
         fd_name = parameters[3].valueAsText
         xy_tolerance = parameters[4].value or 0.01
         xy_resolution = parameters[5].value or 0.001
@@ -380,9 +534,10 @@ class SimpleCADImport(object):
                         arcpy.CopyFeatures_management(merged_fc, original_merged_fc)
                         
                         # Snap vertex všech SC linií na sebe navzájem
-                        snap_env = [[merged_fc, "VERTEX", "0.3 Meters"]]
+                        snap_tolerance = f"{GeometryConstants.SNAP_TOLERANCE} Meters"
+                        snap_env = [[merged_fc, "VERTEX", snap_tolerance]]
                         arcpy.Snap_edit(merged_fc, snap_env)
-                        arcpy.AddMessage("SC linie snapped na sebe navzájem (vertex, 30 cm)")
+                        arcpy.AddMessage(f"SC linie snapped na sebe navzájem (vertex, {snap_tolerance})")
                         
                         # FEATURE TO LINE - vytvoření topologicky čistých linií místo Dissolve
                         # FeatureToLine vytvoří čisté linie bez duplicitních vrcholů
@@ -392,7 +547,7 @@ class SimpleCADImport(object):
                         arcpy.management.FeatureToLine(
                             in_features=merged_fc,
                             out_feature_class=feature_to_line_fc,
-                            cluster_tolerance="0.001 Meters",
+                            cluster_tolerance=f"{GeometryConstants.CLUSTER_TOLERANCE} Meters",
                             attributes="ATTRIBUTES"
                         )
                         
@@ -431,7 +586,7 @@ class SimpleCADImport(object):
                             join_operation="JOIN_ONE_TO_ONE",
                             join_type="KEEP_ALL",
                             match_option="INTERSECT",
-                            search_radius="0.1 Meters"
+                            search_radius=f"{GeometryConstants.SNAP_SEARCH_RADIUS} Meters"
                         )
                         
                         # Vybrání pouze spojených linií s body rozhraní
@@ -484,16 +639,17 @@ class SimpleCADImport(object):
                             connected_buffer_fc = os.path.join(output_workspace, connected_buffer_name)
                             
                             # Buffer ze spojených linií
+                            buffer_distance = f"{GeometryConstants.BUFFER_DISTANCE} Meters"
                             arcpy.analysis.Buffer(
                                 in_features=lines_with_boundaries_fc,
                                 out_feature_class=connected_buffer_fc,
-                                buffer_distance_or_field="0.3 Meters",
+                                buffer_distance_or_field=buffer_distance,
                                 line_side="FULL",
                                 line_end_type="FLAT",
                                 dissolve_option="NONE"
                             )
                             
-                            arcpy.AddMessage(f"Vytvořen 30cm buffer ze spojených linií: {connected_buffer_name}")
+                            arcpy.AddMessage(f"Vytvořen {buffer_distance} buffer ze spojených linií: {connected_buffer_name}")
                             
                             # SPLIT BUFFERU podle bodů rozhraní pomocí Erase/Clip logiky
                             if out_prefix:
@@ -505,8 +661,29 @@ class SimpleCADImport(object):
                             split_buffer_fc = os.path.join(output_workspace, split_buffer_name)
                             
                             try:
+                                # ================================================================
                                 # VYTVOŘENÍ KOLMÝCH ŘEZNÝCH ČAR přes buffer v místech bodů
-                                cutting_lines_name = generate_unique_name(output_gdb, "cutting_lines_temp")
+                                # ================================================================
+                                # 
+                                # Tato sekce vytváří kolmé řezné čáry v místech průsečíků
+                                # pro přesné rozdělení bufferu podle rozhraní výškových pásem.
+                                #
+                                # PROCES:
+                                # 1. Vytvoření prázdné polyline feature class
+                                # 2. Pro každý průsečík:
+                                #    a) Najít nejbližší linii
+                                #    b) Určit směr linie v místě průsečíku
+                                #    c) Vypočítat kolmý vektor
+                                #    d) Vytvořit řeznou čáru kolmou na linii
+                                # 3. Merge řezných čar s outline bufferu
+                                # 4. Feature To Polygon pro rozdělení
+                                #
+                                # PARAMETRY:
+                                # - Délka řezné čáry: 2m (1m na každou stranu)
+                                # - Segment pro výpočet směru: 2m (1m zpět + 1m vpřed)
+                                # ================================================================
+                                
+                                cutting_lines_name = generate_unique_name(output_gdb, \"cutting_lines_temp\")
                                 cutting_lines_fc = os.path.join(output_workspace, cutting_lines_name)
                                 
                                 # Vytvoř feature class pro řezné čáry
@@ -562,8 +739,8 @@ class SimpleCADImport(object):
                                                         perp_x = -dy / length
                                                         perp_y = dx / length
                                                         
-                                                        # Vytvoř kolmou čáru (1m na každou stranu = 2m celkem)
-                                                        line_half_length = 1.0
+                                                        # Vytvoř kolmou čáru (podle GeometryConstants.CUTTING_LINE_LENGTH)
+                                                        line_half_length = GeometryConstants.CUTTING_LINE_LENGTH
                                                         start_pt = arcpy.Point(
                                                             point_x - perp_x * line_half_length,
                                                             point_y - perp_y * line_half_length
