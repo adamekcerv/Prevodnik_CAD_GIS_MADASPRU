@@ -211,13 +211,172 @@ Požadavky:
 
 Postup:
 1. Stáhněte soubory:
-   - Prevodnik_CAD_GIS_Kompletni.pyt (univerzální - doporučeno)
+   
    - Prevodnik_CAD_GIS_ReseneUzemi.pyt (samostatně použitelný)
    - Prevodnik_CAD_GIS_Vysky.pyt (samostatně použitelný)
 2. Zkopírujte do složky s ArcGIS Pro projektem
 3. V ArcGIS Pro: Catalog Pane - Toolboxes - Add Toolbox
 4. Vyberte požadovaný .pyt soubor
-5. Pro Kompletní toolbox musí být všechny tři .pyt soubory ve stejné složce
+5. Pro Kompletní toolbox musí být všechny soubory ve stejné složce
+
+### Instalace fallback balíčku 'centerline' (pro převodník výšek bez Foundation extension)
+
+Pokud nemáte ArcGIS Foundation extension a chcete použít alternativní metodu tvorby centerline (Voronoi diagram), musíte nainstalovat Python balíček `centerline` do ArcGIS Pro prostředí.
+
+**Důležité**: ArcGIS Pro používá vlastní Python prostředí, proto NELZE instalovat balíčky přes systémový Python nebo běžný pip z příkazové řádky. Musíte pracovat přímo s Python prostředím ArcGIS Pro.
+
+#### Krok 1: Klonování Python prostředí (DOPORUČENO)
+
+⚠️ **Nikdy neinstalujte balíčky přímo do výchozího prostředí ArcGIS Pro!** Mohli byste poškodit instalaci.
+
+1. **Otevřete ArcGIS Pro**
+2. **Project** menu → **Python** → **Manage Environments**
+   - Otevře se okno "Python Package Manager"
+   
+   ![Package Manager](Centerline/1_package_manager.png)
+   
+3. **Naklonujte výchozí prostředí**:
+   - V seznamu prostředí najděte **"arcgispro-py3"** (výchozí prostředí)
+   
+   ![Environment Manager](Centerline/2_environmnet_manager.png)
+   
+   - Klikněte na tři tečky **⋮** vedle prostředí
+   - Vyberte **"Clone"**
+   - Zadejte nový název, např: **"arcgispro-py3-custom"**
+   - Klikněte **"OK"**
+   
+   ![Clone Environment](Centerline/3_clone_env.png)
+   ![Clone Environment Dialog](Centerline/3_clone_env_v2.png)
+   
+   - Klonování trvá 5-15 minut (kopíruje se celé Python prostředí)
+
+4. **Aktivujte naklonované prostředí**:
+   - V seznamu prostředí vyberte **"arcgispro-py3-custom"**
+   - Klikněte na **"Activate"** (aktivní prostředí má modrý rámeček)
+   
+   ![Switch Active Environment](Centerline/4_switch_active_env.png)
+   
+   - Restartujte ArcGIS Pro pro aplikování změn
+
+#### Krok 2: Instalace balíčku 'centerline' přes Command Prompt
+
+⚠️ **Poznámka**: Balíček 'centerline' není dostupný v ArcGIS Pro Package Manageru (Add Packages), proto musí být instalován přímo přes příkazovou řádku.
+
+1. **Najděte Python Command Prompt pro vaše naklonované prostředí**:
+   
+   **Varianta A - Přes Start menu (jednodušší)**:
+   - Stiskněte **Windows Start**
+   - Vyhledejte: **"Python Command Prompt"**
+   - Měli byste vidět položku: **"Python Command Prompt (arcgispro-py3-custom)"**
+   - Klikněte pravým tlačítkem → **"Run as Administrator"** (Spustit jako správce)
+   
+   ![Command Prompt - Centerline Install](Centerline/5_cmd_centerline.png)
+   
+   **Varianta B - Přes ArcGIS složku**:
+   - **Start** → **ArcGIS** složka → **"Python Command Prompt"**
+   - Zkontrolujte, že title okna obsahuje název vašeho prostředí
+   - Pokud ne, musíte aktivovat prostředí ručně (viz níže)
+
+2. **Ověřte, že jste ve správném prostředí**:
+   ```cmd
+   conda info --envs
+   ```
+   
+   Aktivní prostředí má hvězdičku (*) na začátku řádku:
+   ```
+   * arcgispro-py3-custom    C:\Users\...\ESRI\conda\envs\arcgispro-py3-custom
+     arcgispro-py3           C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3
+   ```
+   
+   Pokud aktivní prostředí není správné, aktivujte ho:
+   ```cmd
+   conda activate arcgispro-py3-custom
+   ```
+
+3. **Ověřte verzi Pythonu**:
+   ```cmd
+   python --version
+   ```
+   Mělo by vypsat: `Python 3.x.x` (dle verze ArcGIS Pro)
+   Mělo by vypsat: `Python 3.x.x` (dle verze ArcGIS Pro)
+
+4. **Nainstalujte balíček 'centerline'**:
+   
+   
+   **Metoda - Z PyPI**:
+   ```cmd
+   pip install centerline
+   ```
+   
+   **Pro konkrétní verzi**:
+   ```cmd
+   pip install centerline==1.1.1
+   ```
+   
+    Instalace trvá 1-3 minuty a stáhne i závislosti (shapely, numpy, scipy, atd.)
+
+5. **Ověřte úspěšnou instalaci**:
+   ```cmd
+   pip show centerline
+   ```
+   
+   Měl by se zobrazit výpis:
+   ```
+   Name: centerline
+   Version: 1.1.1
+   Summary: Calculate centerline from polygon geometry
+   Home-page: https://github.com/fitodic/centerline
+   Author: Filip Todic
+   License: MIT
+   Location: C:\Users\...\ESRI\conda\envs\arcgispro-py3-custom\...
+   Requires: numpy, scipy, shapely, ...
+   ```
+   
+   **Důležité**: Zkontrolujte pole "Location" - musí ukazovat do vašeho naklonovaného prostředí!
+   
+   ![Pip Show Centerline](Centerline/6_pip_show_centerline.png)
+
+
+#### Shrnutí screenshotů
+
+Ke každému kroku jsou přiloženy screenshoty ve složce `Centerline/`:
+
+1. [1_package_manager.png](Centerline/1_package_manager.png) - Otevření Package Manageru přes Project → Python → Manage Environments
+2. [2_environmnet_manager.png](Centerline/2_environmnet_manager.png) - Seznam Python prostředí (arcgispro-py3)
+3. [3_clone_env.png](Centerline/3_clone_env.png) + [3_clone_env_v2.png](Centerline/3_clone_env_v2.png) - Klonování prostředí (Clone dialog)
+4. [4_switch_active_env.png](Centerline/4_switch_active_env.png) - Aktivace naklonovaného prostředí (modrý rámeček)
+5. [5_cmd_centerline.png](Centerline/5_cmd_centerline.png) - Instalace balíčku přes Python Command Prompt
+6. [6_pip_show_centerline.png](Centerline/6_pip_show_centerline.png) - Ověření instalace pomocí `pip show centerline`
+
+#### Řešení problémů při instalaci
+
+**"Balíček 'centerline' není v Package Manageru"**
+- **Správně** - balíček není v oficiálním PyPI pro ArcGIS Pro
+- Řešení: Použijte Command Prompt a instalujte z GitHubu (viz výše)
+
+**"'conda' is not recognized as internal or external command"**
+- Nepoužíváte Python Command Prompt pro ArcGIS Pro
+- Řešení: Otevřete specifický prompt přes Start → "Python Command Prompt (arcgispro-py3-custom)"
+
+**"'pip' is not recognized as internal or external command"**
+- Stejný problém jako výše - nejste ve správném prostředí
+- Řešení: Používejte Python Command Prompt z ArcGIS Pro
+
+
+**"Permission denied" nebo "Access denied"**
+- Spusťte Python Command Prompt jako **Správce** (Run as Administrator)
+- Nebo zkontrolujte oprávnění k adresáři ArcGIS Pro instalace
+
+**Balíček je nainstalován, ale toolbox ho nevidí**
+- Restartujte ArcGIS Pro
+- Ověřte, že je aktivní správné Python prostředí (s nainstalovaným balíčkem)
+
+#### Poznámky
+
+- **Klonované prostředí zabírá cca 2-3 GB** na disku
+- Při aktualizaci ArcGIS Pro se klonované prostředí **neaktualizuje automaticky** - musíte vytvořit nové
+- Doporučujeme označit si vlastní prostředí podle data vytvoření, např: "arcgispro-py3-custom-2026-01"
+- Seznam naklonovaných prostředí najdete v: `C:\Users\<username>\AppData\Local\ESRI\conda\envs\`
 
 ## Použití
 
