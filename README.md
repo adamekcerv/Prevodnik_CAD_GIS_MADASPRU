@@ -4,11 +4,23 @@ Python toolboxy pro ArcGIS Pro určené pro import a zpracování CAD dat s auto
 
 ## Přehled toolboxů
 
+### Hlavní toolbox (Prevodnik_CAD_GIS.pyt)
+
+**Kombinovaný toolbox** obsahující oba převodníky pod jednou kapotou.
+
+Použití:
+1. V ArcGIS Pro: Catalog Pane → Toolboxes → Add Toolbox
+2. Vyberte: `Prevodnik_CAD_GIS.pyt`
+3. V toolboxu uvidíte oba nástroje:
+   - Import CAD do GIS (Řešená území)
+   - Import CAD do GIS (Výšky)
+
+Poznámka: Tento toolbox automaticky importuje nástroje ze samostatných souborů ReseneUzemi a Vysky, takže ty musí zůstat ve stejné složce.
 
 
 ### 1. Převodník Řešených území (Prevodnik_CAD_GIS_ReseneUzemi.pyt)
 
-Import a analýza hraničních území s kontrolou bodů
+Samostatný toolbox pro import a analýzu hraničních území s kontrolou bodů (lze použít i samostatně, pokud nepotřebujete výšky).
 
 Hlavní funkce:
 - Převod polyline vrstev do polygonů se geometrickým čištěním
@@ -56,9 +68,9 @@ Vstupní vrstvy:
 - 302310_BL_VR_na_plochu (Polyline) - výškové kruhy na plochu
 - 302311_PL_VR_na_plochu_rozhrani (Polyline) - výškové rozhraní ploch
 
-### 3. Převodník Výšek (Prevodnik_CAD_GIS_Vysky.pyt)
+### 2. Převodník Výšek (Prevodnik_CAD_GIS_Vysky.pyt)
 
-Import a zpracování výškových regulativů na liniích
+Samostatný toolbox pro import a zpracování výškových regulativů na liniích (lze použít i samostatně, pokud nepotřebujete řešená území).
 
 Hlavní funkce:
 - Automatická detekce všech SC vrstev (301110-301119 a další)
@@ -211,13 +223,13 @@ Požadavky:
 
 Postup:
 1. Stáhněte soubory:
-   
+   - **Prevodnik_CAD_GIS.pyt** (hlavní toolbox s oběma nástroji - doporučeno)
    - Prevodnik_CAD_GIS_ReseneUzemi.pyt (samostatně použitelný)
    - Prevodnik_CAD_GIS_Vysky.pyt (samostatně použitelný)
 2. Zkopírujte do složky s ArcGIS Pro projektem
 3. V ArcGIS Pro: Catalog Pane - Toolboxes - Add Toolbox
-4. Vyberte požadovaný .pyt soubor
-5. Pro Kompletní toolbox musí být všechny soubory ve stejné složce
+4. **Doporučeno**: Vyberte Prevodnik_CAD_GIS.pyt pro přístup k oběma nástrojům
+5. Hlavní toolbox vyžaduje, aby všechny tři .pyt soubory byly ve stejné složce
 
 ### Instalace fallback balíčku 'centerline' (pro převodník výšek bez Foundation extension)
 
@@ -380,30 +392,19 @@ Ke každému kroku jsou přiloženy screenshoty ve složce `Centerline/`:
 
 ## Použití
 
-### Univerzální převodník (Kompletni)
+### Hlavní toolbox (Prevodnik_CAD_GIS.pyt) - DOPORUČENO
 
-Základní workflow:
+Otevřete hlavní toolbox a vyberte požadovaný nástroj:
+
+**Import CAD do GIS (Řešená území)**
 ```
-CAD soubor → Výběr režimu → Automatické zpracování → Výsledné vrstvy
+CAD soubor → Polygony z linií → Bodová analýza → Výsledné vrstvy
 ```
 
-Parametry:
-- Režim zpracování - Řešená území / Výšky / Obojí
-- Input CAD Soubor - cesta k DWG/DXF/DGN
-- Output Geodatabáze - povinný
-- Output Feature Dataset - volitelný (stejný pro oba režimy)
-- XY Tolerance - 0.01 m (default)
-- XY Resolution - 0.001 m (default)
-- Output Souřadnicový Systém - auto/S-JTSK
-- Geographic Transformation - volitelný
-- Prefix jména výstupu - Z/PL_ (default podle režimu)
-
-Režim "Obojí":
-- Spustí Řešená území s prefixem "Z"
-- Pak spustí Výšky s prefixem "PL_"
-- Obě části použijí stejnou geodatabázi a feature dataset
-- Vrstvy z Řešených území se zachovají a použijí v Výškách (pokud mají pole Layer)
-- Celkový čas: součet obou částí (cca 5-40 minut dle dat)
+**Import CAD do GIS (Výšky)**
+```
+CAD soubor → Merge SC linií → Buffer → Centerline → Výsledné vrstvy
+```
 
 ### Samostatné toolboxy
 
