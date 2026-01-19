@@ -225,27 +225,34 @@ class CadFile(object):
         """
         Načte všechny vrstvy z CAD souboru.
         """
-        arcpy.env.workspace = self.cad_file
-        geometry_types = ["Point", "Polyline", "Polygon", "Annotation", "MultiPatch"]
-        result = {}
+        # Uložení původního workspace
+        original_workspace = arcpy.env.workspace
         
-        for fc_type in geometry_types:
-            if arcpy.Exists(fc_type):
-                try:
-                    with arcpy.da.SearchCursor(fc_type, ["Layer"]) as cur:
-                        all_lays = [row[0] for row in cur]
-                    for lyr in sorted(set(all_lays)):
-                        disp_name = f"{lyr} ({fc_type})"
-                        result[disp_name] = CadLayer(self.cad_file, fc_type, lyr)
-                except Exception as e:
-                    arcpy.AddWarning(f"Chyba při načítání '{fc_type}': {e}")
-        
-        if not result:
-            arcpy.AddWarning("[CadFile] Žádné vrstvy v CADu.")
-        else:
-            arcpy.AddMessage("[CadFile] Nalezené vrstvy: " + ", ".join(result.keys()))
-        
-        return result
+        try:
+            arcpy.env.workspace = self.cad_file
+            geometry_types = ["Point", "Polyline", "Polygon", "Annotation", "MultiPatch"]
+            result = {}
+            
+            for fc_type in geometry_types:
+                if arcpy.Exists(fc_type):
+                    try:
+                        with arcpy.da.SearchCursor(fc_type, ["Layer"]) as cur:
+                            all_lays = [row[0] for row in cur]
+                        for lyr in sorted(set(all_lays)):
+                            disp_name = f"{lyr} ({fc_type})"
+                            result[disp_name] = CadLayer(self.cad_file, fc_type, lyr)
+                    except Exception as e:
+                        arcpy.AddWarning(f"Chyba při načítání '{fc_type}': {e}")
+            
+            if not result:
+                arcpy.AddWarning("[CadFile] Žádné vrstvy v CADu.")
+            else:
+                arcpy.AddMessage("[CadFile] Nalezené vrstvy: " + ", ".join(result.keys()))
+            
+            return result
+        finally:
+            # Obnovení původního workspace
+            arcpy.env.workspace = original_workspace
 
     def export_layers(self, selected_display_names, output_workspace,
                     spatial_ref=None, transform_method=None, out_prefix=""):
@@ -526,12 +533,16 @@ class CadFile(object):
                     
                     # Smazat filtrované kruhy (Z302310_VR_circles_LN)
                     try:
-                        arcpy.env.workspace = output_workspace
-                        circles_classes = arcpy.ListFeatureClasses("*VR_circles*")
-                        for circles_fc in circles_classes:
-                            circles_path = os.path.join(output_workspace, circles_fc)
-                            arcpy.Delete_management(circles_path)
-                            arcpy.AddMessage(f"[export_layers] Smazána vrstva filtrovaných kruhů: {circles_fc}")
+                        original_ws = arcpy.env.workspace
+                        try:
+                            arcpy.env.workspace = output_workspace
+                            circles_classes = arcpy.ListFeatureClasses("*VR_circles*")
+                            for circles_fc in circles_classes:
+                                circles_path = os.path.join(output_workspace, circles_fc)
+                                arcpy.Delete_management(circles_path)
+                                arcpy.AddMessage(f"[export_layers] Smazána vrstva filtrovaných kruhů: {circles_fc}")
+                        finally:
+                            arcpy.env.workspace = original_ws
                     except Exception as e:
                         arcpy.AddWarning(f"[export_layers] Nelze smazat filtrované kruhy: {e}")
                     

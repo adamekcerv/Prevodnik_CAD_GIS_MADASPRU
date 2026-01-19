@@ -930,17 +930,21 @@ class SimpleCADImport(object):
         circles_fc = None
         
         # Hledání finálního bufferu
-        arcpy.env.workspace = output_workspace
-        buffer_classes = arcpy.ListFeatureClasses("*final_buffer*")
-        if buffer_classes:
-            buffer_fc = os.path.join(output_workspace, buffer_classes[0])
-            arcpy.AddMessage(f"Nalezena finální buffer vrstva: {buffer_classes[0]}")
-        
-        # Hledání vrstvy kruhů
-        circle_classes = arcpy.ListFeatureClasses("*circles*")
-        if circle_classes:
-            circles_fc = os.path.join(output_workspace, circle_classes[0])
-            arcpy.AddMessage(f"Nalezena vrstva kruhů: {circle_classes[0]}")
+        original_workspace = arcpy.env.workspace
+        try:
+            arcpy.env.workspace = output_workspace
+            buffer_classes = arcpy.ListFeatureClasses("*final_buffer*")
+            if buffer_classes:
+                buffer_fc = os.path.join(output_workspace, buffer_classes[0])
+                arcpy.AddMessage(f"Nalezena finální buffer vrstva: {buffer_classes[0]}")
+            
+            # Hledání vrstvy kruhů
+            circle_classes = arcpy.ListFeatureClasses("*circles*")
+            if circle_classes:
+                circles_fc = os.path.join(output_workspace, circle_classes[0])
+                arcpy.AddMessage(f"Nalezena vrstva kruhů: {circle_classes[0]}")
+        finally:
+            arcpy.env.workspace = original_workspace
         
         # Pokud existují obě vrstvy, proveď spatial join
         if buffer_fc and circles_fc and arcpy.Exists(buffer_fc) and arcpy.Exists(circles_fc):
