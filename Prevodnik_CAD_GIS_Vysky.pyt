@@ -1172,6 +1172,7 @@ class SimpleCADImport(object):
                             from shapely.geometry import shape, mapping, LineString, MultiLineString
                             from shapely.ops import linemerge, unary_union
                             import json
+                            from shapely import wkt
                             
                             arcpy.AddMessage("✓ Balíček 'centerline' nalezen - používám optimalizovanou Voronoi metodu")
                             
@@ -1245,7 +1246,9 @@ class SimpleCADImport(object):
                                         try:
                                             # Převod ArcPy geometry na Shapely
                                             polygon_json = polygon_geom.JSON
-                                            shapely_polygon = shape(json.loads(polygon_json))
+#                                             shapely_polygon = shape(json.loads(polygon_json))
+                                            arc_geom = arcpy.AsShape(json.loads(polygon_json), True) # NEW
+                                            shapely_polygon = wkt.loads(arc_geom.WKT) # NEW
                                             
                                             # Validace polygonu
                                             if not shapely_polygon.is_valid:
@@ -1275,8 +1278,9 @@ class SimpleCADImport(object):
                                                     if cl_geom and not cl_geom.is_empty:
                                                         # Převod Shapely geometry zpět na ArcPy
                                                         cl_json = mapping(cl_geom)
-                                                        arcpy_geom = arcpy.AsShape(cl_json, True)
-                                                        
+#                                                         arcpy_geom = arcpy.AsShape(cl_json, True)
+                                                        arcpy_geom = arcpy.FromWKT(cl_geom.wkt, sr)
+
                                                         # Vložení do výstupní feature class
                                                         insert_cursor.insertRow([arcpy_geom, oid])
                                                         centerline_count += 1
