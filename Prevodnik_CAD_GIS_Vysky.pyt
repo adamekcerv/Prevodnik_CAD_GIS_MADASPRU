@@ -483,64 +483,82 @@ class SimpleCADImport(object):
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při zpracování VR na bod: {e}")
         
-        # Zpracování VR na linii vrstvy - POUŽITÍ POINT MÍSTO POLYLINE (zachová všechny atributy)
+        # Zpracování VR na linii vrstvy - POUŽITÍ CENTROIDŮ KRUHŮ (jako v notebooku!)
         circles_vr_na_linii = None
-        point_vr_na_linii = None  # Body s atributy z dynamických bloků
         
         if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
             try:
-                arcpy.AddMessage("Krok 4: Zpracování VR na linii - export Point s atributy")
+                arcpy.AddMessage("Krok 4: Zpracování VR na linii - převod kruhů na centroidy")
                 
-                # Export Point feature class (dynamic block insertion points WITH attributes)
-                layer_name = "302210_BL_VR_na_linii"
+                # 1) Multipart to Singlepart (jako u VR na bod)
+                singlepart_name = generate_unique_name(output_gdb, "VR_linii_singlepart_temp")
+                singlepart_fc = os.path.join(output_workspace, singlepart_name)
                 
-                if out_prefix:
-                    point_name = f"{out_prefix}{layer_name}_POINT"
-                else:
-                    point_name = f"PL_{layer_name}_POINT"
-                
-                point_name = generate_unique_name(output_gdb, point_name)
-                point_vr_na_linii = os.path.join(output_workspace, point_name)
-                
-                # Export Point z CAD
-                arcpy.env.workspace = input_cad
-                field_delimited = arcpy.AddFieldDelimiters("Point", "Layer")
-                
-                arcpy.FeatureClassToFeatureClass_conversion(
-                    in_features="Point",
-                    out_path=output_workspace,
-                    out_name=point_name,
-                    where_clause=f"{field_delimited} = '{layer_name}'"
+                arcpy.management.MultipartToSinglepart(
+                    in_features=vr_na_linii_layer,
+                    out_feature_class=singlepart_fc
                 )
                 
-                point_count = int(arcpy.GetCount_management(point_vr_na_linii)[0])
-                arcpy.AddMessage(f"✓ Exportováno {point_count} Point prvků s atributy")
+                # 2) Filtrování uzavřených linií (kruhy)
+                circles_temp_name = generate_unique_name(output_gdb, "VR_linii_circles_temp")
+                circles_temp_fc = os.path.join(output_workspace, circles_temp_name)
                 
-                # DEBUG: Zkontroluj pole a hodnoty
-                point_fields = [f.name for f in arcpy.ListFields(point_vr_na_linii)]
-                arcpy.AddMessage(f"DEBUG - Point pole ({len(point_fields)}): {', '.join([f for f in point_fields if not f.startswith('Shape')])[:200]}...")
+                arcpy.management.CreateFeatureclass(
+                    out_path=output_workspace,
+                    out_name=circles_temp_name.split(os.sep)[-1],
+                    geometry_type="POLYLINE",
+                    template=singlepart_fc,
+                    spatial_reference=output_sr
+                )
                 
-                # DEBUG: Zkontroluj hodnoty atributů
-                test_attrs = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "VYSKA_MAX", "RefName"]
-                existing_attrs = [a for a in test_attrs if a in point_fields]
+                # Kopírování pouze uzavřených linií (kruhy)
+                field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
+                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
+                
+                circles_count = 0
+                with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
+                    with arcpy.da.InsertCursor(circles_temp_fc, ["SHAPE@"] + field_names) as insert_cursor:
+                        for row in search_cursor:
+                            geometry = row[0]
+                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
+                                insert_cursor.insertRow(row)
+                                circles_count += 1
+                
+                arcpy.AddMessage(f"✓ Nalezeno {circles_count} uzavřených linií (kruhů)")
+                
+                # 3) Převod kruhů na centroidy (KLÍČOVÝ KROK - jako v notebooku!)
+                centroids_name = generate_unique_name(output_gdb, "VR_linii_centroids_temp")
+                circles_vr_na_linii = os.path.join(output_workspace, centroids_name)
+                
+                arcpy.management.FeatureToPoint(
+                    in_features=circles_temp_fc,
+                    out_feature_class=circles_vr_na_linii,
+                    point_location="INSIDE"  # Centroid uvnitř kruhu
+                )
+                
+                centroids_count = int(arcpy.GetCount_management(circles_vr_na_linii)[0])
+                arcpy.AddMessage(f"✓ Vytvořeno {centroids_count} centroidů s atributy")
+                
+                # DEBUG: Zkontroluj atributy v centroidech
+                centroid_fields = [f.name for f in arcpy.ListFields(circles_vr_na_linii)]
+                test_attrs = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "NP_MAX", "VYSKA_MAX"]
+                existing_attrs = [a for a in test_attrs if a in centroid_fields]
                 
                 if existing_attrs:
-                    arcpy.AddMessage(f"DEBUG - Nalezené atributy VR: {', '.join(existing_attrs)}")
-                    with arcpy.da.SearchCursor(point_vr_na_linii, ["OID@"] + existing_attrs) as cursor:
+                    arcpy.AddMessage(f"DEBUG - Atributy v centroidech: {', '.join(existing_attrs)}")
+                    with arcpy.da.SearchCursor(circles_vr_na_linii, ["OID@"] + existing_attrs) as cursor:
                         for i, row in enumerate(cursor):
                             if i >= 3:
                                 break
                             vals = ", ".join([f"{existing_attrs[j]}={row[j+1]}" for j in range(len(existing_attrs))])
-                            arcpy.AddMessage(f"  Point OID={row[0]}: {vals}")
-                else:
-                    arcpy.AddWarning("  ⚠ Žádné atributy VR nebyly nalezeny v Point!")
+                            arcpy.AddMessage(f"  Centroid OID={row[0]}: {vals}")
                 
-                # Pro zpětnou kompatibilitu - naplnit circles_vr_na_linii pointy
-                # (kód níže očekává circles_vr_na_linii jako zdroj atributů)
-                circles_vr_na_linii = point_vr_na_linii
+                # Cleanup
+                arcpy.Delete_management(singlepart_fc)
+                arcpy.Delete_management(circles_temp_fc)
                 
             except Exception as e:
-                arcpy.AddWarning(f"Chyba při exportu Point VR na linii: {e}")
+                arcpy.AddWarning(f"Chyba při zpracování VR na linii: {e}")
 
         # KROK 5: Generování automatických rozhraní tam, kde se mění výška
         # (podle logiky z notebooku - Dissolve podle atributu výšky, hledání koncových bodů)
@@ -796,11 +814,145 @@ class SimpleCADImport(object):
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při řezání stavebních čar: {e}")
         
-        # KROK 7: PŘESKOČENO - není potřeba cleanup
-        # SplitLineAtPoint na původních liniích nevytváří false rozhraní
-        # Cleanup by mohl spojit i segmenty které MAJÍ být rozdělené
-        arcpy.AddMessage("Krok 7: Cleanup přeskočen (není potřeba pro původní linie)")
-        arcpy.AddMessage(f"  Zachováno všech {int(arcpy.GetCount_management(sc_rozdelene_fc)[0])} segmentů po SplitLineAtPoint")
+        # KROK 7: Dočištění falešných rozhraní na koncových bodech SC
+        # (upraveno - nesmí mazat celé vrstvy které nejsou rozdělené)
+        arcpy.AddMessage("=" * 60)
+        arcpy.AddMessage("Krok 7: Cleanup falešných rozhraní")
+        arcpy.AddMessage("=" * 60)
+        
+        sc_cleaned_fc = None
+        if sc_rozdelene_fc and rozhrani_body_all and arcpy.Exists(sc_rozdelene_fc) and arcpy.Exists(rozhrani_body_all):
+            try:
+                arcpy.AddMessage("Hledání falešných rozhraní na koncových bodech SC...")
+                
+                # Zjisti počet PŘED splitováním (z merged_fc)
+                original_count = int(arcpy.GetCount_management(merged_fc)[0]) if merged_fc and arcpy.Exists(merged_fc) else 0
+                split_count = int(arcpy.GetCount_management(sc_rozdelene_fc)[0])
+                
+                arcpy.AddMessage(f"  Původní SC linie: {original_count}")
+                arcpy.AddMessage(f"  Po SplitLineAtPoint: {split_count}")
+                
+                # Pokud se počet NEZMĚNIL (žádné řezy), přeskoč cleanup
+                if split_count <= original_count:
+                    arcpy.AddMessage("✓ Žádné řezy neproběhly - cleanup není potřeba")
+                    arcpy.AddMessage("  (Zachovány všechny původní linie)")
+                else:
+                    # Nějaké řezy proběhly - pokračuj s cleanup
+                    # Převeď koncové body rozdělených SC na body
+                    sc_vertices_name = generate_unique_name(output_gdb, "SC_rozdelene_vertices_temp")
+                    sc_vertices_fc = os.path.join(output_workspace, sc_vertices_name)
+                    
+                    arcpy.management.FeatureVerticesToPoints(
+                        in_features=sc_rozdelene_fc,
+                        out_feature_class=sc_vertices_fc,
+                        point_location="BOTH_ENDS"
+                    )
+                    
+                    # Vyber body které NEKOLIDUJÍ s rozhraními = falešná rozhraní
+                    arcpy.management.SelectLayerByLocation(
+                        in_layer=sc_vertices_fc,
+                        overlap_type="INTERSECT",
+                        select_features=rozhrani_body_all,
+                        search_distance="0.001 Meters",  # Malá tolerance pro snap
+                        selection_type="NEW_SELECTION",
+                        invert_spatial_relationship="INVERT"
+                    )
+                    
+                    false_rozhrani_count = int(arcpy.GetCount_management(sc_vertices_fc)[0])
+                    arcpy.AddMessage(f"  Nalezeno {false_rozhrani_count} falešných koncových bodů")
+                    
+                    if false_rozhrani_count > 0:
+                        # Vyber SC segmenty které kolidují s falešnými rozhraními
+                        arcpy.management.SelectLayerByLocation(
+                            in_layer=sc_rozdelene_fc,
+                            overlap_type="INTERSECT",
+                            select_features=sc_vertices_fc,
+                            search_distance=None,
+                            selection_type="NEW_SELECTION",
+                            invert_spatial_relationship="NOT_INVERT"
+                        )
+                        
+                        selected_count = int(arcpy.GetCount_management(sc_rozdelene_fc)[0])
+                        arcpy.AddMessage(f"  Segmenty kolidující s falešnými body: {selected_count}")
+                        
+                        # KONTROLA: Pokud by cleanup smazal VŠE, přeskoč
+                        if selected_count >= split_count:
+                            arcpy.AddWarning("⚠ Cleanup by smazal všechny segmenty - PŘESKOČENO")
+                            arcpy.AddMessage("  (Pravděpodobně některé SC nemají žádná rozhraní)")
+                            arcpy.management.SelectLayerByAttribute(
+                                in_layer_or_view=sc_rozdelene_fc,
+                                selection_type="CLEAR_SELECTION"
+                            )
+                            arcpy.Delete_management(sc_vertices_fc)
+                        else:
+                            # Spoj tyto vybrané segmenty (odstraní falešná rozhraní)
+                            sc_merged_false_name = generate_unique_name(output_gdb, "SC_merged_false_temp")
+                            sc_merged_false_fc = os.path.join(output_workspace, sc_merged_false_name)
+                            
+                            arcpy.management.Dissolve(
+                                in_features=sc_rozdelene_fc,
+                                out_feature_class=sc_merged_false_fc,
+                                dissolve_field=None,
+                                statistics_fields=None,
+                                multi_part="SINGLE_PART",
+                                unsplit_lines="DISSOLVE_LINES"
+                            )
+                            
+                            dissolved_count = int(arcpy.GetCount_management(sc_merged_false_fc)[0])
+                            arcpy.AddMessage(f"  Dissolved segmentů: {dissolved_count}")
+                            
+                            # Vyber SC segmenty které leží UVNITŘ spojených segmentů (budou smazány)
+                            arcpy.management.SelectLayerByLocation(
+                                in_layer=sc_rozdelene_fc,
+                                overlap_type="WITHIN",
+                                select_features=sc_merged_false_fc,
+                                search_distance=None,
+                                selection_type="NEW_SELECTION",
+                                invert_spatial_relationship="NOT_INVERT"
+                            )
+                            
+                            to_delete_count = int(arcpy.GetCount_management(sc_rozdelene_fc)[0])
+                            arcpy.AddMessage(f"  Segmenty k odstranění (WITHIN): {to_delete_count}")
+                            
+                            if to_delete_count > 0:
+                                # Smazat tyto segmenty
+                                arcpy.management.DeleteRows(sc_rozdelene_fc)
+                                
+                                # Sloučit zpět s vyčištěnou vrstvou
+                                sc_cleaned_name = generate_unique_name(output_gdb, "SC_cleaned_temp")
+                                sc_cleaned_fc = os.path.join(output_workspace, sc_cleaned_name)
+                                
+                                arcpy.management.Merge(
+                                    inputs=[sc_rozdelene_fc, sc_merged_false_fc],
+                                    output=sc_cleaned_fc
+                                )
+                                
+                                cleaned_count = int(arcpy.GetCount_management(sc_cleaned_fc)[0])
+                                arcpy.AddMessage(f"✓ Cleanup dokončen: {to_delete_count} segmentů odstraněno, {cleaned_count} finálních segmentů")
+                                
+                                # Cleanup temp vrstev
+                                arcpy.Delete_management(sc_vertices_fc)
+                                arcpy.Delete_management(sc_merged_false_fc)
+                                arcpy.Delete_management(sc_rozdelene_fc)
+                                
+                                # Použij vyčištěnou vrstvu dál
+                                sc_rozdelene_fc = sc_cleaned_fc
+                            else:
+                                arcpy.AddMessage("✓ Žádné segmenty k odstranění - cleanup není potřeba")
+                                arcpy.Delete_management(sc_vertices_fc)
+                                arcpy.Delete_management(sc_merged_false_fc)
+                        
+                        # Clear selection
+                        arcpy.management.SelectLayerByAttribute(
+                            in_layer_or_view=sc_rozdelene_fc,
+                            selection_type="CLEAR_SELECTION"
+                        )
+                    else:
+                        arcpy.AddMessage("✓ Žádná falešná rozhraní nenalezena")
+                        arcpy.Delete_management(sc_vertices_fc)
+                    
+            except Exception as e:
+                arcpy.AddWarning(f"Chyba při cleanup falešných rozhraní: {e}")
         
         # KROK 8: Spatial Join pro připojení atributů z dynamických bloků (kruhů)
         arcpy.AddMessage("=" * 60)
@@ -810,20 +962,19 @@ class SimpleCADImport(object):
         vyskova_regulace_fc = None
         if sc_rozdelene_fc and circles_vr_na_linii and arcpy.Exists(sc_rozdelene_fc) and arcpy.Exists(circles_vr_na_linii):
             try:
-                # Použijeme Point přímo (už obsahuje všechny atributy z dynamic bloků)
-                # NEPŘEVÁDÍME na centroidy - Point už JE bod!
-                points_vr = circles_vr_na_linii  # Point feature class s atributy
+                # Použijeme centroidy kruhů (už vytvořené v Kroku 4)
+                points_vr = circles_vr_na_linii  # Centroidy s atributy
                 
                 points_count = int(arcpy.GetCount_management(points_vr)[0])
-                arcpy.AddMessage(f"✓ Použito {points_count} Point prvků s atributy dynamických bloků")
+                arcpy.AddMessage(f"✓ Použito {points_count} centroidů kruhů s atributy VR")
                 
-                # DEBUG: Zkontroluj jaká pole má Point
-                arcpy.AddMessage("DEBUG - Kontrola polí v Point...")
+                # DEBUG: Zkontroluj jaká pole má centroid
+                arcpy.AddMessage("DEBUG - Kontrola polí v centroidech...")
                 point_fields_list = [f.name for f in arcpy.ListFields(points_vr) if f.type not in ["OID", "Geometry"]]
-                arcpy.AddMessage(f"  Pole v Point ({len(point_fields_list)}): {', '.join(point_fields_list[:15])}")
+                arcpy.AddMessage(f"  Pole v centroidech ({len(point_fields_list)}): {', '.join(point_fields_list[:15])}")
                 
-                # DEBUG: Zkontroluj hodnoty atributů v prvních 3 pointech
-                arcpy.AddMessage("DEBUG - Kontrola hodnot atributů v prvních 3 Point...")
+                # DEBUG: Zkontroluj hodnoty atributů v prvních 3 centroidech
+                arcpy.AddMessage("DEBUG - Kontrola hodnot atributů v prvních 3 centroidech...")
                 test_attrs = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "NP_MAX", "VYSKA_MAX"]
                 existing_test_attrs = [a for a in test_attrs if a in point_fields_list]
                 
@@ -834,49 +985,15 @@ class SimpleCADImport(object):
                             if i >= 3:
                                 break
                             attr_values = ", ".join([f"{attr}={row[j+1]}" for j, attr in enumerate(existing_test_attrs)])
-                            arcpy.AddMessage(f"  Point OID={row[0]}: {attr_values}")
+                            arcpy.AddMessage(f"  Centroid OID={row[0]}: {attr_values}")
                 else:
                     arcpy.AddWarning("  ⚠ Žádné očekávané atributy VR nebyly nalezeny!")
                 
-                # DEBUG: Zkontroluj extent Point vs SC
+                # DEBUG: Zkontroluj extent centroidů vs SC
                 point_extent = arcpy.Describe(points_vr).extent
                 sc_extent = arcpy.Describe(sc_rozdelene_fc).extent
-                arcpy.AddMessage(f"DEBUG - Point extent: X({point_extent.XMin:.2f} - {point_extent.XMax:.2f}), Y({point_extent.YMin:.2f} - {point_extent.YMax:.2f})")
+                arcpy.AddMessage(f"DEBUG - Centroidy extent: X({point_extent.XMin:.2f} - {point_extent.XMax:.2f}), Y({point_extent.YMin:.2f} - {point_extent.YMax:.2f})")
                 arcpy.AddMessage(f"DEBUG - SC extent: X({sc_extent.XMin:.2f} - {sc_extent.XMax:.2f}), Y({sc_extent.YMin:.2f} - {sc_extent.YMax:.2f})")
-                
-                # DEBUG: Zjisti minimální vzdálenost mezi Point a SC linií
-                arcpy.AddMessage("DEBUG - Měření vzdáleností Point od SC linií...")
-                min_distance = float('inf')
-                max_distance = 0
-                distances = []
-                
-                with arcpy.da.SearchCursor(points_vr, ["SHAPE@", "OID@"]) as point_cursor:
-                    for i, point_row in enumerate(point_cursor):
-                        if i >= 5:  # Kontroluj jen prvních 5 pointů
-                            break
-                        point_geom = point_row[0]
-                        point_oid = point_row[1]
-                        
-                        # Najdi nejbližší SC linii
-                        nearest_dist = float('inf')
-                        with arcpy.da.SearchCursor(sc_rozdelene_fc, ["SHAPE@"]) as sc_cursor:
-                            for sc_row in sc_cursor:
-                                sc_geom = sc_row[0]
-                                dist = point_geom.distanceTo(sc_geom)
-                                if dist < nearest_dist:
-                                    nearest_dist = dist
-                        
-                        distances.append(nearest_dist)
-                        if nearest_dist < min_distance:
-                            min_distance = nearest_dist
-                        if nearest_dist > max_distance:
-                            max_distance = nearest_dist
-                        
-                        arcpy.AddMessage(f"  Point OID={point_oid}: nejbližší SC = {nearest_dist:.2f}m")
-                
-                if distances:
-                    avg_distance = sum(distances) / len(distances)
-                    arcpy.AddMessage(f"DEBUG - Vzdálenosti (prvních 5): min={min_distance:.2f}m, max={max_distance:.2f}m, avg={avg_distance:.2f}m")
                 
                 # Získat všechna pole z Point
                 point_fields = [field.name for field in arcpy.ListFields(points_vr) 
@@ -887,22 +1004,22 @@ class SimpleCADImport(object):
                 field_mappings.addTable(sc_rozdelene_fc)
                 field_mappings.addTable(points_vr)
                 
-                # Spatial Join - připoj atributy od NEJBLIŽŠÍHO Point (všechny atributy zachovány)
+                # Spatial Join - INTERSECT jako v notebooku (centroidy musí protínat SC)
                 vyskova_regulace_sj_name = generate_unique_name(output_gdb, "VyskovaRegulace_SJ_temp")
                 vyskova_regulace_sj_fc = os.path.join(output_workspace, vyskova_regulace_sj_name)
                 
                 arcpy.analysis.SpatialJoin(
                     target_features=sc_rozdelene_fc,
-                    join_features=points_vr,  # Point přímo (ne centroidy)
+                    join_features=points_vr,  # Centroidy kruhů
                     out_feature_class=vyskova_regulace_sj_fc,
-                    join_operation="JOIN_ONE_TO_ONE",  # Jeden segment = jeden nejbližší Point
+                    join_operation="JOIN_ONE_TO_MANY",  # Může být více centroidů na jeden segment
                     join_type="KEEP_ALL",
                     field_mapping=field_mappings,
-                    match_option="CLOSEST",  # Najdi nejbližší Point
-                    search_radius=""  # Bez limitu vzdálenosti - vždy najde nejbližší
+                    match_option="WITHIN_A_DISTANCE",  # Centroid v dosahu SC
+                    search_radius="10 Meters"  # Poloměr kruhu (obvykle ~5-10m)
                 )
                 
-                arcpy.AddMessage("✓ Atributy připojeny od nejbližších Point (všechny atributy VR zachovány)")
+                arcpy.AddMessage("✓ Atributy připojeny pomocí WITHIN_A_DISTANCE (centroidy do 10m od SC)")
                 
                 # DEBUG: Zkontroluj kolik segmentů má přiřazené atributy
                 arcpy.AddMessage("DEBUG - Kontrola přiřazených atributů po Spatial Join...")
