@@ -483,86 +483,64 @@ class SimpleCADImport(object):
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při zpracování VR na bod: {e}")
         
-        # Zpracování VR na linii vrstvy - multipart to singlepart a filtrování uzavřených linií  
+        # Zpracování VR na linii vrstvy - POUŽITÍ POINT MÍSTO POLYLINE (zachová všechny atributy)
         circles_vr_na_linii = None
+        point_vr_na_linii = None  # Body s atributy z dynamických bloků
+        
         if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
             try:
-                arcpy.AddMessage("Krok 4: Zpracování VR na linii (kruhy)")
+                arcpy.AddMessage("Krok 4: Zpracování VR na linii - export Point s atributy")
                 
-                # DEBUG: Zkontroluj jaká pole má původní CAD vrstva
-                arcpy.AddMessage("DEBUG - Kontrola polí v původní CAD vrstvě 302210_BL_VR_na_linii...")
-                orig_fields = [f.name for f in arcpy.ListFields(vr_na_linii_layer)]
-                arcpy.AddMessage(f"  Celkem polí: {len(orig_fields)}")
-                arcpy.AddMessage(f"  Všechna pole: {', '.join(orig_fields)}")
+                # Export Point feature class (dynamic block insertion points WITH attributes)
+                layer_name = "302210_BL_VR_na_linii"
                 
-                # DEBUG: Zkontroluj hodnoty v prvních 3 prvcích PŘED singlepart
-                arcpy.AddMessage("DEBUG - Hodnoty atributů v prvních 3 prvcích PŘED singlepart...")
-                test_attrs = ["RIMSA_MIN", "VYSKA_VB", "NP_MIN", "VYSKA_MAX"]
-                existing_attrs = [a for a in test_attrs if a in orig_fields]
+                if out_prefix:
+                    point_name = f"{out_prefix}{layer_name}_POINT"
+                else:
+                    point_name = f"PL_{layer_name}_POINT"
+                
+                point_name = generate_unique_name(output_gdb, point_name)
+                point_vr_na_linii = os.path.join(output_workspace, point_name)
+                
+                # Export Point z CAD
+                arcpy.env.workspace = input_cad
+                field_delimited = arcpy.AddFieldDelimiters("Point", "Layer")
+                
+                arcpy.FeatureClassToFeatureClass_conversion(
+                    in_features="Point",
+                    out_path=output_workspace,
+                    out_name=point_name,
+                    where_clause=f"{field_delimited} = '{layer_name}'"
+                )
+                
+                point_count = int(arcpy.GetCount_management(point_vr_na_linii)[0])
+                arcpy.AddMessage(f"✓ Exportováno {point_count} Point prvků s atributy")
+                
+                # DEBUG: Zkontroluj pole a hodnoty
+                point_fields = [f.name for f in arcpy.ListFields(point_vr_na_linii)]
+                arcpy.AddMessage(f"DEBUG - Point pole ({len(point_fields)}): {', '.join([f for f in point_fields if not f.startswith('Shape')])[:200]}...")
+                
+                # DEBUG: Zkontroluj hodnoty atributů
+                test_attrs = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "VYSKA_MAX", "RefName"]
+                existing_attrs = [a for a in test_attrs if a in point_fields]
                 
                 if existing_attrs:
-                    with arcpy.da.SearchCursor(vr_na_linii_layer, ["OID@"] + existing_attrs) as cursor:
+                    arcpy.AddMessage(f"DEBUG - Nalezené atributy VR: {', '.join(existing_attrs)}")
+                    with arcpy.da.SearchCursor(point_vr_na_linii, ["OID@"] + existing_attrs) as cursor:
                         for i, row in enumerate(cursor):
                             if i >= 3:
                                 break
-                            attr_values = ", ".join([f"{attr}={row[j+1]}" for j, attr in enumerate(existing_attrs)])
-                            arcpy.AddMessage(f"  Prvek OID={row[0]}: {attr_values}")
+                            vals = ", ".join([f"{existing_attrs[j]}={row[j+1]}" for j in range(len(existing_attrs))])
+                            arcpy.AddMessage(f"  Point OID={row[0]}: {vals}")
                 else:
-                    arcpy.AddWarning("  ⚠ Žádné z očekávaných atributů (RIMSA_MIN, VYSKA_VB, atd.) nebylo nalezeno!")
-                    arcpy.AddMessage("  Hledej alternativní názvy v seznamu polí výše...")
+                    arcpy.AddWarning("  ⚠ Žádné atributy VR nebyly nalezeny v Point!")
                 
-                # Název pro singlepart vrstvu
-                if out_prefix:
-                    singlepart_name = f"{out_prefix}302210_VR_singlepart_LN"
-                else:
-                    singlepart_name = "PL_302210_VR_singlepart_LN"
-                
-                singlepart_name = generate_unique_name(output_gdb, singlepart_name)
-                singlepart_fc = os.path.join(output_workspace, singlepart_name)
-                
-                # Multipart to Singlepart
-                arcpy.management.MultipartToSinglepart(vr_na_linii_layer, singlepart_fc)
-                
-                # Filtrování pouze uzavřených linií (kruhy)
-                # Název pro finální vrstvu s kruhy
-                if out_prefix:
-                    circles_name = f"{out_prefix}302210_VR_circles_LN"
-                else:
-                    circles_name = "PL_302210_VR_circles_LN"
-                
-                circles_name = generate_unique_name(output_gdb, circles_name)
-                circles_vr_na_linii = os.path.join(output_workspace, circles_name)
-                
-                # Vytvoření prázdné kopie pro kruhy
-                arcpy.management.CreateFeatureclass(
-                    out_path=output_workspace,
-                    out_name=circles_name.split(os.sep)[-1],
-                    geometry_type="POLYLINE",
-                    template=singlepart_fc,
-                    spatial_reference=output_sr
-                )
-                
-                # Kopírování pouze uzavřených linií
-                circles_count = 0
-                # Získání seznamu polí (bez OBJECTID který se generuje automaticky)
-                field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
-                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
-                
-                with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
-                    with arcpy.da.InsertCursor(circles_vr_na_linii, ["SHAPE@"] + field_names) as insert_cursor:
-                        for row in search_cursor:
-                            geometry = row[0]
-                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
-                                insert_cursor.insertRow(row)
-                                circles_count += 1
-                
-                arcpy.AddMessage(f"✓ Nalezeno {circles_count} uzavřených linií (kruhů)")
-                
-                # Smazání dočasné singlepart vrstvy
-                arcpy.Delete_management(singlepart_fc)
+                # Pro zpětnou kompatibilitu - naplnit circles_vr_na_linii pointy
+                # (kód níže očekává circles_vr_na_linii jako zdroj atributů)
+                circles_vr_na_linii = point_vr_na_linii
                 
             except Exception as e:
-                arcpy.AddWarning(f"Chyba při zpracování VR na linii: {e}")
+                arcpy.AddWarning(f"Chyba při exportu Point VR na linii: {e}")
 
         # KROK 5: Generování automatických rozhraní tam, kde se mění výška
         # (podle logiky z notebooku - Dissolve podle atributu výšky, hledání koncových bodů)
@@ -832,74 +810,59 @@ class SimpleCADImport(object):
         vyskova_regulace_fc = None
         if sc_rozdelene_fc and circles_vr_na_linii and arcpy.Exists(sc_rozdelene_fc) and arcpy.Exists(circles_vr_na_linii):
             try:
-                # Převeď kruhy na centrody (středy) - eliminuje problém překrývání
-                circles_centroids_name = generate_unique_name(output_gdb, "VR_circles_centroids_temp")
-                circles_centroids_fc = os.path.join(output_workspace, circles_centroids_name)
+                # Použijeme Point přímo (už obsahuje všechny atributy z dynamic bloků)
+                # NEPŘEVÁDÍME na centroidy - Point už JE bod!
+                points_vr = circles_vr_na_linii  # Point feature class s atributy
                 
-                arcpy.management.FeatureToPoint(
-                    in_features=circles_vr_na_linii,
-                    out_feature_class=circles_centroids_fc,
-                    point_location="INSIDE"  # Centroid uvnitř polygonu
-                )
+                points_count = int(arcpy.GetCount_management(points_vr)[0])
+                arcpy.AddMessage(f"✓ Použito {points_count} Point prvků s atributy dynamických bloků")
                 
-                centroids_count = int(arcpy.GetCount_management(circles_centroids_fc)[0])
-                arcpy.AddMessage(f"✓ Vytvořeno {centroids_count} centroidů z kruhů")
+                # DEBUG: Zkontroluj jaká pole má Point
+                arcpy.AddMessage("DEBUG - Kontrola polí v Point...")
+                point_fields_list = [f.name for f in arcpy.ListFields(points_vr) if f.type not in ["OID", "Geometry"]]
+                arcpy.AddMessage(f"  Pole v Point ({len(point_fields_list)}): {', '.join(point_fields_list[:15])}")
                 
-                # DEBUG: Zkontroluj jaká pole mají kruhy a centroidy
-                arcpy.AddMessage("DEBUG - Kontrola polí v kruzích a centroidech...")
-                circle_fields_list = [f.name for f in arcpy.ListFields(circles_vr_na_linii) if f.type not in ["OID", "Geometry"]]
-                centroid_fields_list = [f.name for f in arcpy.ListFields(circles_centroids_fc) if f.type not in ["OID", "Geometry"]]
-                arcpy.AddMessage(f"  Pole v kruzích ({len(circle_fields_list)}): {', '.join(circle_fields_list[:10])}")
-                arcpy.AddMessage(f"  Pole v centroidech ({len(centroid_fields_list)}): {', '.join(centroid_fields_list[:10])}")
-                
-                # DEBUG: Zkontroluj hodnoty atributů v prvních 3 kruzích
-                arcpy.AddMessage("DEBUG - Kontrola hodnot atributů v prvních 3 kruzích...")
-                test_attrs = ["RIMSA_MIN", "VYSKA_VB", "NP_MIN", "VYSKA_MAX"]
-                existing_test_attrs = [a for a in test_attrs if a in circle_fields_list]
+                # DEBUG: Zkontroluj hodnoty atributů v prvních 3 pointech
+                arcpy.AddMessage("DEBUG - Kontrola hodnot atributů v prvních 3 Point...")
+                test_attrs = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "NP_MAX", "VYSKA_MAX"]
+                existing_test_attrs = [a for a in test_attrs if a in point_fields_list]
                 
                 if existing_test_attrs:
-                    with arcpy.da.SearchCursor(circles_vr_na_linii, ["OID@"] + existing_test_attrs) as cursor:
+                    arcpy.AddMessage(f"  Nalezené atributy VR: {', '.join(existing_test_attrs)}")
+                    with arcpy.da.SearchCursor(points_vr, ["OID@"] + existing_test_attrs) as cursor:
                         for i, row in enumerate(cursor):
                             if i >= 3:
                                 break
                             attr_values = ", ".join([f"{attr}={row[j+1]}" for j, attr in enumerate(existing_test_attrs)])
-                            arcpy.AddMessage(f"  Kruh OID={row[0]}: {attr_values}")
+                            arcpy.AddMessage(f"  Point OID={row[0]}: {attr_values}")
+                else:
+                    arcpy.AddWarning("  ⚠ Žádné očekávané atributy VR nebyly nalezeny!")
                 
-                # DEBUG: Zkontroluj hodnoty atributů v prvních 3 centroidech
-                arcpy.AddMessage("DEBUG - Kontrola hodnot atributů v prvních 3 centroidech...")
-                if existing_test_attrs:
-                    with arcpy.da.SearchCursor(circles_centroids_fc, ["OID@"] + existing_test_attrs) as cursor:
-                        for i, row in enumerate(cursor):
-                            if i >= 3:
-                                break
-                            attr_values = ", ".join([f"{attr}={row[j+1]}" for j, attr in enumerate(existing_test_attrs)])
-                            arcpy.AddMessage(f"  Centroid OID={row[0]}: {attr_values}")
-                
-                # DEBUG: Zkontroluj extent centroidů vs SC
-                centroid_extent = arcpy.Describe(circles_centroids_fc).extent
+                # DEBUG: Zkontroluj extent Point vs SC
+                point_extent = arcpy.Describe(points_vr).extent
                 sc_extent = arcpy.Describe(sc_rozdelene_fc).extent
-                arcpy.AddMessage(f"DEBUG - Centroid extent: X({centroid_extent.XMin:.2f} - {centroid_extent.XMax:.2f}), Y({centroid_extent.YMin:.2f} - {centroid_extent.YMax:.2f})")
+                arcpy.AddMessage(f"DEBUG - Point extent: X({point_extent.XMin:.2f} - {point_extent.XMax:.2f}), Y({point_extent.YMin:.2f} - {point_extent.YMax:.2f})")
                 arcpy.AddMessage(f"DEBUG - SC extent: X({sc_extent.XMin:.2f} - {sc_extent.XMax:.2f}), Y({sc_extent.YMin:.2f} - {sc_extent.YMax:.2f})")
                 
-                # DEBUG: Zjisti minimální vzdálenost mezi centroidem a SC linií
-                arcpy.AddMessage("DEBUG - Měření vzdáleností centroidů od SC linií...")
+                # DEBUG: Zjisti minimální vzdálenost mezi Point a SC linií
+                arcpy.AddMessage("DEBUG - Měření vzdáleností Point od SC linií...")
                 min_distance = float('inf')
                 max_distance = 0
                 distances = []
                 
-                with arcpy.da.SearchCursor(circles_centroids_fc, ["SHAPE@", "OID@"]) as cent_cursor:
-                    for i, cent_row in enumerate(cent_cursor):
-                        if i >= 5:  # Kontroluj jen prvních 5 centroidů
+                with arcpy.da.SearchCursor(points_vr, ["SHAPE@", "OID@"]) as point_cursor:
+                    for i, point_row in enumerate(point_cursor):
+                        if i >= 5:  # Kontroluj jen prvních 5 pointů
                             break
-                        centroid_geom = cent_row[0]
-                        centroid_oid = cent_row[1]
+                        point_geom = point_row[0]
+                        point_oid = point_row[1]
                         
                         # Najdi nejbližší SC linii
                         nearest_dist = float('inf')
                         with arcpy.da.SearchCursor(sc_rozdelene_fc, ["SHAPE@"]) as sc_cursor:
                             for sc_row in sc_cursor:
                                 sc_geom = sc_row[0]
-                                dist = centroid_geom.distanceTo(sc_geom)
+                                dist = point_geom.distanceTo(sc_geom)
                                 if dist < nearest_dist:
                                     nearest_dist = dist
                         
@@ -909,62 +872,91 @@ class SimpleCADImport(object):
                         if nearest_dist > max_distance:
                             max_distance = nearest_dist
                         
-                        arcpy.AddMessage(f"  Centroid OID={centroid_oid}: nejbližší SC = {nearest_dist:.2f}m")
+                        arcpy.AddMessage(f"  Point OID={point_oid}: nejbližší SC = {nearest_dist:.2f}m")
                 
                 if distances:
                     avg_distance = sum(distances) / len(distances)
                     arcpy.AddMessage(f"DEBUG - Vzdálenosti (prvních 5): min={min_distance:.2f}m, max={max_distance:.2f}m, avg={avg_distance:.2f}m")
                 
-                # Získat všechna pole z kruhů
-                circle_fields = [field.name for field in arcpy.ListFields(circles_centroids_fc) 
-                                if field.type not in ["OID", "Geometry"] and field.name.upper() not in ["SHAPE_LENGTH", "OBJECTID"]]
+                # Získat všechna pole z Point
+                point_fields = [field.name for field in arcpy.ListFields(points_vr) 
+                                if field.type not in ["OID", "Geometry"] and field.name.upper() not in ["SHAPE_LENGTH", "OBJECTID", "ORIG_FID"]]
                 
-                # Vytvoř field mapping - zachovej všechna pole
+                # Vytvoř field mapping - zachovej všechna pole z Point
                 field_mappings = arcpy.FieldMappings()
                 field_mappings.addTable(sc_rozdelene_fc)
-                field_mappings.addTable(circles_centroids_fc)
+                field_mappings.addTable(points_vr)
                 
-                # Spatial Join - připoj atributy od NEJBLIŽŠÍHO centroidu
+                # Spatial Join - připoj atributy od NEJBLIŽŠÍHO Point (všechny atributy zachovány)
                 vyskova_regulace_sj_name = generate_unique_name(output_gdb, "VyskovaRegulace_SJ_temp")
                 vyskova_regulace_sj_fc = os.path.join(output_workspace, vyskova_regulace_sj_name)
                 
                 arcpy.analysis.SpatialJoin(
                     target_features=sc_rozdelene_fc,
-                    join_features=circles_centroids_fc,
+                    join_features=points_vr,  # Point přímo (ne centroidy)
                     out_feature_class=vyskova_regulace_sj_fc,
-                    join_operation="JOIN_ONE_TO_ONE",  # Jeden segment = jeden nejbližší kruh
+                    join_operation="JOIN_ONE_TO_ONE",  # Jeden segment = jeden nejbližší Point
                     join_type="KEEP_ALL",
                     field_mapping=field_mappings,
-                    match_option="CLOSEST",  # Najdi nejbližší centroid
+                    match_option="CLOSEST",  # Najdi nejbližší Point
                     search_radius=""  # Bez limitu vzdálenosti - vždy najde nejbližší
                 )
                 
-                arcpy.AddMessage("✓ Atributy připojeny od nejbližších centroidů kruhů")
+                arcpy.AddMessage("✓ Atributy připojeny od nejbližších Point (všechny atributy VR zachovány)")
                 
                 # DEBUG: Zkontroluj kolik segmentů má přiřazené atributy
                 arcpy.AddMessage("DEBUG - Kontrola přiřazených atributů po Spatial Join...")
-                null_count = 0
-                notnull_count = 0
                 
-                # Použij první atribut výšky který existuje
-                test_field = None
-                for field in ["RIMSA_MIN", "VYSKA_VB", "NP_MIN", "VYSKA_MAX"]:
-                    if field in [f.name for f in arcpy.ListFields(vyskova_regulace_sj_fc)]:
-                        test_field = field
-                        break
+                # Zkontroluj všechny důležité atributy VR
+                test_attrs_all = ["RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "NP_MIN", "NP_MAX", "VYSKA_MAX"]
+                sj_fields = [f.name for f in arcpy.ListFields(vyskova_regulace_sj_fc)]
+                existing_test_attrs_sj = [a for a in test_attrs_all if a in sj_fields]
                 
-                if test_field:
-                    with arcpy.da.SearchCursor(vyskova_regulace_sj_fc, [test_field]) as cursor:
-                        for row in cursor:
-                            if row[0] is None:
-                                null_count += 1
-                            else:
-                                notnull_count += 1
+                if existing_test_attrs_sj:
+                    arcpy.AddMessage(f"DEBUG - Kontrola atributů po SJ: {', '.join(existing_test_attrs_sj)}")
                     
-                    arcpy.AddMessage(f"DEBUG - Segmenty s atributy: {notnull_count}, bez atributů: {null_count}")
-                    arcpy.AddMessage(f"DEBUG - Test pole: {test_field}")
+                    # Zjisti počty NULL vs non-NULL pro každý atribut
+                    for attr in existing_test_attrs_sj:
+                        null_count = 0
+                        notnull_count = 0
+                        with arcpy.da.SearchCursor(vyskova_regulace_sj_fc, [attr]) as cursor:
+                            for row in cursor:
+                                if row[0] is None:
+                                    null_count += 1
+                                else:
+                                    notnull_count += 1
+                        arcpy.AddMessage(f"  {attr}: {notnull_count} hodnot, {null_count} NULL")
+                    
+                    # Zobraz prvních 3 segmenty
+                    arcpy.AddMessage(f"DEBUG - První 3 segmenty po SJ:")
+                    with arcpy.da.SearchCursor(vyskova_regulace_sj_fc, ["OID@"] + existing_test_attrs_sj) as cursor:
+                        for i, row in enumerate(cursor):
+                            if i >= 3:
+                                break
+                            vals = ", ".join([f"{existing_test_attrs_sj[j]}={row[j+1]}" for j in range(len(existing_test_attrs_sj))])
+                            arcpy.AddMessage(f"  Segment OID={row[0]}: {vals}")
                 else:
-                    arcpy.AddWarning("DEBUG - Žádné pole výšky nenalezeno pro test!")
+                    arcpy.AddWarning("DEBUG - Žádné pole výšky nenalezeno po SJ!")
+                
+                # Již nepotřebujeme mazat circles_centroids_fc - nepřevádíme na centroidy
+                # Point zůstává Point po celou dobu
+                    arcpy.AddMessage("Připojování původních atributů ze SC...")
+                    
+                    # Vytvoř mapu FID -> Layer z původních SC
+                    layer_map = {}
+                    with arcpy.da.SearchCursor(merged_fc_original, ["OID@", "Layer"]) as cursor:
+                        for row in cursor:
+                            layer_map[row[0]] = row[1]
+                    
+                    # Přidej pole SC_Layer do výsledné vrstvy
+                    arcpy.management.AddField(
+                        in_table=vyskova_regulace_sj_fc,
+                        field_name="SC_Layer",
+                        field_type="TEXT",
+                        field_length=255
+                    )
+                    
+                    # Přidej další užitečná pole z původních SC pokud existují
                 
                 # Připojit původní atributy ze stavebních čar (Layer, typ SC atd.)
                 if merged_fc_original and arcpy.Exists(merged_fc_original):
@@ -1019,9 +1011,6 @@ class SimpleCADImport(object):
                                         break
                     
                     arcpy.AddMessage("✓ Původní atributy SC připojeny")
-                
-                # Cleanup
-                arcpy.Delete_management(circles_centroids_fc)
                 
                 # KROK 9: Vytvoření finální vrstvy (již bez konfliktů díky CLOSEST)
                 arcpy.AddMessage("Krok 9: Vytvoření finální vrstvy...")
