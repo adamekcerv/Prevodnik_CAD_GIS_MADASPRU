@@ -64,6 +64,14 @@ def log_message(message, level="INFO"):
     arcpy.AddMessage(f"{prefix} {message}")
 
 
+
+def sanitize_name(name):
+    """Odstraní nepovolené znaky z názvu"""
+    if not name:
+        return "unknown"
+    return "".join(c if c.isalnum() else "_" for c in str(name))
+
+
 def get_feature_count(fc):
     """Bezpečné získání počtu prvků"""
     try:
@@ -741,22 +749,7 @@ class HeightRegulationImport(object):
                             log_message(f"Dogenerováno {generated_count} chybějících rozhraní", "OK")
 
                             # Export dogenerovaných rozhraní pro kontrolu
-                            try:
-                                if out_prefix:
-                                    gen_name = f"{out_prefix}Rozhrani_generovana"
-                                else:
-                                    gen_name = "Z_Rozhrani_generovana"
-                                
-                                gen_name = generate_unique_name(output_gdb, gen_name)
-                                gen_output = os.path.join(output_workspace, gen_name)
-                                
-                                arcpy.CopyFeatures_management(r"memory\generated_rozhrani", gen_output)
-                                log_message(f"Export vygenerovaných rozhraní: {gen_name}", "DEBUG")
-                            except Exception as e:
-                                log_message(f"Chyba při exportu generovaných rozhraní: {e}", "WARN")
-
-                            
-                            # Snap dogenerovaných rozhraní ke SC liniím  
+                            # Snap dogenerovaných rozhraní ke SC liniím
                             if merged_sc_all and arcpy.Exists(merged_sc_all):
                                 log_message("Snap dogenerovaných rozhraní ke SC liniím (30cm edge)...", "STEP")
                                 try:
@@ -926,20 +919,20 @@ class HeightRegulationImport(object):
                         out_features=r"memory\false_endpoints"
                     )
                     
-                    # Export falešných bodů pro kontrolu
-                    try:
-                        if out_prefix:
-                            false_name = f"{out_prefix}Rozhrani_falesne"
-                        else:
-                            false_name = "Z_Rozhrani_falesne"
-                        
-                        false_name = generate_unique_name(output_gdb, false_name)
-                        false_output = os.path.join(output_workspace, false_name)
-                        
-                        arcpy.CopyFeatures_management(r"memory\false_endpoints", false_output)
-                        log_message(f"Export falešných rozhraní (merged back): {false_name}", "DEBUG")
-                    except Exception as e:
-                        log_message(f"Chyba při exportu falešných rozhraní: {e}", "WARN")
+                    # Export falešných bodů pro kontrolu - DISABLED FOR FINAL CLEANUP
+                    # try:
+                    #     if out_prefix:
+                    #         false_name = f"{out_prefix}Rozhrani_falesne"
+                    #     else:
+                    #         false_name = "Z_Rozhrani_falesne"
+                    #     
+                    #     false_name = generate_unique_name(output_gdb, false_name)
+                    #     false_output = os.path.join(output_workspace, false_name)
+                    #     
+                    #     arcpy.CopyFeatures_management(r"memory\false_endpoints", false_output)
+                    #     log_message(f"Export falešných rozhraní (merged back): {false_name}", "DEBUG")
+                    # except Exception as e:
+                    #     log_message(f"Chyba při exportu falešných rozhraní: {e}", "WARN")
 
                     
                     # 3. Vyber SC segmenty, které se dotýkají falešných bodů
@@ -1266,7 +1259,6 @@ class HeightRegulationImport(object):
                             log_message(f"Iterace {i+1}: Propagováno {len(updates)} segmentů", "DEBUG")
                             
                             # Update DB
-                            updated_sample_oid = None
                             with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
                                 for row in cursor:
                                     oid = row[0]
@@ -1275,14 +1267,6 @@ class HeightRegulationImport(object):
                                         for k, val in enumerate(new_attrs):
                                             row[k+1] = val
                                         cursor.updateRow(row)
-                                        if updated_sample_oid is None:
-                                            updated_sample_oid = oid
-                                        
-                            # VERIFICATION READ
-                            if updated_sample_oid is not None:
-                                with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs, where_clause=f"OBJECTID = {updated_sample_oid}") as verify_cursor:
-                                    for v_row in verify_cursor:
-                                        log_message(f"VERIFICATION READ for OID {updated_sample_oid}: {v_row[1:]}", "DEBUG")
                                         
                             # Update local cache
                             for oid, new_attrs in updates.items():
@@ -1415,108 +1399,122 @@ class HeightRegulationImport(object):
                         if null_count > 0:
                             log_message(f"  - NULL hodnot: {null_count} segmentů", "WARN")
                 
-                # Pro každý typ SC vytvoř samostatnou vrstvu
-                for sc_type in sorted(sc_types):
-                    if sc_type:
-                        log_message("=" * 60, "INFO")
-                        log_message(f"Zpracovávám typ: {sc_type}", "STEP")
+                # Seznam polí, která chceme zachovat (kromě systémových)
+                KEEP_FIELDS = [
+                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", 
+                    "NP_MAX", "NUP_MAX", "RIMSA_MAX", 
+                    "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
+                ]
+
+                # Pro každý nalezený typ SC
+                for sc_type in sc_types:
+                    if sc_type is None:
+                        continue
                         
-                        # Export s WHERE clause (místo selection - feature class nepodporuje selection)
-                        if out_prefix:
-                            output_name = f"{out_prefix}{sc_type}"
-                        else:
-                            output_name = f"Z_{sc_type}"
+                    # FILTR: Pouze typy začínající na 3011
+                    if not str(sc_type).startswith('3011'):
+                        continue
+
+                    log_message("=" * 60, "INFO")
+                    log_message(f"Zpracovávám typ: {sc_type}", "STEP")
+                    
+                    # Construct valid output name
+                    safe_name = sanitize_name(sc_type)
+                    if out_prefix:
+                        out_name = f"{out_prefix}_{safe_name}"
+                    else:
+                        out_name = f"Z_{safe_name}"
                         
-                        output_name = generate_unique_name(output_gdb, output_name)
-                        this_output = os.path.join(output_workspace, output_name)
-                        
-                        # WHERE clause s escapovaným názvem pole
-                        field_delimited = arcpy.AddFieldDelimiters(sc_final_with_vr, "SC_TYPE")
-                        where_clause = f"{field_delimited} = '{sc_type}'"
-                        
-                        log_message(f"WHERE: {where_clause}", "DEBUG")
-                        
+                    # Ensure checking for existence/uniqueness in the whole GDB
+                    # Use custom helper generate_unique_name which checks datasets too
+                    unique_out_name = generate_unique_name(output_gdb, out_name)
+                    out_fc = os.path.join(output_workspace, unique_out_name)
+                    
+                    # Select
+                    where_clause = f"SC_TYPE = '{sc_type}'"
+                    log_message(f"WHERE: {where_clause}", "DEBUG")
+                    
+                    try:
                         arcpy.conversion.ExportFeatures(
                             in_features=sc_final_with_vr,
-                            out_features=this_output,
+                            out_features=out_fc,
                             where_clause=where_clause
                         )
                         
-                        final_count = get_feature_count(this_output)
-                        log_message(f"Exportováno: {output_name} ({final_count} segmentů)", "OK")
+                        log_message(f"Exportováno: {unique_out_name}", "OK")
                         
-                        if final_count == 0:
-                            log_message(f"VAROVÁNÍ: Žádné segmenty pro {sc_type}!", "WARN")
-                            continue
+                        # FILTRACE POLÍ
+                        # Získáme seznam polí v nové vrstvě
+                        existing_fields = [f.name for f in arcpy.ListFields(out_fc)]
+                        fields_to_delete = []
                         
-                        final_outputs.append((this_output, sc_type))
-                        
-                        # Detekce chyb (segmenty s více bloky S RŮZNÝMI hodnotami)
-                        # Použij dynamické VR atributy místo hardcoded HEIGHT_ATTRIBUTES
-                        if vr_circles and arcpy.Exists(vr_circles):
-                            vr_attributes = get_vr_attributes(vr_circles)
-                        else:
-                            vr_attributes = []
-                        
-                        fields = [f.name for f in arcpy.ListFields(this_output)]
-                        unique_field = None
-                        for attr in vr_attributes:
-                            if attr in fields:
-                                unique_field = attr
-                                break
-                        
-                        if unique_field:
-                            count_field_name = f"COUNT_{unique_field}"
-                            unique_field_name = f"UNIQUE_{unique_field}"
-                            
-                            if count_field_name in fields and unique_field_name in fields:
-                                # Spočítej chyby ručně
-                                manual_errors = 0
-                                with arcpy.da.SearchCursor(this_output, [count_field_name, unique_field_name]) as cursor:
-                                    for row in cursor:
-                                        if row[0] is not None and row[0] > 0 and row[1] is not None and row[1] > 1:
-                                            manual_errors += 1
+                        for field_name in existing_fields:
+                            # Nechceme mazat systémová pole
+                            f_info = arcpy.ListFields(out_fc, field_name)[0]
+                            if f_info.type in ["OID", "Geometry", "GlobalID", "GUID"]:
+                                continue
+                            if f_info.required:
+                                continue
+                            if field_name.lower() in ["shape_length", "shape_area"]:
+                                continue
                                 
-                                if manual_errors > 0:
-                                    # WHERE clause pro chyby
-                                    where_errors = f"{count_field_name} IS NOT NULL AND {count_field_name} > 0 AND {unique_field_name} > 1"
-                                    
-                                    if out_prefix:
-                                        errors_name = f"{out_prefix}{sc_type}_Errors"
-                                    else:
-                                        errors_name = f"Z_{sc_type}_Errors"
-                                    
-                                    errors_name = generate_unique_name(output_gdb, errors_name)
-                                    this_errors = os.path.join(output_workspace, errors_name)
-                                    
-                                    arcpy.conversion.ExportFeatures(
-                                        in_features=this_output,
-                                        out_features=this_errors,
-                                        where_clause=where_errors
-                                    )
-                                    
-                                    log_message(f"⚠️ {manual_errors} chyb → {errors_name}", "WARN")
-                                    errors_outputs.append((this_errors, sc_type))
-                                else:
-                                    log_message("✅ Žádné chyby", "OK")
-                    else:
-                        # SC_TYPE bylo None - export jako jednu vrstvu
-                        if out_prefix:
-                            output_name = f"{out_prefix}VyskovaRegulaceNaLinii_l"
-                        else:
-                            output_name = "Z_VyskovaRegulaceNaLinii_l"
+                            # Pokud pole není v KEEP_FIELDS, smažeme ho
+                            if field_name not in KEEP_FIELDS:
+                                fields_to_delete.append(field_name)
                         
-                        output_name = generate_unique_name(output_gdb, output_name)
-                        this_output = os.path.join(output_workspace, output_name)
+                        if fields_to_delete:
+                            # log_message(f"Mazání nadbytečných polí: {len(fields_to_delete)}", "DEBUG")
+                            arcpy.management.DeleteField(out_fc, fields_to_delete)
                         
-                        arcpy.CopyFeatures_management(sc_final_with_vr, this_output)
+                        final_outputs.append(out_fc)
                         
-                        final_count = get_feature_count(this_output)
-                        log_message(f"Exportováno: {output_name} ({final_count} segmentů) - bez rozdělení typů", "OK")
-                        final_outputs.append((this_output, "všechny_typy"))
+                    except Exception as e:
+                        log_message(f"Chyba při exportu {sc_type}: {e}", "ERROR")
+
+                # EXPORT VR_NA_BOD (pokud existuje)
+                # Musíme najít správný název vrstvy v memory nebo GDB. 
+                # V Phase 1 se importovalo. Zkusíme pohledat vrstvou končící na "302110_BL_VR_na_bod" v importovaných.
+                # Nebo prostě prohledáme 'memory'
                 
+                # EXPORT VR_NA_BOD (pokud existuje)
+                # Použijeme proměnnou vr_na_bod_layer z Phase 1
+                
+                if vr_na_bod_layer and arcpy.Exists(vr_na_bod_layer):
+                    vr_bod_source = vr_na_bod_layer
+                    
+                    out_name_bod = "Z_302110_BL_VR_na_bod"
+                    if out_prefix: out_name_bod = f"{out_prefix}_{out_name_bod}"
+                    
+                    # Ensure unique
+                    unique_out_bod = generate_unique_name(output_gdb, out_name_bod)
+                    out_fc_bod = os.path.join(output_workspace, unique_out_bod)
+                    
+                    try:
+                        log_message(f"Exportuji VR na bod: {unique_out_bod}", "STEP")
+                        arcpy.conversion.ExportFeatures(vr_bod_source, out_fc_bod)
+                        
+                        # Filtrace polí i zde
+                        existing_fields = [f.name for f in arcpy.ListFields(out_fc_bod)]
+                        fields_to_delete = []
+                        for field_name in existing_fields:
+                            f_info = arcpy.ListFields(out_fc_bod, field_name)[0]
+                            if f_info.type in ["OID", "Geometry", "GlobalID", "GUID"] or f_info.required or field_name.lower() in ["shape_length", "shape_area"]:
+                                continue
+                            if field_name not in KEEP_FIELDS:
+                                fields_to_delete.append(field_name)
+                                
+                        if fields_to_delete:
+                            arcpy.management.DeleteField(out_fc_bod, fields_to_delete)
+                            
+                        final_outputs.append(out_fc_bod)
+                        log_message("VR na bod exportováno a začištěno.", "OK")
+                        
+                    except Exception as e:
+                         log_message(f"Chyba při exportu VR na bod: {e}", "WARN")
+
             except Exception as e:
-                log_message(f"Chyba při rozdělování podle typů SC: {e}", "ERROR")
+                log_message(f"Kritická chyba ve Fázi 9: {e}", "ERROR")
+                pass
 
         # ============================================================
         # FÁZE 10: CLEANUP
@@ -1525,39 +1523,39 @@ class HeightRegulationImport(object):
         log_message("FÁZE 10: CLEANUP DOČASNÝCH VRSTEV", "STEP")
         log_message("=" * 60, "INFO")
         
-        # Export rozhraní pro kontrolu (před cleanup)
-        if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
-            try:
-                if out_prefix:
-                    rozhrani_name = f"{out_prefix}Rozhrani_body_kontrola"
-                else:
-                    rozhrani_name = "Z_Rozhrani_body_kontrola"
-                
-                rozhrani_name = generate_unique_name(output_gdb, rozhrani_name)
-                rozhrani_output = os.path.join(output_workspace, rozhrani_name)
-                
-                arcpy.CopyFeatures_management(rozhrani_body_all, rozhrani_output)
-                rozhrani_count = get_feature_count(rozhrani_output)
-                log_message(f"Export bodů rozhraní: {rozhrani_name} ({rozhrani_count} bodů)", "DEBUG")
-            except Exception as e:
-                log_message(f"Nepodařilo se exportovat body rozhraní: {e}", "WARN")
+        # Export rozhraní pro kontrolu (před cleanup) - DISABLED FOR FINAL CLEANUP
+        # if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+        #     try:
+        #         if out_prefix:
+        #             rozhrani_name = f"{out_prefix}Rozhrani_body_kontrola"
+        #         else:
+        #             rozhrani_name = "Z_Rozhrani_body_kontrola"
+        #         
+        #         rozhrani_name = generate_unique_name(output_gdb, rozhrani_name)
+        #         rozhrani_output = os.path.join(output_workspace, rozhrani_name)
+        #         
+        #         arcpy.CopyFeatures_management(rozhrani_body_all, rozhrani_output)
+        #         rozhrani_count = get_feature_count(rozhrani_output)
+        #         log_message(f"Export bodů rozhraní: {rozhrani_name} ({rozhrani_count} bodů)", "DEBUG")
+        #     except Exception as e:
+        #         log_message(f"Nepodařilo se exportovat body rozhraní: {e}", "WARN")
         
-        # Export CAD linie rozhraní pro kontrolu
-        if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
-            try:
-                if out_prefix:
-                    rozhrani_line_name = f"{out_prefix}Rozhrani_linie_CAD"
-                else:
-                    rozhrani_line_name = "Z_Rozhrani_linie_CAD"
-                
-                rozhrani_line_name = generate_unique_name(output_gdb, rozhrani_line_name)
-                rozhrani_line_output = os.path.join(output_workspace, rozhrani_line_name)
-                
-                arcpy.CopyFeatures_management(vr_rozhrani_layer, rozhrani_line_output)
-                rozhrani_line_count = get_feature_count(rozhrani_line_output)
-                log_message(f"Export CAD linií rozhraní: {rozhrani_line_name} ({rozhrani_line_count} linií)", "DEBUG")
-            except Exception as e:
-                log_message(f"Nepodařilo se exportovat CAD linie rozhraní: {e}", "WARN")
+        # Export CAD linie rozhraní pro kontrolu - DISABLED FOR FINAL CLEANUP
+        # if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
+        #     try:
+        #         if out_prefix:
+        #             rozhrani_line_name = f"{out_prefix}Rozhrani_linie_CAD"
+        #         else:
+        #             rozhrani_line_name = "Z_Rozhrani_linie_CAD"
+        #         
+        #         rozhrani_line_name = generate_unique_name(output_gdb, rozhrani_line_name)
+        #         rozhrani_line_output = os.path.join(output_workspace, rozhrani_line_name)
+        #         
+        #         arcpy.CopyFeatures_management(vr_rozhrani_layer, rozhrani_line_output)
+        #         rozhrani_line_count = get_feature_count(rozhrani_line_output)
+        #         log_message(f"Export CAD linií rozhraní: {rozhrani_line_name} ({rozhrani_line_count} linií)", "DEBUG")
+        #     except Exception as e:
+        #         log_message(f"Nepodařilo se exportovat CAD linie rozhraní: {e}", "WARN")
         
         # Seznam memory vrstev k smazání
         memory_layers = [
@@ -1569,7 +1567,10 @@ class HeightRegulationImport(object):
             r"memory\sc_with_vr_temp",
             r"memory\sc_dissolve_clean",
             r"memory\sc_final_split",
-            r"memory\sc_cleaned"
+            r"memory\sc_cleaned",
+            r"memory\vr_linii_singlepart",
+            r"memory\rozhrani_body_multipart",
+            r"memory\rozhrani_lines_snap"
         ]
         
         deleted = 0
@@ -1583,16 +1584,26 @@ class HeightRegulationImport(object):
         
         log_message(f"Smazáno {deleted} dočasných vrstev z paměti", "OK")
         
-        # Smazání pomocných vrstev z output workspace
+        # Smazání pomocných vrstev z output workspace (importované vrstvy a dočasné mezivýsledky)
+        deleted_gdb = 0
         try:
-            if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
-                arcpy.Delete_management(vr_rozhrani_layer)
+            # Smazání původní vrstvy rozhraní a VR bloků
+            layers_to_delete = [vr_rozhrani_layer, vr_na_bod_layer, vr_na_linii_layer, vr_circles]
+            
+            for layer in layers_to_delete:
+                if layer and arcpy.Exists(layer):
+                    arcpy.Delete_management(layer)
+                    deleted_gdb += 1
+                    
             # Smazání původních SC vrstev (jsou nahrazeny finálními výstupy s SC_TYPE)
             for sc_layer in sc_layers:
                 if arcpy.Exists(sc_layer):
                     arcpy.Delete_management(sc_layer)
-        except:
-            pass
+                    deleted_gdb += 1
+        except Exception as e:
+            log_message(f"Chyba při mazání pomocných vrstev v GDB: {e}", "WARN")
+            
+        log_message(f"Smazáno {deleted_gdb} importovaných vrstev z GDB", "OK")
 
         # ============================================================
         # SHRNUTÍ
@@ -1603,12 +1614,12 @@ class HeightRegulationImport(object):
         
         if final_outputs:
             log_message(f"Vytvořeno {len(final_outputs)} výstupních vrstev:", "OK")
-            for output_path, type_name in final_outputs:
+            for output_path in final_outputs:
                 log_message(f"  • {os.path.basename(output_path)}", "OK")
         
         if errors_outputs:
             log_message(f"Vrstvy s chybami ({len(errors_outputs)}):", "WARN")
-            for error_path, type_name in errors_outputs:
+            for error_path in errors_outputs:
                 log_message(f"  • {os.path.basename(error_path)}", "WARN")
         
         log_message(f"Output GDB: {output_gdb}", "INFO")
