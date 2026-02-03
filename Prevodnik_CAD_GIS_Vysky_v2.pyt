@@ -521,8 +521,25 @@ class HeightRegulationImport(object):
                 # Intersect rozhraní se SC liniemi → body
                 log_message("Hledám průsečíky rozhraní se SC liniemi...", "STEP")
                 
+                # Nejdřív SNAP rozhraní na SC linie (0.5m edge)
+                rozhrani_for_intersect = vr_rozhrani_layer
+                try:
+                    log_message("Snap bodů rozhraní ke SC liniím (0.5m edge)...", "STEP")
+                    # Export do memory pro editaci
+                    rozhrani_snap_tm = r"memory\rozhrani_lines_snap"
+                    arcpy.conversion.ExportFeatures(vr_rozhrani_layer, rozhrani_snap_tm)
+                    
+                    # Snap 
+                    snap_env = [[merged_sc_all, "EDGE", "0.5 Meters"]]
+                    arcpy.edit.Snap(rozhrani_snap_tm, snap_env)
+                    
+                    rozhrani_for_intersect = rozhrani_snap_tm
+                    log_message("Snap rozhraní dokončen", "DEBUG")
+                except Exception as e:
+                    log_message(f"Snap rozhraní selhal, použiji původní: {e}", "WARN")
+
                 arcpy.analysis.PairwiseIntersect(
-                    in_features=f"{vr_rozhrani_layer};{merged_sc_all}",
+                    in_features=[rozhrani_for_intersect, merged_sc_all],
                     out_feature_class=r"memory\rozhrani_body_multipart",
                     join_attributes="NO_FID",
                     cluster_tolerance=None,
@@ -722,6 +739,22 @@ class HeightRegulationImport(object):
                             
                             generated_count = get_feature_count(r"memory\generated_rozhrani")
                             log_message(f"Dogenerováno {generated_count} chybějících rozhraní", "OK")
+
+                            # Export dogenerovaných rozhraní pro kontrolu
+                            try:
+                                if out_prefix:
+                                    gen_name = f"{out_prefix}Rozhrani_generovana"
+                                else:
+                                    gen_name = "Z_Rozhrani_generovana"
+                                
+                                gen_name = generate_unique_name(output_gdb, gen_name)
+                                gen_output = os.path.join(output_workspace, gen_name)
+                                
+                                arcpy.CopyFeatures_management(r"memory\generated_rozhrani", gen_output)
+                                log_message(f"Export vygenerovaných rozhraní: {gen_name}", "DEBUG")
+                            except Exception as e:
+                                log_message(f"Chyba při exportu generovaných rozhraní: {e}", "WARN")
+
                             
                             # Snap dogenerovaných rozhraní ke SC liniím  
                             if merged_sc_all and arcpy.Exists(merged_sc_all):
@@ -845,17 +878,149 @@ class HeightRegulationImport(object):
             sc_final_split = merged_sc_all
 
         # ============================================================
-        # FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ (DOČASNĚ VYPNUTO)
+        # FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ (podle notebooku)
         # ============================================================
         log_message("=" * 60, "INFO")
-        log_message("FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ (PŘESKOČENO)", "STEP")
+        log_message("FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ", "STEP")
         log_message("=" * 60, "INFO")
         
-        # DŮVOD VYPNUTÍ: Logika byla chybná - slučovala i segmenty s různými výškami
-        # Řešení: Dissolve v FÁZI 8 podle výškových atributů to vyřeší lépe
+        # Logika z notebooku:
+        # 1. Najdi koncové body SC segmentů
+        # 2. Vyber ty, které NEKOLIDUJÍ s rozhraními (falešné řezy)
+        # 3. Spoj segmenty, které mají tyto falešné řezy
         
-        log_message("Čištění falešných rozhraní přeskočeno - použije se dissolve podle výšek", "INFO")
         sc_cleaned = sc_final_split
+        
+        try:
+            if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                log_message("Detekuji falešná rozhraní (koncové body mimo skutečná rozhraní)...", "STEP")
+                
+                # 1. Extrahuj všechny koncové body SC segmentů
+                arcpy.management.FeatureVerticesToPoints(
+                    in_features=sc_final_split,
+                    out_feature_class=r"memory\sc_split_endpoints",
+                    point_location="BOTH_ENDS"
+                )
+                
+                endpoints_count = get_feature_count(r"memory\sc_split_endpoints")
+                log_message(f"Nalezeno {endpoints_count} koncových bodů", "DEBUG")
+                
+                # 2. Vyber body, které NEKOLIDUJÍ s rozhraními (= falešné řezy)
+                arcpy.management.MakeFeatureLayer(r"memory\sc_split_endpoints", "endpoints_lyr")
+                
+                arcpy.management.SelectLayerByLocation(
+                    in_layer="endpoints_lyr",
+                    overlap_type="INTERSECT",
+                    select_features=rozhrani_body_all,
+                    search_distance="0.35 Meters",  # Trochu větší než split radius
+                    selection_type="NEW_SELECTION",
+                    invert_spatial_relationship="INVERT"
+                )
+                
+                false_endpoints_count = int(arcpy.GetCount_management("endpoints_lyr")[0])
+                log_message(f"Falešných koncových bodů (mimo rozhraní): {false_endpoints_count}", "DEBUG")
+                
+                if false_endpoints_count > 0:
+                    arcpy.conversion.ExportFeatures(
+                        in_features="endpoints_lyr",
+                        out_features=r"memory\false_endpoints"
+                    )
+                    
+                    # Export falešných bodů pro kontrolu
+                    try:
+                        if out_prefix:
+                            false_name = f"{out_prefix}Rozhrani_falesne"
+                        else:
+                            false_name = "Z_Rozhrani_falesne"
+                        
+                        false_name = generate_unique_name(output_gdb, false_name)
+                        false_output = os.path.join(output_workspace, false_name)
+                        
+                        arcpy.CopyFeatures_management(r"memory\false_endpoints", false_output)
+                        log_message(f"Export falešných rozhraní (merged back): {false_name}", "DEBUG")
+                    except Exception as e:
+                        log_message(f"Chyba při exportu falešných rozhraní: {e}", "WARN")
+
+                    
+                    # 3. Vyber SC segmenty, které se dotýkají falešných bodů
+                    arcpy.management.MakeFeatureLayer(sc_final_split, "sc_split_lyr")
+                    
+                    arcpy.management.SelectLayerByLocation(
+                        in_layer="sc_split_lyr",
+                        overlap_type="INTERSECT",
+                        select_features=r"memory\false_endpoints",
+                        search_distance=None,
+                        selection_type="NEW_SELECTION",
+                        invert_spatial_relationship="NOT_INVERT"
+                    )
+                    
+                    segments_to_merge = int(arcpy.GetCount_management("sc_split_lyr")[0])
+                    log_message(f"Segmentů s falešnými rozhraními: {segments_to_merge}", "DEBUG")
+                    
+                    if segments_to_merge > 0:
+                        # 4. Spoj tyto segmenty (dissolve podle SC_TYPE - aby se nespojily různé typy)
+                        arcpy.conversion.ExportFeatures(
+                            in_features="sc_split_lyr",
+                            out_features=r"memory\segments_to_merge"
+                        )
+                        
+                        # Dissolve podle SC_TYPE (spojí jen segmenty stejného typu)
+                        dissolve_fields = ["SC_TYPE"] if "SC_TYPE" in [f.name for f in arcpy.ListFields(r"memory\segments_to_merge")] else []
+                        
+                        arcpy.management.Dissolve(
+                            in_features=r"memory\segments_to_merge",
+                            out_feature_class=r"memory\segments_merged",
+                            dissolve_field=dissolve_fields,
+                            statistics_fields=None,
+                            multi_part="SINGLE_PART",
+                            unsplit_lines="DISSOLVE_LINES"
+                        )
+                        
+                        merged_count = get_feature_count(r"memory\segments_merged")
+                        log_message(f"Po spojení falešných řezů: {merged_count} segmentů", "DEBUG")
+                        
+                        # 5. Najdi původní segmenty, které leží WITHIN spojených (= budou smazány)
+                        arcpy.management.SelectLayerByLocation(
+                            in_layer="sc_split_lyr",
+                            overlap_type="WITHIN",
+                            select_features=r"memory\segments_merged",
+                            search_distance=None,
+                            selection_type="NEW_SELECTION",
+                            invert_spatial_relationship="NOT_INVERT"
+                        )
+                        
+                        segments_to_delete = int(arcpy.GetCount_management("sc_split_lyr")[0])
+                        log_message(f"Mazání {segments_to_delete} původních segmentů...", "DEBUG")
+                        
+                        # 6. Smazání původních rozdělených segmentů
+                        if segments_to_delete > 0:
+                            arcpy.management.DeleteRows("sc_split_lyr")
+                        
+                        # 7. Merge spojených segmentů zpět do sc_final_split
+                        arcpy.management.Append(
+                            inputs=r"memory\segments_merged",
+                            target=sc_final_split,
+                            schema_type="NO_TEST"
+                        )
+                        
+                        final_cleaned_count = get_feature_count(sc_final_split)
+                        log_message(f"Po čištění falešných rozhraní: {final_cleaned_count} segmentů", "OK")
+                        log_message(f"Odstraněno {segments_to_delete - merged_count} falešných řezů", "OK")
+                    else:
+                        log_message("Žádné segmenty s falešnými rozhraními nenalezeny", "DEBUG")
+                else:
+                    log_message("Všechny koncové body odpovídají skutečným rozhraním", "OK")
+                
+                sc_cleaned = sc_final_split
+                
+            else:
+                log_message("Žádná rozhraní - přeskakuji čištění", "DEBUG")
+                sc_cleaned = sc_final_split
+        
+        except Exception as e:
+            log_message(f"Chyba při čištění falešných rozhraní: {e}", "WARN")
+            log_message("Pokračuji s nečištěnými segmenty", "WARN")
+            sc_cleaned = sc_final_split
         
         # DEBUG - kontrola SC_TYPE
         fields = [f.name for f in arcpy.ListFields(sc_cleaned)]
@@ -903,9 +1068,14 @@ class HeightRegulationImport(object):
                 # ============================================================
                 # PROPAGACE ATRIBUTŮ MEZI ROZHRANÍMI
                 # ============================================================
-                log_message("Propagace atributů v oblastech mezi rozhraními...", "STEP")
+                # ============================================================
+                # PROPAGACE ATRIBUTŮ (SERIAL & PARALLEL)
+                # ============================================================
+                # Cíl: Přenést atributy přes rozdělené segmenty (i různých typů),
+                # POKUD mezi nimi není rozhraní.
                 
-                # Zjisti VR atributy
+                log_message("Spouštím chytrou propagaci atributů (Respektuje rozhraní)...", "STEP")
+                
                 if vr_circles and arcpy.Exists(vr_circles):
                     vr_attributes = get_vr_attributes(vr_circles)
                 else:
@@ -914,74 +1084,108 @@ class HeightRegulationImport(object):
                 fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
                 available_height_attrs = [attr for attr in vr_attributes if attr in fields]
                 
-                if available_height_attrs:
-                    # Najdi segmenty s NULL vs s hodnotami
-                    null_count = 0
-                    filled_count = 0
+                if available_height_attrs and rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                    # 1. Vytvoř buffer kolem rozhraní (to jsou bariéry)
+                    # Tolerance 5cm - pokud se segmenty dotýkají blíž než 5cm od rozhraní, považujeme to za přerušení
+                    try:
+                        arcpy.analysis.Buffer(rozhrani_body_all, r"memory\rozhrani_buffer", "0.05 Meters")
+                        # Načti buffer jako geometrii pro rychlý test
+                        barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
+                    except Exception as e:
+                        log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
+                        barrier_geom = None
+
+                    # 2. Načti segmenty
+                    # OID -> {geom, attrs, has_data}
+                    segments_data = {}
                     
-                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
+                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID", "SHAPE@"] + available_height_attrs) as cursor:
                         for row in cursor:
-                            has_value = any(row[i+1] is not None for i in range(len(available_height_attrs)))
-                            if has_value:
-                                filled_count += 1
-                            else:
-                                null_count += 1
+                            oid = row[0]
+                            geom = row[1]
+                            attrs = list(row[2:])
+                            has_data = any(a is not None for a in attrs)
+                            segments_data[oid] = {"geom": geom, "attrs": attrs, "has_data": has_data}
+
+                    # 3. Iterativní propagace
+                    max_iterations = 10
                     
-                    log_message(f"Segmentů s atributy: {filled_count}, bez atributů: {null_count}", "DEBUG")
-                    
-                    if null_count > 0 and filled_count > 0:
-                        # Iterativní propagace přes sousedy (max 10 iterací)
-                        log_message("Spouštím iterativní propagaci atributů...", "STEP")
+                    for i in range(max_iterations):
+                        changes = 0
+                        updates = {} # oid -> new_attrs
                         
-                        for iteration in range(10):
-                            changes = 0
+                        # Projdi jen ty bez dat
+                        null_segments = {k: v for k, v in segments_data.items() if not v["has_data"]}
+                        filled_segments = {k: v for k, v in segments_data.items() if v["has_data"]}
+                        
+                        if not null_segments:
+                            break
                             
-                            # Načti všechny segmenty s jejich geometrií a atributy
-                            segments = {}
-                            with arcpy.da.SearchCursor(r"memory\sc_final_sj", 
-                                                      ["OBJECTID", "SHAPE@"] + available_height_attrs) as cursor:
+                        # Pro každý prázdný segment
+                        for null_oid, null_info in null_segments.items():
+                            null_geom = null_info["geom"]
+                            
+                            # Najdi souseda s daty
+                            # Optimalizace: nejdřív check extent? Prozatím brute-force over filled (pro malé počty OK, pro velké pomalé)
+                            # Pro zrychlení použijeme Index nebo jen 'touches'
+                            
+                            candidate_attrs = None
+                            
+                            for fill_oid, fill_info in filled_segments.items():
+                                fill_geom = fill_info["geom"]
+                                
+                                if null_geom.disjoint(fill_geom):
+                                    continue
+                                    
+                                if null_geom.touches(fill_geom):
+                                    # Mají společný bod
+                                    # Získej průnik (bod dotyku)
+                                    touch_point = null_geom.intersect(fill_geom, 1) # 1 = bod
+                                    
+                                    # Je tento bod chráněn bariérou?
+                                    is_blocked = False
+                                    if barrier_geom and touch_point:
+                                        if not barrier_geom.disjoint(touch_point):
+                                            is_blocked = True
+                                    
+                                    if not is_blocked:
+                                        candidate_attrs = fill_info["attrs"]
+                                        break # Našli jsme dárce
+                            
+                            if candidate_attrs:
+                                updates[null_oid] = candidate_attrs
+                                changes += 1
+                        
+                        # Aplikuj změny do paměti a DB
+                        if updates:
+                            log_message(f"Iterace {i+1}: Propagováno {len(updates)} segmentů", "DEBUG")
+                            
+                            # Update DB
+                            with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
                                 for row in cursor:
                                     oid = row[0]
-                                    geom = row[1]
-                                    attrs = list(row[2:])
-                                    segments[oid] = {"geom": geom, "attrs": attrs}
+                                    if oid in updates:
+                                        new_attrs = updates[oid]
+                                        for k, val in enumerate(new_attrs):
+                                            row[k+1] = val
+                                        cursor.updateRow(row)
+                                        
+                            # Update local cache
+                            for oid, new_attrs in updates.items():
+                                segments_data[oid]["attrs"] = new_attrs
+                                segments_data[oid]["has_data"] = True
+                        else:
+                            log_message(f"Propagace dokončena po {i} iteracích", "OK")
+                            break
                             
-                            # Pro každý NULL segment najdi sousedy s hodnotami
-                            updates = []
-                            for oid, data in segments.items():
-                                # Je NULL?
-                                if all(attr is None for attr in data["attrs"]):
-                                    # Najdi sousední segment s hodnotami
-                                    for neighbor_oid, neighbor_data in segments.items():
-                                        if neighbor_oid != oid:
-                                            # Má soused hodnoty?
-                                            if any(attr is not None for attr in neighbor_data["attrs"]):
-                                                # Dotýkají se?
-                                                if data["geom"].touches(neighbor_data["geom"]) or data["geom"].intersects(neighbor_data["geom"]):
-                                                    # Zkopíruj atributy
-                                                    updates.append((oid, neighbor_data["attrs"]))
-                                                    changes += 1
-                                                    break
-                            
-                            # Aplikuj změny
-                            if updates:
-                                with arcpy.da.UpdateCursor(r"memory\sc_final_sj", 
-                                                          ["OBJECTID"] + available_height_attrs) as cursor:
-                                    for row in cursor:
-                                        oid = row[0]
-                                        for update_oid, new_attrs in updates:
-                                            if oid == update_oid:
-                                                for i, attr in enumerate(new_attrs):
-                                                    row[i+1] = attr
-                                                cursor.updateRow(row)
-                                                break
-                                
-                                log_message(f"Iterace {iteration+1}: propagováno {changes} segmentů", "DEBUG")
-                            else:
-                                log_message(f"Propagace dokončena po {iteration+1} iteracích", "OK")
-                                break
-                    else:
-                        log_message("Propagace není potřeba (všechny segmenty mají nebo nemají atributy)", "DEBUG")
+                    # Cleanup barriers
+                    if arcpy.Exists(r"memory\rozhrani_buffer"):
+                        arcpy.Delete_management(r"memory\rozhrani_buffer")
+
+                
+                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
+
+
                 
                 # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
                 log_message("Dissolve pro detekci chyb...", "STEP")
