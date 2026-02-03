@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+"""
+MADASPRU CAD Import - Výšky v2
+Metoda: SplitLineAtPoint (bez buffer/centerline)
+Logika převzata z HeightRegulationLine.ipynb
+"""
 import arcpy
 import os
 
@@ -9,18 +14,22 @@ DEFAULT_LAYERS = [
     "302211_PL_VR_na_linii_rozhrani"
 ]
 
+# Výškové atributy pro dissolve a přenos
+HEIGHT_ATTRIBUTES = [
+    "RIMSA_MIN", "RIMSA_MAX",
+    "NP_MIN", "NP_MAX", "NPU_MAX",
+    "VYSKA_MAX", "VYSKA_VB", "VYSKA_VB_I"
+]
+
 def generate_unique_name(gdb_path, base_name):
     """Generuje unikátní název pro feature class v geodatabázi"""
     unique_name = base_name
     counter = 1
     
-    # Uložení původního workspace
     original_workspace = arcpy.env.workspace
     
     try:
-        # Kontrola existence v celé geodatabázi (včetně feature datasets)
         while arcpy.Exists(os.path.join(gdb_path, unique_name)):
-            # Hledání ve všech feature datasets
             arcpy.env.workspace = gdb_path
             datasets = arcpy.ListDatasets("", "Feature")
             name_exists = False
@@ -36,22 +45,92 @@ def generate_unique_name(gdb_path, base_name):
             else:
                 break
     finally:
-        # Obnovení původního workspace
         arcpy.env.workspace = original_workspace
     
     return unique_name
 
+
+def log_message(message, level="INFO"):
+    """Helper pro logování s úrovněmi"""
+    prefix = {
+        "INFO": "ℹ️",
+        "OK": "✅",
+        "WARN": "⚠️",
+        "ERROR": "❌",
+        "DEBUG": "🔍",
+        "STEP": "▶️"
+    }.get(level, "")
+    
+    arcpy.AddMessage(f"{prefix} {message}")
+
+
+def get_feature_count(fc):
+    """Bezpečné získání počtu prvků"""
+    try:
+        return int(arcpy.GetCount_management(fc)[0])
+    except:
+        return 0
+
+
+def get_vr_attributes(vr_feature_class):
+    """
+    Získá POUZE relevantní atributy z VR bloků (výškové + dokumentační)
+    Vyloučí CAD metadata (Entity, Handle, Layer, Color atd.)
+    Returns: seznam názvů atributů
+    """
+    # Systémová pole
+    excluded_fields = {
+        "OBJECTID", "SHAPE", "SHAPE_LENGTH", "SHAPE_AREA", 
+        "FID", "OID", "GLOBALID", "TARGET_FID", "SC_TYPE",
+        "JOIN_FID", "JOIN_COUNT"
+    }
+    
+    # CAD metadata - vyloučit (každý blok má unikátní hodnoty)
+    cad_metadata_prefixes = {
+        "ENTITY", "HANDLE", "LAYER", "LYR", "COLOR", "LINETYPE", 
+        "LTSCALE", "ELEVATION", "THICKNESS", "LINEWT", "BLK",
+        "ENT", "EXT", "DOC", "REF", "GLOBALWIDTH"
+    }
+    
+    vr_attrs = []
+    try:
+        for field in arcpy.ListFields(vr_feature_class):
+            field_upper = field.name.upper()
+            
+            # Skip systémová pole
+            if field_upper in excluded_fields:
+                continue
+            if field_upper.startswith("SHAPE"):
+                continue
+            if field.type in ["Geometry", "OID"]:
+                continue
+            
+            # Skip CAD metadata
+            is_cad_metadata = False
+            for prefix in cad_metadata_prefixes:
+                if field_upper.startswith(prefix):
+                    is_cad_metadata = True
+                    break
+            
+            if not is_cad_metadata:
+                vr_attrs.append(field.name)
+    except:
+        pass
+    
+    return vr_attrs
+
+
 class Toolbox(object):
     def __init__(self):
-        self.label = "MADASPRU CAD Import - Výšky"
-        self.alias = "MADASPRU_Vysky"
-        self.tools = [SimpleCADImport]
+        self.label = "MADASPRU CAD Import - Výšky v2"
+        self.alias = "MADASPRU_Vysky_v2"
+        self.tools = [HeightRegulationImport]
 
 
-class SimpleCADImport(object):
+class HeightRegulationImport(object):
     def __init__(self):
-        self.label = "Import CAD vrstev (Výšky)"
-        self.alias = "simpleCADImport"
+        self.label = "Import CAD vrstev (Výšky) - SplitLine metoda"
+        self.alias = "heightRegulationImport"
         self.canRunInBackground = False
 
     def getParameterInfo(self):
@@ -84,6 +163,20 @@ class SimpleCADImport(object):
             direction="Input"
         )
         param2.filter.list = ["Local Database"]
+        
+        # Nastavení výchozí hodnoty - aktuální projekt GDB nebo C:\GIS_Data\Output.gdb
+        try:
+            # Zkus použít Default.gdb z aktuálního projektu
+            aprx = arcpy.mp.ArcGISProject("CURRENT")
+            param2.value = aprx.defaultGeodatabase
+        except:
+            # Fallback - pokud není projekt nebo selže
+            try:
+                default_path = r"C:\GIS_Data\Output.gdb"
+                if arcpy.Exists(default_path):
+                    param2.value = default_path
+            except:
+                pass
 
         # Output Feature Dataset
         param3 = arcpy.Parameter(
@@ -141,7 +234,17 @@ class SimpleCADImport(object):
             direction="Input"
         )
 
-        return [param0, param1, param2, param3, param4, param5, param6, param7, param8]
+        # Search radius pro split
+        param9 = arcpy.Parameter(
+            displayName="Search Radius pro Split (m)",
+            name="split_radius",
+            datatype="GPDouble",
+            parameterType="Optional",
+            direction="Input"
+        )
+        param9.value = 0.001
+
+        return [param0, param1, param2, param3, param4, param5, param6, param7, param8, param9]
 
     def isLicensed(self):
         return True
@@ -151,7 +254,6 @@ class SimpleCADImport(object):
             cad_file = parameters[0].valueAsText
             
             try:
-                # Načtení dostupných vrstev z CAD
                 arcpy.env.workspace = cad_file
                 available_layers = []
                 
@@ -159,17 +261,16 @@ class SimpleCADImport(object):
                     with arcpy.da.SearchCursor("Polyline", ["Layer"]) as cursor:
                         layers = sorted(set([row[0] for row in cursor]))
                         for layer in layers:
-                            # Automaticky zahrnuj všechny SC vrstvy (301110-301119...) + ostatní z DEFAULT_LAYERS
+                            # SC vrstvy + VR vrstvy
                             if layer.startswith("3011") and "_PL_SC_" in layer:
                                 available_layers.append(f"{layer} (Polyline)")
                             elif layer in DEFAULT_LAYERS:
                                 available_layers.append(f"{layer} (Polyline)")
                 
                 parameters[1].filter.list = available_layers
-                parameters[1].values = available_layers  # Automaticky vybrané
+                parameters[1].values = available_layers
                 parameters[1].enabled = True
                 
-                # Automatické nastavení S-JTSK
                 if not parameters[6].altered:
                     parameters[6].value = arcpy.SpatialReference(5514)
                     
@@ -182,65 +283,77 @@ class SimpleCADImport(object):
     def execute(self, parameters, messages):
         arcpy.env.overwriteOutput = True
         
+        # ============================================================
+        # FÁZE 0: NAČTENÍ PARAMETRŮ
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 0: NAČTENÍ PARAMETRŮ", "STEP")
+        log_message("=" * 60, "INFO")
+        
         input_cad = parameters[0].valueAsText
         selected_layers = parameters[1].values if parameters[1].values else []
         output_gdb = parameters[2].valueAsText
+        
         fd_name = parameters[3].valueAsText
         xy_tolerance = parameters[4].value or 0.01
         xy_resolution = parameters[5].value or 0.001
         output_sr = parameters[6].value or arcpy.SpatialReference(5514)
         transform_method = parameters[7].valueAsText
         out_prefix = parameters[8].valueAsText or ""
+        split_radius = parameters[9].value or 0.001
+        
+        log_message(f"CAD soubor: {input_cad}", "INFO")
+        log_message(f"Output GDB: {output_gdb}", "INFO")
+        log_message(f"Split radius: {split_radius}m", "INFO")
+        log_message(f"Vybraných vrstev: {len(selected_layers)}", "INFO")
 
         # Vytvoření Feature Dataset pokud je zadán
         if fd_name:
             fd_path = os.path.join(output_gdb, fd_name)
             if not arcpy.Exists(fd_path):
-                arcpy.AddMessage(f"Vytvářím Feature Dataset: {fd_name}")
+                log_message(f"Vytvářím Feature Dataset: {fd_name}", "STEP")
                 arcpy.CreateFeatureDataset_management(
                     out_dataset_path=output_gdb,
                     out_name=fd_name,
                     spatial_reference=output_sr
                 )
-                
-                # Nastavení tolerance a rozlišení
                 arcpy.env.XYTolerance = f"{xy_tolerance} Meters"
                 arcpy.env.XYResolution = f"{xy_resolution} Meters"
-                
             output_workspace = fd_path
         else:
             output_workspace = output_gdb
 
-        # Export vrstev
-        exported_count = 0
+        # ============================================================
+        # FÁZE 1: IMPORT A PŘÍPRAVA DAT
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 1: IMPORT A PŘÍPRAVA DAT", "STEP")
+        log_message("=" * 60, "INFO")
+        
         sc_layers = []  # Seznam SC vrstev pro merge
-        vr_rozhrani_layer = None  # Pro uložení 302211 vrstvy
-        vr_na_linii_layer = None  # Pro uložení 302210 vrstvy
-        vr_na_bod_layer = None  # Pro uložení 302110 vrstvy
+        vr_rozhrani_layer = None  # 302211 - rozhraní
+        vr_na_linii_layer = None  # 302210 - VR bloky na linii
+        vr_na_bod_layer = None  # 302110 - VR bloky na bod
+        exported_count = 0
         
         for layer_info in selected_layers:
             if " (Polyline)" in layer_info:
                 layer_name = layer_info.replace(" (Polyline)", "")
                 
-                # Nastavení workspace na CAD soubor pro každý export
                 arcpy.env.workspace = input_cad
                 
-                # SQL pro filtrování vrstvy
                 field_delimited = arcpy.AddFieldDelimiters("Polyline", "Layer")
                 where_clause = f"{field_delimited} = '{layer_name}'"
                 
-                # Název výstupní vrstvy (s prefixem kvůli ArcGIS pravidlům)
                 if out_prefix:
                     base_name = f"{out_prefix}{layer_name}_LN"
                 else:
-                    base_name = f"PL_{layer_name}_LN"  # Přidáme prefix PL_ aby název nezačínal číslicí
+                    base_name = f"PL_{layer_name}_LN"
                 
-                # Generování unikátního názvu
                 output_name = generate_unique_name(output_gdb, base_name)
                 output_fc = os.path.join(output_workspace, output_name)
                 
                 try:
-                    # Export vrstvy
                     arcpy.FeatureClassToFeatureClass_conversion(
                         in_features="Polyline",
                         out_path=output_workspace,
@@ -248,7 +361,6 @@ class SimpleCADImport(object):
                         where_clause=where_clause
                     )
                     
-                    # Reprojekce pokud je potřeba (pouze pokud není Feature Dataset)
                     if transform_method and not fd_name:
                         arcpy.Project_management(
                             in_dataset=output_fc,
@@ -259,1242 +371,1274 @@ class SimpleCADImport(object):
                         arcpy.Delete_management(output_fc)
                         arcpy.Rename_management(output_fc + "_prj", output_name)
                     elif not fd_name:
-                        # DefineProjection pouze pokud není v Feature Dataset
                         arcpy.DefineProjection_management(output_fc, output_sr)
                     
-                    arcpy.AddMessage(f"Exportováno: {layer_name}")
+                    count = get_feature_count(output_fc)
+                    log_message(f"Importováno: {layer_name} ({count} prvků)", "OK")
                     exported_count += 1
                     
-                    # Kontrola zda je to SC vrstva (všechny 3011xx) pro pozdější merge
+                    # Kategorizace vrstev
                     if layer_name.startswith("3011") and "_PL_SC_" in layer_name:
                         sc_layers.append(output_fc)
-                    
-                    # Kontrola zda je to VR rozhraní vrstva pro snap
                     elif layer_name == "302211_PL_VR_na_linii_rozhrani":
                         vr_rozhrani_layer = output_fc
-                    
-                    # Kontrola zda je to VR na bod vrstva pro multipart processing
                     elif layer_name == "302110_BL_VR_na_bod":
                         vr_na_bod_layer = output_fc
-                    
-                    # Kontrola zda je to VR na linii vrstva pro multipart processing
                     elif layer_name == "302210_BL_VR_na_linii":
                         vr_na_linii_layer = output_fc
                     
                 except Exception as e:
-                    arcpy.AddWarning(f"Chyba při exportu {layer_name}: {e}")
+                    log_message(f"Chyba při exportu {layer_name}: {e}", "ERROR")
 
-        # Merge SC vrstev pokud jsou alespoň 2
-        merged_fc = None
-        if len(sc_layers) >= 2:
+        log_message(f"Celkem importováno: {exported_count} vrstev", "OK")
+        log_message(f"SC vrstev: {len(sc_layers)}", "DEBUG")
+        log_message(f"VR rozhraní: {'Ano' if vr_rozhrani_layer else 'Ne'}", "DEBUG")
+        log_message(f"VR na linii: {'Ano' if vr_na_linii_layer else 'Ne'}", "DEBUG")
+
+        # Uložit mapování: layer_path -> type_name pro identifikaci po merge
+        sc_type_mapping = {}  # {layer_path: type_name}
+        for sc_layer in sc_layers:
+            layer_basename = os.path.basename(sc_layer)
+            # Extrahuj typ ze jména (např. "PL_301110_PL_SC_uzavrena_LN" -> "301110_PL_SC_uzavrena")
+            if out_prefix:
+                type_name = layer_basename.replace(out_prefix, "").replace("_LN", "")
+            else:
+                type_name = layer_basename.replace("PL_", "", 1).replace("_LN", "")
+            sc_type_mapping[sc_layer] = type_name
+            log_message(f"SC vrstva registrována: {type_name}", "DEBUG")
+
+        # Merge SC vrstev + přidání pole SC_TYPE (aby bylo možné rozdělit zpět)
+        merged_sc_all = None
+        if len(sc_layers) >= 1:
             try:
-                # Název pro sloučenou vrstvu
-                if out_prefix:
-                    merged_name = f"{out_prefix}SC_all_LN"
-                else:
-                    merged_name = "PL_SC_all_LN"
+                merged_sc_all = r"memory\sc_all_merged"
                 
-                merged_name = generate_unique_name(output_gdb, merged_name)
-                merged_fc = os.path.join(output_workspace, merged_name)
-                
-                # Merge všech SC vrstev
-                arcpy.Merge_management(sc_layers, merged_fc)
-                arcpy.AddMessage(f"Sloučeno {len(sc_layers)} SC vrstev do: {merged_name}")
-                
-                # Smazání původních SC vrstev (volitelné)
+                # Přidat pole SC_TYPE do každé SC vrstvy PŘED mergem
                 for sc_layer in sc_layers:
-                    arcpy.Delete_management(sc_layer)
-                arcpy.AddMessage("Původní SC vrstvy smazány")
+                    sc_type = sc_type_mapping[sc_layer]
+                    
+                    # Přidat pole pokud neexistuje
+                    existing_fields = [f.name for f in arcpy.ListFields(sc_layer)]
+                    if "SC_TYPE" not in existing_fields:
+                        arcpy.management.AddField(sc_layer, "SC_TYPE", "TEXT", field_length=100)
+                        log_message(f"Přidáno pole SC_TYPE do {os.path.basename(sc_layer)}", "DEBUG")
+                    
+                    # Nastavit hodnotu
+                    updated_count = 0
+                    with arcpy.da.UpdateCursor(sc_layer, ["SC_TYPE"]) as cursor:
+                        for row in cursor:
+                            row[0] = sc_type
+                            cursor.updateRow(row)
+                            updated_count += 1
+                    log_message(f"SC_TYPE='{sc_type}' nastaveno pro {updated_count} prvků", "DEBUG")
+                
+                # Merge
+                if len(sc_layers) >= 2:
+                    arcpy.Merge_management(sc_layers, merged_sc_all)
+                    log_message(f"Sloučeno {len(sc_layers)} SC vrstev (s polem SC_TYPE)", "OK")
+                else:
+                    arcpy.CopyFeatures_management(sc_layers[0], merged_sc_all)
+                    log_message(f"Zkopírována 1 SC vrstva (s polem SC_TYPE)", "OK")
+                
+                sc_count = get_feature_count(merged_sc_all)
+                log_message(f"Celkem SC linií: {sc_count}", "DEBUG")
+                
+                # DEBUG - kontrola SC_TYPE po merge
+                fields = [f.name for f in arcpy.ListFields(merged_sc_all)]
+                if "SC_TYPE" in fields:
+                    sc_types_found = set()
+                    with arcpy.da.SearchCursor(merged_sc_all, ["SC_TYPE"]) as cursor:
+                        for row in cursor:
+                            if row[0]:
+                                sc_types_found.add(row[0])
+                    log_message(f"SC_TYPE po merge: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+                else:
+                    log_message("CHYBA: SC_TYPE pole CHYBÍ po merge!", "ERROR")
                 
             except Exception as e:
-                arcpy.AddWarning(f"Chyba při merge SC vrstev: {e}")
-        
-        # FALLBACK: Pokud není VR rozhraní, vytvoř buffer přímo z merged SC linií
-        if not vr_rozhrani_layer and merged_fc and arcpy.Exists(merged_fc):
+                log_message(f"Chyba při merge SC vrstev: {e}", "ERROR")
+                return
+
+        # Zpracování VR bloků na linii - MultipartToSinglepart a filtrování kruhů
+        vr_circles = None
+        if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
             try:
-                arcpy.AddMessage("VR rozhraní nebylo nalezeno - vytvářím buffer přímo ze všech SC linií")
+                log_message("Zpracovávám VR bloky na linii...", "STEP")
                 
-                # Vytvoř buffer ze všech SC linií najednou
+                # Singlepart
+                singlepart_temp = r"memory\vr_linii_singlepart"
+                arcpy.management.MultipartToSinglepart(vr_na_linii_layer, singlepart_temp)
+                
+                # Filtrování uzavřených linií (kruhy)
                 if out_prefix:
-                    simple_buffer_name = f"{out_prefix}SC_final_buffer"
+                    circles_name = f"{out_prefix}302210_VR_circles"
                 else:
-                    simple_buffer_name = "PL_SC_final_buffer"
+                    circles_name = "PL_302210_BL_VR_na_linii_circles"
                 
-                simple_buffer_name = generate_unique_name(output_gdb, simple_buffer_name)
-                simple_buffer_fc = os.path.join(output_workspace, simple_buffer_name)
+                circles_name = generate_unique_name(output_gdb, circles_name)
+                vr_circles = os.path.join(output_workspace, circles_name)
                 
-                arcpy.analysis.Buffer(
-                    in_features=merged_fc,
-                    out_feature_class=simple_buffer_fc,
-                    buffer_distance_or_field="0.3 Meters",
-                    line_side="FULL",
-                    line_end_type="FLAT",
-                    dissolve_option="NONE"
+                arcpy.management.CreateFeatureclass(
+                    out_path=output_workspace,
+                    out_name=circles_name,
+                    geometry_type="POLYLINE",
+                    template=singlepart_temp,
+                    spatial_reference=output_sr
                 )
                 
-                buffer_count = int(arcpy.GetCount_management(simple_buffer_fc)[0])
-                arcpy.AddMessage(f"Vytvořen jednoduchý buffer ze SC linií: {simple_buffer_name}")
-                arcpy.AddMessage(f"Počet buffer prvků: {buffer_count}")
+                field_names = [field.name for field in arcpy.ListFields(singlepart_temp) 
+                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
+                
+                circles_count = 0
+                with arcpy.da.SearchCursor(singlepart_temp, ["SHAPE@"] + field_names) as search_cursor:
+                    with arcpy.da.InsertCursor(vr_circles, ["SHAPE@"] + field_names) as insert_cursor:
+                        for row in search_cursor:
+                            geometry = row[0]
+                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
+                                insert_cursor.insertRow(row)
+                                circles_count += 1
+                
+                log_message(f"Nalezeno {circles_count} VR bloků (uzavřených linií/kruhů)", "OK")
+                
+                arcpy.Delete_management(singlepart_temp)
+                arcpy.Delete_management(vr_na_linii_layer)
                 
             except Exception as e:
-                arcpy.AddWarning(f"Chyba při vytváření jednoduchého bufferu: {e}")
+                log_message(f"Chyba při zpracování VR bloků: {e}", "ERROR")
+
+        # ============================================================
+        # FÁZE 2: VYTVOŘENÍ BODŮ ROZHRANÍ Z CAD
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 2: VYTVOŘENÍ BODŮ ROZHRANÍ Z CAD", "STEP")
+        log_message("=" * 60, "INFO")
         
-        # Snap VR rozhraní na SC merge vrstvu
-        elif vr_rozhrani_layer and merged_fc and arcpy.Exists(vr_rozhrani_layer) and arcpy.Exists(merged_fc):
+        rozhrani_body = None
+        rozhrani_count_cad = 0
+        
+        if vr_rozhrani_layer and merged_sc_all and arcpy.Exists(vr_rozhrani_layer) and arcpy.Exists(merged_sc_all):
             try:
-                # Snap tolerance 30 cm = 0.3 metrů
-                snap_env = [[merged_fc, "EDGE", "0.3 Meters"]]
-                arcpy.Snap_edit(vr_rozhrani_layer, snap_env)
-                arcpy.AddMessage("VR rozhraní napojeno na SC linie (tolerance 30 cm)")
+                # Intersect rozhraní se SC liniemi → body
+                log_message("Hledám průsečíky rozhraní se SC liniemi...", "STEP")
                 
-                # Intersect pro vytvoření bodové vrstvy z průsečíků
+                # Nejdřív SNAP rozhraní na SC linie (0.5m edge)
+                rozhrani_for_intersect = vr_rozhrani_layer
                 try:
-                    # Název pro intersect vrstvu
-                    if out_prefix:
-                        intersect_name = f"{out_prefix}SC_VR_intersect_PT"
-                    else:
-                        intersect_name = "PL_SC_VR_intersect_PT"
+                    log_message("Snap bodů rozhraní ke SC liniím (0.5m edge)...", "STEP")
+                    # Export do memory pro editaci
+                    rozhrani_snap_tm = r"memory\rozhrani_lines_snap"
+                    arcpy.conversion.ExportFeatures(vr_rozhrani_layer, rozhrani_snap_tm)
                     
-                    intersect_name = generate_unique_name(output_gdb, intersect_name)
-                    intersect_fc = os.path.join(output_workspace, intersect_name)
+                    # Snap 
+                    snap_env = [[merged_sc_all, "EDGE", "0.5 Meters"]]
+                    arcpy.edit.Snap(rozhrani_snap_tm, snap_env)
                     
-                    # Intersect SC všech linií s VR rozhraním - výstup jako body
-                    arcpy.Intersect_analysis(
-                        in_features=[merged_fc, vr_rozhrani_layer],
-                        out_feature_class=intersect_fc,
-                        join_attributes="ALL",
-                        cluster_tolerance="",
-                        output_type="POINT"
+                    rozhrani_for_intersect = rozhrani_snap_tm
+                    log_message("Snap rozhraní dokončen", "DEBUG")
+                except Exception as e:
+                    log_message(f"Snap rozhraní selhal, použiji původní: {e}", "WARN")
+
+                arcpy.analysis.PairwiseIntersect(
+                    in_features=[rozhrani_for_intersect, merged_sc_all],
+                    out_feature_class=r"memory\rozhrani_body_multipart",
+                    join_attributes="NO_FID",
+                    cluster_tolerance=None,
+                    output_type="POINT"
+                )
+                
+                # Multipart to Singlepart
+                arcpy.management.MultipartToSinglepart(
+                    in_features=r"memory\rozhrani_body_multipart",
+                    out_feature_class=r"memory\rozhrani_body_cad"
+                )
+                
+                rozhrani_body = r"memory\rozhrani_body_cad"
+                rozhrani_count_cad = get_feature_count(rozhrani_body)
+                
+                log_message(f"Nalezeno {rozhrani_count_cad} bodů rozhraní z CAD", "OK")
+                
+                # Snap bodů rozhraní ke SC liniím (30cm edge snap)
+                log_message("Snap bodů rozhraní ke SC liniím (30cm edge)...", "STEP")
+                try:
+                    # Snap settings: [[snap_environment, snap_type, distance]]
+                    snap_env = [[merged_sc_all, "EDGE", "0.3 Meters"]]
+                    arcpy.edit.Snap(rozhrani_body, snap_env)
+                    log_message("Snap dokončen", "OK")
+                except Exception as snap_error:
+                    log_message(f"Snap selhal (pokračuji bez snap): {snap_error}", "WARN")
+                
+                arcpy.Delete_management(r"memory\rozhrani_body_multipart")
+                
+            except Exception as e:
+                log_message(f"Chyba při vytváření bodů rozhraní: {e}", "ERROR")
+        else:
+            log_message("VR rozhraní vrstva nebyla nalezena - přeskakuji", "WARN")
+
+        # ============================================================
+        # FÁZE 3: PRVNÍ ŘEZÁNÍ SC PODLE CAD ROZHRANÍ
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 3: PRVNÍ ŘEZÁNÍ SC PODLE CAD ROZHRANÍ", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        sc_split_cad = None
+        
+        if rozhrani_body and rozhrani_count_cad > 0:
+            try:
+                log_message(f"Řežu SC linie v {rozhrani_count_cad} místech rozhraní...", "STEP")
+                
+                # Zvýšený search_radius na 30cm pro zachycení blízkých rozhraní
+                arcpy.management.SplitLineAtPoint(
+                    in_features=merged_sc_all,
+                    point_features=rozhrani_body,
+                    out_feature_class=r"memory\sc_split_cad",
+                    search_radius="0.3 Meters"
+                )
+                
+                sc_split_cad = r"memory\sc_split_cad"
+                split_count = get_feature_count(sc_split_cad)
+                
+                log_message(f"SC rozděleny na {split_count} segmentů", "OK")
+                
+            except Exception as e:
+                log_message(f"Chyba při řezání SC: {e}", "ERROR")
+                sc_split_cad = merged_sc_all  # Fallback na původní
+        else:
+            log_message("Žádná CAD rozhraní - SC zůstávají nerozdělené", "WARN")
+            sc_split_cad = merged_sc_all
+
+        # ============================================================
+        # FÁZE 4: PŘIPOJENÍ VR BLOKŮ K SEGMENTŮM
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 4: PŘIPOJENÍ VR BLOKŮ K SEGMENTŮM", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        sc_with_vr = None
+        
+        if vr_circles and sc_split_cad and arcpy.Exists(vr_circles):
+            try:
+                log_message("Připojuji VR bloky k SC segmentům (SpatialJoin)...", "STEP")
+                
+                arcpy.analysis.SpatialJoin(
+                    target_features=sc_split_cad,
+                    join_features=vr_circles,
+                    out_feature_class=r"memory\sc_with_vr",
+                    join_operation="JOIN_ONE_TO_MANY",
+                    join_type="KEEP_ALL",
+                    match_option="INTERSECT",
+                    search_radius=None
+                )
+                
+                sc_with_vr = r"memory\sc_with_vr"
+                joined_count = get_feature_count(sc_with_vr)
+                
+                log_message(f"Spatial join dokončen: {joined_count} záznamů", "OK")
+                
+                # Debug - kolik má připojené VR
+                with arcpy.da.SearchCursor(sc_with_vr, ["Join_Count"]) as cursor:
+                    with_vr = sum(1 for row in cursor if row[0] and row[0] > 0)
+                log_message(f"Segmentů s připojeným VR blokem: {with_vr}", "DEBUG")
+                
+            except Exception as e:
+                log_message(f"Chyba při SpatialJoin: {e}", "ERROR")
+                sc_with_vr = sc_split_cad
+        else:
+            log_message("VR bloky nebyly nalezeny - pokračuji bez připojení výšek", "WARN")
+            sc_with_vr = sc_split_cad
+
+        # ============================================================
+        # FÁZE 5: DOGENEROVÁNÍ CHYBĚJÍCÍCH ROZHRANÍ
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 5: DOGENEROVÁNÍ CHYBĚJÍCÍCH ROZHRANÍ", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        rozhrani_body_all = rozhrani_body  # Začneme s CAD rozhraními
+        rozhrani_all = rozhrani_body  # Alias pro FÁZE 8
+        
+        if sc_with_vr and vr_circles:
+            try:
+                # Dynamicky získej VŠECHNY atributy z VR bloků
+                vr_attributes = get_vr_attributes(vr_circles)
+                log_message(f"VR atributy z bloků: {', '.join(vr_attributes) if vr_attributes else 'žádné'}", "DEBUG")
+                
+                # Zjisti, které z VR atributů jsou dostupné v sc_with_vr
+                available_height_attrs = []
+                fields = [f.name for f in arcpy.ListFields(sc_with_vr)]
+                for attr in vr_attributes:
+                    if attr in fields:
+                        available_height_attrs.append(attr)
+                
+                log_message(f"Dostupné výškové atributy v SC: {', '.join(available_height_attrs)}", "DEBUG")
+                
+                if available_height_attrs:
+                    # Dissolve podle VŠECH výškových atributů
+                    log_message("Dissolve podle všech výškových atributů...", "STEP")
+                    
+                    # Vytvoř statistiky UNIQUE pro každý atribut
+                    stats_fields = ";".join([f"{attr} UNIQUE" for attr in available_height_attrs])
+                    
+                    arcpy.management.Dissolve(
+                        in_features=sc_with_vr,
+                        out_feature_class=r"memory\sc_dissolve",
+                        dissolve_field=available_height_attrs,
+                        statistics_fields=stats_fields,
+                        multi_part="SINGLE_PART",
+                        unsplit_lines="DISSOLVE_LINES"
                     )
                     
-                    arcpy.AddMessage(f"Vytvořena bodová vrstva průsečíků: {intersect_name}")
+                    dissolve_count = get_feature_count(r"memory\sc_dissolve")
+                    log_message(f"Po dissolve: {dissolve_count} spojených segmentů", "DEBUG")
                     
-                    # PŘÍPRAVA FINÁLNÍ KOMBINOVANÉ VRSTVY
-                    # Logika: PL_SC_split_LN (primární) + PL_SC_all_LN tam kde není split (doplňkové)
+                    # Vyber pouze ty s určenou výškou (alespoň jeden atribut není NULL)
+                    where_parts = []
+                    for attr in available_height_attrs:
+                        where_parts.append(f"{attr} IS NOT NULL")
+                    where_clause = " OR ".join(where_parts)
                     
-                    try:
-                        # 1. PŘÍPRAVA SPOJENÝCH LINIÍ pro split
-                        # Kopie původní merged vrstvy pro zachování
-                        original_merged_name = generate_unique_name(output_gdb, "PL_SC_all_backup_temp")
-                        original_merged_fc = os.path.join(output_workspace, original_merged_name)
-                        arcpy.CopyFeatures_management(merged_fc, original_merged_fc)
-                        
-                        # Snap vertex všech SC linií na sebe navzájem
-                        snap_env = [[merged_fc, "VERTEX", "0.3 Meters"]]
-                        arcpy.Snap_edit(merged_fc, snap_env)
-                        arcpy.AddMessage("SC linie snapped na sebe navzájem (vertex, 30 cm)")
-                        
-                        # FEATURE TO LINE - vytvoření topologicky čistých linií místo Dissolve
-                        # FeatureToLine vytvoří čisté linie bez duplicitních vrcholů
-                        feature_to_line_name = generate_unique_name(output_gdb, "PL_SC_feature_to_line_temp")
-                        feature_to_line_fc = os.path.join(output_workspace, feature_to_line_name)
-                        
-                        arcpy.management.FeatureToLine(
-                            in_features=merged_fc,
-                            out_feature_class=feature_to_line_fc,
-                            cluster_tolerance="0.001 Meters",
-                            attributes="ATTRIBUTES"
+                    arcpy.management.SelectLayerByAttribute(
+                        in_layer_or_view=r"memory\sc_dissolve",
+                        selection_type="NEW_SELECTION",
+                        where_clause=where_clause
+                    )
+                    
+                    selected_count = get_feature_count(r"memory\sc_dissolve")
+                    log_message(f"Segmentů s výškou: {selected_count}", "DEBUG")
+                    
+                    if selected_count > 0:
+                        # Koncové body těchto segmentů
+                        arcpy.management.FeatureVerticesToPoints(
+                            in_features=r"memory\sc_dissolve",
+                            out_feature_class=r"memory\dissolve_vertices",
+                            point_location="BOTH_ENDS"
                         )
                         
-                        arcpy.AddMessage("SC linie převedeny na topologicky čisté segmenty pomocí FeatureToLine")
+                        vertices_count = get_feature_count(r"memory\dissolve_vertices")
+                        log_message(f"Koncových bodů: {vertices_count}", "DEBUG")
                         
-                        # Dissolve pouze spojitých linií (bez multipart)
-                        dissolved_name = generate_unique_name(output_gdb, "PL_SC_dissolved_temp")
-                        dissolved_fc = os.path.join(output_workspace, dissolved_name)
+                        # Najdi body které se překrývají (= rozhraní mezi různými typy)
+                        arcpy.analysis.Intersect(
+                            in_features=r"memory\dissolve_vertices",
+                            out_feature_class=r"memory\overlapping_points",
+                            join_attributes="ONLY_FID",
+                            output_type="POINT"
+                        )
                         
-                        arcpy.Dissolve_management(
-                            in_features=feature_to_line_fc,
-                            out_feature_class=dissolved_fc,
-                            dissolve_field="",
-                            statistics_fields="",
-                            multi_part="SINGLE_PART",  # Změněno na SINGLE_PART
+                        overlap_count = get_feature_count(r"memory\overlapping_points")
+                        log_message(f"Překrývajících se bodů: {overlap_count}", "DEBUG")
+                        
+                        if overlap_count > 0:
+                            # Dissolve překrývajících bodů do jednoho
+                            arcpy.management.Dissolve(
+                                in_features=r"memory\overlapping_points",
+                                out_feature_class=r"memory\generated_rozhrani",
+                                dissolve_field=None,
+                                multi_part="SINGLE_PART"
+                            )
+                            
+                            generated_count = get_feature_count(r"memory\generated_rozhrani")
+                            log_message(f"Dogenerováno {generated_count} chybějících rozhraní", "OK")
+
+                            # Export dogenerovaných rozhraní pro kontrolu
+                            try:
+                                if out_prefix:
+                                    gen_name = f"{out_prefix}Rozhrani_generovana"
+                                else:
+                                    gen_name = "Z_Rozhrani_generovana"
+                                
+                                gen_name = generate_unique_name(output_gdb, gen_name)
+                                gen_output = os.path.join(output_workspace, gen_name)
+                                
+                                # arcpy.CopyFeatures_management(r"memory\generated_rozhrani", gen_output)
+                                # log_message(f"Export vygenerovaných rozhraní: {gen_name}", "DEBUG")
+                            except Exception as e:
+                                log_message(f"Chyba při exportu generovaných rozhraní: {e}", "WARN")
+
+                            
+                            # Snap dogenerovaných rozhraní ke SC liniím  
+                            if merged_sc_all and arcpy.Exists(merged_sc_all):
+                                log_message("Snap dogenerovaných rozhraní ke SC liniím (30cm edge)...", "STEP")
+                                try:
+                                    snap_env = [[merged_sc_all, "EDGE", "0.3 Meters"]]
+                                    arcpy.edit.Snap(r"memory\generated_rozhrani", snap_env)
+                                    log_message("Snap dokončen", "OK")
+                                except Exception as snap_error:
+                                    log_message(f"Snap selhal (pokračuji bez snap): {snap_error}", "WARN")
+                            
+                            # Merge CAD rozhraní + vygenerovaná
+                            if rozhrani_body and arcpy.Exists(rozhrani_body):
+                                arcpy.management.Merge(
+                                    inputs=[rozhrani_body, r"memory\generated_rozhrani"],
+                                    output=r"memory\rozhrani_all"
+                                )
+                            else:
+                                arcpy.CopyFeatures_management(
+                                    r"memory\generated_rozhrani",
+                                    r"memory\rozhrani_all"
+                                )
+                            
+                            rozhrani_body_all = r"memory\rozhrani_all"
+                            rozhrani_all = rozhrani_body_all  # Alias pro FÁZE 8
+                            total_rozhrani = get_feature_count(rozhrani_body_all)
+                            log_message(f"Celkem rozhraní: {total_rozhrani}", "OK")
+                            
+                            # Cleanup
+                            arcpy.Delete_management(r"memory\overlapping_points")
+                            arcpy.Delete_management(r"memory\generated_rozhrani")
+                        else:
+                            log_message("Žádná dodatečná rozhraní nebyla potřeba", "INFO")
+                        
+                        arcpy.Delete_management(r"memory\dissolve_vertices")
+                    
+                    # Clear selection
+                    arcpy.management.SelectLayerByAttribute(
+                        in_layer_or_view=r"memory\sc_dissolve",
+                        selection_type="CLEAR_SELECTION"
+                    )
+                    arcpy.Delete_management(r"memory\sc_dissolve")
+                    
+                else:
+                    log_message("Žádné výškové atributy nebyly nalezeny", "WARN")
+                    
+            except Exception as e:
+                log_message(f"Chyba při generování rozhraní: {e}", "ERROR")
+
+        # ============================================================
+        # FÁZE 6: FINÁLNÍ ŘEZÁNÍ VŠEMI ROZHRANÍMI
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 6: FINÁLNÍ ŘEZÁNÍ VŠEMI ROZHRANÍMI", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        sc_final_split = None
+        
+        try:
+            # Dissolve původních SC (čistá geometrie) - ZACHOVAT SC_TYPE
+            log_message("Dissolve původních SC linií...", "STEP")
+            
+            arcpy.management.Dissolve(
+                in_features=merged_sc_all,
+                out_feature_class=r"memory\sc_dissolve_clean",
+                dissolve_field="SC_TYPE",  # Zachovat typ SC
+                multi_part="SINGLE_PART",
+                unsplit_lines="DISSOLVE_LINES"
+            )
+            
+            clean_count = get_feature_count(r"memory\sc_dissolve_clean")
+            log_message(f"Čistých spojených SC: {clean_count}", "DEBUG")
+            
+            # DEBUG - kontrola SC_TYPE po dissolve
+            fields = [f.name for f in arcpy.ListFields(r"memory\sc_dissolve_clean")]
+            if "SC_TYPE" in fields:
+                sc_types_found = set()
+                with arcpy.da.SearchCursor(r"memory\sc_dissolve_clean", ["SC_TYPE"]) as cursor:
+                    for row in cursor:
+                        if row[0]:
+                            sc_types_found.add(row[0])
+                log_message(f"SC_TYPE po dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+            else:
+                log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po dissolve!", "WARN")
+            
+            # Finální split všemi rozhraními
+            if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                rozhrani_total = get_feature_count(rozhrani_body_all)
+                log_message(f"Řežu SC linie v {rozhrani_total} místech rozhraní...", "STEP")
+                
+                # Zvýšený search_radius na 30cm pro zachycení blízkých rozhraní
+                arcpy.management.SplitLineAtPoint(
+                    in_features=r"memory\sc_dissolve_clean",
+                    point_features=rozhrani_body_all,
+                    out_feature_class=r"memory\sc_final_split",
+                    search_radius="0.3 Meters"
+                )
+                
+                sc_final_split = r"memory\sc_final_split"
+            else:
+                log_message("Žádná rozhraní - používám dissolve výstup", "WARN")
+                sc_final_split = r"memory\sc_dissolve_clean"
+            
+            final_count = get_feature_count(sc_final_split)
+            log_message(f"Finální počet segmentů po split: {final_count}", "OK")
+            
+            # DEBUG - kontrola SC_TYPE po split
+            fields = [f.name for f in arcpy.ListFields(sc_final_split)]
+            if "SC_TYPE" in fields:
+                sc_types_found = set()
+                with arcpy.da.SearchCursor(sc_final_split, ["SC_TYPE"]) as cursor:
+                    for row in cursor:
+                        if row[0]:
+                            sc_types_found.add(row[0])
+                log_message(f"SC_TYPE po split: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+            else:
+                log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po split!", "WARN")
+            
+        except Exception as e:
+            log_message(f"Chyba při finálním split: {e}", "ERROR")
+            sc_final_split = merged_sc_all
+
+        # ============================================================
+        # FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ (podle notebooku)
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        # Logika z notebooku:
+        # 1. Najdi koncové body SC segmentů
+        # 2. Vyber ty, které NEKOLIDUJÍ s rozhraními (falešné řezy)
+        # 3. Spoj segmenty, které mají tyto falešné řezy
+        
+        sc_cleaned = sc_final_split
+        
+        try:
+            if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                log_message("Detekuji falešná rozhraní (koncové body mimo skutečná rozhraní)...", "STEP")
+                
+                # 1. Extrahuj všechny koncové body SC segmentů
+                arcpy.management.FeatureVerticesToPoints(
+                    in_features=sc_final_split,
+                    out_feature_class=r"memory\sc_split_endpoints",
+                    point_location="BOTH_ENDS"
+                )
+                
+                endpoints_count = get_feature_count(r"memory\sc_split_endpoints")
+                log_message(f"Nalezeno {endpoints_count} koncových bodů", "DEBUG")
+                
+                # 2. Vyber body, které NEKOLIDUJÍ s rozhraními (= falešné řezy)
+                arcpy.management.MakeFeatureLayer(r"memory\sc_split_endpoints", "endpoints_lyr")
+                
+                arcpy.management.SelectLayerByLocation(
+                    in_layer="endpoints_lyr",
+                    overlap_type="INTERSECT",
+                    select_features=rozhrani_body_all,
+                    search_distance="0.35 Meters",  # Trochu větší než split radius
+                    selection_type="NEW_SELECTION",
+                    invert_spatial_relationship="INVERT"
+                )
+                
+                false_endpoints_count = int(arcpy.GetCount_management("endpoints_lyr")[0])
+                log_message(f"Falešných koncových bodů (mimo rozhraní): {false_endpoints_count}", "DEBUG")
+                
+                if false_endpoints_count > 0:
+                    arcpy.conversion.ExportFeatures(
+                        in_features="endpoints_lyr",
+                        out_features=r"memory\false_endpoints"
+                    )
+                    
+                    # Export falešných bodů pro kontrolu
+                    try:
+                        if out_prefix:
+                            false_name = f"{out_prefix}Rozhrani_falesne"
+                        else:
+                            false_name = "Z_Rozhrani_falesne"
+                        
+                        false_name = generate_unique_name(output_gdb, false_name)
+                        false_output = os.path.join(output_workspace, false_name)
+                        
+                        # arcpy.CopyFeatures_management(r"memory\false_endpoints", false_output)
+                        # log_message(f"Export falešných rozhraní (merged back): {false_name}", "DEBUG")
+                    except Exception as e:
+                        log_message(f"Chyba při exportu falešných rozhraní: {e}", "WARN")
+
+
+                    
+                    # 3. Vyber SC segmenty, které se dotýkají falešných bodů
+                    arcpy.management.MakeFeatureLayer(sc_final_split, "sc_split_lyr")
+                    
+                    arcpy.management.SelectLayerByLocation(
+                        in_layer="sc_split_lyr",
+                        overlap_type="INTERSECT",
+                        select_features=r"memory\false_endpoints",
+                        search_distance=None,
+                        selection_type="NEW_SELECTION",
+                        invert_spatial_relationship="NOT_INVERT"
+                    )
+                    
+                    segments_to_merge = int(arcpy.GetCount_management("sc_split_lyr")[0])
+                    log_message(f"Segmentů s falešnými rozhraními: {segments_to_merge}", "DEBUG")
+                    
+                    if segments_to_merge > 0:
+                        # 4. Spoj tyto segmenty (dissolve podle SC_TYPE - aby se nespojily různé typy)
+                        arcpy.conversion.ExportFeatures(
+                            in_features="sc_split_lyr",
+                            out_features=r"memory\segments_to_merge"
+                        )
+                        
+                        # Dissolve podle SC_TYPE (spojí jen segmenty stejného typu)
+                        dissolve_fields = ["SC_TYPE"] if "SC_TYPE" in [f.name for f in arcpy.ListFields(r"memory\segments_to_merge")] else []
+                        
+                        arcpy.management.Dissolve(
+                            in_features=r"memory\segments_to_merge",
+                            out_feature_class=r"memory\segments_merged",
+                            dissolve_field=dissolve_fields,
+                            statistics_fields=None,
+                            multi_part="SINGLE_PART",
                             unsplit_lines="DISSOLVE_LINES"
                         )
                         
-                        # Připojení do connected_fc
-                        connected_name = generate_unique_name(output_gdb, "PL_SC_connected_clean")
-                        connected_fc = os.path.join(output_workspace, connected_name)
+                        merged_count = get_feature_count(r"memory\segments_merged")
+                        log_message(f"Po spojení falešných řezů: {merged_count} segmentů", "DEBUG")
                         
-                        # Repair geometry a clean up
-                        arcpy.RepairGeometry_management(dissolved_fc, "DELETE_NULL")
-                        arcpy.CopyFeatures_management(dissolved_fc, connected_fc)
-                        arcpy.AddMessage("SC linie připraveny jako topologicky čisté spojené segmenty")
-                        
-                        # 2. IDENTIFIKACE spojených linií které obsahují body rozhraní
-                        spatial_join_name = generate_unique_name(output_gdb, "PL_SC_spatial_join_temp")
-                        spatial_join_fc = os.path.join(output_workspace, spatial_join_name)
-                        
-                        arcpy.SpatialJoin_analysis(
-                            target_features=connected_fc,
-                            join_features=intersect_fc,
-                            out_feature_class=spatial_join_fc,
-                            join_operation="JOIN_ONE_TO_ONE",
-                            join_type="KEEP_ALL",
-                            match_option="INTERSECT",
-                            search_radius="0.1 Meters"
+                        # 5. Najdi původní segmenty, které leží WITHIN spojených (= budou smazány)
+                        arcpy.management.SelectLayerByLocation(
+                            in_layer="sc_split_lyr",
+                            overlap_type="WITHIN",
+                            select_features=r"memory\segments_merged",
+                            search_distance=None,
+                            selection_type="NEW_SELECTION",
+                            invert_spatial_relationship="NOT_INVERT"
                         )
                         
-                        # Vybrání pouze spojených linií s body rozhraní
-                        lines_with_boundaries_name = generate_unique_name(output_gdb, "PL_SC_with_boundaries_temp")
-                        lines_with_boundaries_fc = os.path.join(output_workspace, lines_with_boundaries_name)
+                        segments_to_delete = int(arcpy.GetCount_management("sc_split_lyr")[0])
+                        log_message(f"Mazání {segments_to_delete} původních segmentů...", "DEBUG")
                         
-                        arcpy.Select_analysis(
-                            in_features=spatial_join_fc,
-                            out_feature_class=lines_with_boundaries_fc,
-                            where_clause="Join_Count > 0"
+                        # 6. Smazání původních rozdělených segmentů
+                        if segments_to_delete > 0:
+                            arcpy.management.DeleteRows("sc_split_lyr")
+                        
+                        # 7. Merge spojených segmentů zpět do sc_final_split
+                        arcpy.management.Append(
+                            inputs=r"memory\segments_merged",
+                            target=sc_final_split,
+                            schema_type="NO_TEST"
                         )
                         
-                        boundary_count = int(arcpy.GetCount_management(lines_with_boundaries_fc)[0])
-                        arcpy.AddMessage(f"Nalezeno {boundary_count} spojených linií s body rozhraní")
-                        
-                        # 3. MÍSTO SPLIT LINIÍ - VYTVOŘÍME BUFFER ZE SPOJENÝCH LINIÍ A TEN SPLITNEME
-                        if boundary_count > 0:
-                            # Nejprve vytvoříme přesné průsečíky bodů s liniemi
-                            precise_points_name = generate_unique_name(output_gdb, "PL_SC_precise_points_temp")
-                            precise_points_fc = os.path.join(output_workspace, precise_points_name)
-                            
-                            # Intersect bodů s liniemi pro získání přesných pozic
-                            arcpy.Intersect_analysis(
-                                in_features=[lines_with_boundaries_fc, intersect_fc],
-                                out_feature_class=precise_points_fc,
-                                join_attributes="NO_FID",
-                                cluster_tolerance="",
-                                output_type="POINT"
-                            )
-                            
-                            # Pokud vznikly multipoint geometrie, převeď je na singlepart
-                            multipart_temp = generate_unique_name(output_gdb, "precise_singlepart_temp")
-                            multipart_fc = os.path.join(output_workspace, multipart_temp)
-                            arcpy.MultipartToSinglepart_management(precise_points_fc, multipart_fc)
-                            
-                            # Nahraď původní vrstvu singlepart verzí
-                            arcpy.Delete_management(precise_points_fc)
-                            arcpy.Rename_management(multipart_fc, precise_points_fc)
-                            
-                            precise_count = int(arcpy.GetCount_management(precise_points_fc)[0])
-                            arcpy.AddMessage(f"Nalezeno {precise_count} přesných průsečíků pro buffer split")
-                            
-                            # Vytvoříme 30cm buffer ze spojených linií (před splitováním)
-                            if out_prefix:
-                                connected_buffer_name = f"{out_prefix}SC_connected_buffer"
-                            else:
-                                connected_buffer_name = "PL_SC_connected_buffer"
-                            
-                            connected_buffer_name = generate_unique_name(output_gdb, connected_buffer_name)
-                            connected_buffer_fc = os.path.join(output_workspace, connected_buffer_name)
-                            
-                            # Buffer ze spojených linií
-                            arcpy.analysis.Buffer(
-                                in_features=lines_with_boundaries_fc,
-                                out_feature_class=connected_buffer_fc,
-                                buffer_distance_or_field="0.3 Meters",
-                                line_side="FULL",
-                                line_end_type="FLAT",
-                                dissolve_option="NONE"
-                            )
-                            
-                            arcpy.AddMessage(f"Vytvořen 30cm buffer ze spojených linií: {connected_buffer_name}")
-                            
-                            # SPLIT BUFFERU podle bodů rozhraní pomocí Erase/Clip logiky
-                            if out_prefix:
-                                split_buffer_name = f"{out_prefix}SC_split_buffer"
-                            else:
-                                split_buffer_name = "PL_SC_split_buffer"
-                            
-                            split_buffer_name = generate_unique_name(output_gdb, split_buffer_name)
-                            split_buffer_fc = os.path.join(output_workspace, split_buffer_name)
-                            
-                            try:
-                                # VYTVOŘENÍ KOLMÝCH ŘEZNÝCH ČAR přes buffer v místech bodů
-                                cutting_lines_name = generate_unique_name(output_gdb, "cutting_lines_temp")
-                                cutting_lines_fc = os.path.join(output_workspace, cutting_lines_name)
-                                
-                                # Vytvoř feature class pro řezné čáry
-                                sr = arcpy.Describe(connected_buffer_fc).spatialReference
-                                arcpy.CreateFeatureclass_management(
-                                    out_path=output_workspace,
-                                    out_name=os.path.basename(cutting_lines_fc),
-                                    geometry_type="POLYLINE",
-                                    spatial_reference=sr
-                                )
-                                
-                                # Pro každý bod vytvoř kolmou řeznou čáru
-                                with arcpy.da.SearchCursor(precise_points_fc, ['SHAPE@']) as point_cursor:
-                                    with arcpy.da.InsertCursor(cutting_lines_fc, ['SHAPE@']) as line_cursor:
-                                        for point_row in point_cursor:
-                                            point_geom = point_row[0]
-                                            point_x = point_geom.firstPoint.X
-                                            point_y = point_geom.firstPoint.Y
-                                            
-                                            # Najdi nejbližší linii pro určení směru
-                                            min_distance = float('inf')
-                                            closest_line = None
-                                            
-                                            with arcpy.da.SearchCursor(lines_with_boundaries_fc, ['SHAPE@']) as line_search:
-                                                for line_row in line_search:
-                                                    line_geom = line_row[0]
-                                                    distance = line_geom.distanceTo(point_geom)
-                                                    if distance < min_distance:
-                                                        min_distance = distance
-                                                        closest_line = line_geom
-                                            
-                                            if closest_line:
-                                                # Najdi pozici bodu na linii
-                                                pos = closest_line.measureOnLine(point_geom)
-                                                
-                                                # Vytvořím segment kolem bodu pro výpočet směru
-                                                start_pos = max(0, pos - 1.0)  # 1m zpět
-                                                end_pos = min(closest_line.length, pos + 1.0)  # 1m vpřed
-                                                
-                                                if end_pos > start_pos:
-                                                    segment = closest_line.segmentAlongLine(start_pos, end_pos)
-                                                    
-                                                    # Aproximace směru pomocí prvního a posledního bodu segmentu
-                                                    first_pt = segment.firstPoint
-                                                    last_pt = segment.lastPoint
-                                                    
-                                                    dx = last_pt.X - first_pt.X
-                                                    dy = last_pt.Y - first_pt.Y
-                                                    length = (dx*dx + dy*dy)**0.5
-                                                    
-                                                    if length > 0:
-                                                        # Kolmý vektor (-dy, dx) normalizovaný
-                                                        perp_x = -dy / length
-                                                        perp_y = dx / length
-                                                        
-                                                        # Vytvoř kolmou čáru (1m na každou stranu = 2m celkem)
-                                                        line_half_length = 1.0
-                                                        start_pt = arcpy.Point(
-                                                            point_x - perp_x * line_half_length,
-                                                            point_y - perp_y * line_half_length
-                                                        )
-                                                        end_pt = arcpy.Point(
-                                                            point_x + perp_x * line_half_length,
-                                                            point_y + perp_y * line_half_length
-                                                        )
-                                                        
-                                                        cutting_line = arcpy.Polyline(
-                                                            arcpy.Array([start_pt, end_pt]), sr
-                                                        )
-                                                        line_cursor.insertRow([cutting_line])
-                                
-                                cutting_count = int(arcpy.GetCount_management(cutting_lines_fc)[0])
-                                arcpy.AddMessage(f"Vytvořeno {cutting_count} kolmých řezných čar pro přesný split bufferu")
-                                
-                                # POUŽITÍ FEATURE TO POLYGON - přesné rozdělení pomocí čar
-                                # Nejdříve převeď buffer na linie (outline)
-                                buffer_outline_name = generate_unique_name(output_gdb, "buffer_outline_temp")
-                                buffer_outline_fc = os.path.join(output_workspace, buffer_outline_name)
-                                
-                                arcpy.management.PolygonToLine(
-                                    in_features=connected_buffer_fc,
-                                    out_feature_class=buffer_outline_fc
-                                )
-                                
-                                # Merge outline s řeznými čárami
-                                merged_lines_name = generate_unique_name(output_gdb, "merged_lines_temp")
-                                merged_lines_fc = os.path.join(output_workspace, merged_lines_name)
-                                
-                                arcpy.Merge_management(
-                                    inputs=[buffer_outline_fc, cutting_lines_fc],
-                                    output=merged_lines_fc
-                                )
-                                
-                                # Feature To Polygon - vytvoří nové polygony rozdělené čárami
-                                temp_polygons_name = generate_unique_name(output_gdb, "temp_polygons")
-                                temp_polygons_fc = os.path.join(output_workspace, temp_polygons_name)
-                                
-                                arcpy.management.FeatureToPolygon(
-                                    in_features=merged_lines_fc,
-                                    out_feature_class=temp_polygons_fc,
-                                    cluster_tolerance="0.001 Meters",
-                                    attributes="ATTRIBUTES"
-                                )
-                                
-                                # FILTROVÁNÍ - pouze polygony které se protínají s původními liniemi
-                                # Vytvoř buffer kolem původních linií pro identifikaci "platných" bufferů
-                                original_lines_buffer_name = generate_unique_name(output_gdb, "original_lines_buffer_temp")
-                                original_lines_buffer_fc = os.path.join(output_workspace, original_lines_buffer_name)
-                                
-                                arcpy.analysis.Buffer(
-                                    in_features=lines_with_boundaries_fc,
-                                    out_feature_class=original_lines_buffer_fc,
-                                    buffer_distance_or_field="0.35 Meters",  # Trochu větší než 30cm
-                                    dissolve_option="ALL"  # Dissolve všech do jednoho
-                                )
-                                
-                                # Intersect - zachovej pouze polygony které jsou uvnitř tohoto bufferu
-                                intersected_polygons_name = generate_unique_name(output_gdb, "intersected_polygons_temp")
-                                intersected_polygons_fc = os.path.join(output_workspace, intersected_polygons_name)
-                                
-                                arcpy.analysis.Intersect(
-                                    in_features=[temp_polygons_fc, original_lines_buffer_fc],
-                                    out_feature_class=intersected_polygons_fc,
-                                    join_attributes="NO_FID"
-                                )
-                                
-                                # DODATEČNÉ FILTROVÁNÍ - spatial join s původními liniemi
-                                # Zachovej pouze buffer polygony které obsahují skutečnou linii
-                                spatial_join_temp_name = generate_unique_name(output_gdb, "spatial_join_temp")
-                                spatial_join_temp_fc = os.path.join(output_workspace, spatial_join_temp_name)
-                                
-                                arcpy.analysis.SpatialJoin(
-                                    target_features=intersected_polygons_fc,
-                                    join_features=lines_with_boundaries_fc,  # PL_SC_all linie
-                                    out_feature_class=spatial_join_temp_fc,
-                                    join_operation="JOIN_ONE_TO_ONE",
-                                    join_type="KEEP_ALL",
-                                    match_option="INTERSECT"
-                                )
-                                
-                                # Vyfiltruj pouze polygony které mají spojenou linii (Join_Count > 0)
-                                # Tím se odstraní vnitřní "díry" které neobsahují žádnou linii
-                                where_clause = "Join_Count > 0"
-                                
-                                arcpy.conversion.FeatureClassToFeatureClass(
-                                    in_features=spatial_join_temp_fc,
-                                    out_path=output_workspace,
-                                    out_name=split_buffer_name,
-                                    where_clause=where_clause
-                                )
-                                
-                                # Cleanup navíc
-                                arcpy.Delete_management(intersected_polygons_fc)
-                                arcpy.Delete_management(spatial_join_temp_fc)
-                                
-                                # Cleanup navíc
-                                arcpy.Delete_management(temp_polygons_fc)
-                                arcpy.Delete_management(original_lines_buffer_fc)
-                                
-                                buffer_parts = int(arcpy.GetCount_management(split_buffer_fc)[0])
-                                arcpy.AddMessage(f"Buffer přesně rozdělen kolmicemi na {buffer_parts} částí: {split_buffer_name}")
-                                
-                                # Cleanup
-                                arcpy.Delete_management(cutting_lines_fc)
-                                arcpy.Delete_management(buffer_outline_fc)
-                                arcpy.Delete_management(merged_lines_fc)
-                                arcpy.Delete_management(temp_polygons_fc)
-                                arcpy.Delete_management(original_lines_buffer_fc)
-                                
-                            except Exception as e:
-                                arcpy.AddWarning(f"Chyba při rozdělování bufferu kolmicemi: {e}")
-                                
-                                # Fallback - použij původní buffer s body approach
-                                # Vytvoř buffer kolem bodů pro rozdělení
-                                points_buffer_name = generate_unique_name(output_gdb, "points_split_buffer_temp")
-                                points_buffer_fc = os.path.join(output_workspace, points_buffer_name)
-                                
-                                arcpy.analysis.Buffer(
-                                    in_features=precise_points_fc,
-                                    out_feature_class=points_buffer_fc,
-                                    buffer_distance_or_field="0.35 Meters"  # Větší než buffer linie (35cm > 30cm) pro zajištění řezu
-                                )
-                                
-                                # Erase - odstraň místa kde jsou body (vytvoří "díry")
-                                erased_buffer_name = generate_unique_name(output_gdb, "erased_buffer_temp") 
-                                erased_buffer_fc = os.path.join(output_workspace, erased_buffer_name)
-                                
-                                arcpy.analysis.Erase(
-                                    in_features=connected_buffer_fc,
-                                    erase_features=points_buffer_fc,
-                                    out_feature_class=erased_buffer_fc
-                                )
-                                
-                                # Multipart to Singlepart pro rozdělení
-                                arcpy.MultipartToSinglepart_management(erased_buffer_fc, split_buffer_fc)
-                                
-                                buffer_parts = int(arcpy.GetCount_management(split_buffer_fc)[0])
-                                arcpy.AddMessage(f"Buffer rozdělen podle bodů rozhraní na {buffer_parts} částí: {split_buffer_name}")
-                                
-                                # Cleanup fallback
-                                arcpy.Delete_management(points_buffer_fc)
-                                arcpy.Delete_management(erased_buffer_fc)
-                                
-                            except Exception as e:
-                                arcpy.AddWarning(f"Chyba při rozdělování bufferu: {e}")
-                                # Fallback - použij původní buffer bez rozdělení
-                                arcpy.CopyFeatures_management(connected_buffer_fc, split_buffer_fc)
-                            
-                            # Pro kompatibilitu s existujícím kódem
-                            split_fc = split_buffer_fc  # Buffer místo split linií
-                            
-                            # 4. IDENTIFIKACE původních linií které se NEPŘEKRÝVAJÍ se spojenými liniemi
-                            # Jednoduchý přístup - zkopíruj všechny původní a odeber pouze ty které jsou skutečně ve spojených oblastech
-                            
-                            # Debug informace
-                            total_original = int(arcpy.GetCount_management(original_merged_fc)[0])
-                            total_connected = int(arcpy.GetCount_management(lines_with_boundaries_fc)[0])
-                            arcpy.AddMessage(f"Debug: Původních linií celkem: {total_original}")
-                            arcpy.AddMessage(f"Debug: Spojených linií s rozhraními: {total_connected}")
-                            
-                            # Vytvoř buffer kolem spojených linií pro identifikaci "zakázaných" oblastí
-                            connected_buffer_name = generate_unique_name(output_gdb, "PL_SC_connected_buffer_temp")
-                            connected_buffer_fc = os.path.join(output_workspace, connected_buffer_name)
-                            arcpy.Buffer_analysis(lines_with_boundaries_fc, connected_buffer_fc, "0.5 Meters")
-                            
-                            # Erase - odeber z původních linií ty části které jsou v bufferu spojených linií
-                            non_overlapping_name = generate_unique_name(output_gdb, "PL_SC_non_overlapping_temp")
-                            non_overlapping_fc = os.path.join(output_workspace, non_overlapping_name)
-                            
-                            arcpy.Erase_analysis(
-                                in_features=original_merged_fc,
-                                erase_features=connected_buffer_fc,
-                                out_feature_class=non_overlapping_fc
-                            )
-                            
-                            non_overlap_count = int(arcpy.GetCount_management(non_overlapping_fc)[0])
-                            arcpy.AddMessage(f"Debug: Nepřekrývajících se původních linií (po erase): {non_overlap_count}")
-                            
-                            # Pro kontrolu - spočítej kolik linií bylo "erasovano"
-                            erased_count = total_original - non_overlap_count
-                            arcpy.AddMessage(f"Debug: Odstraněno (erase): {erased_count} linií z původních")
-                            arcpy.AddMessage(f"Debug: Zachováno pro final: {non_overlap_count} původních linií")
-                            
-                            # 5. VYTVOŘENÍ BUFFERŮ Z PŮVODNÍCH LINIÍ (bez rozhraní)
-                            if out_prefix:
-                                original_buffer_name = f"{out_prefix}SC_original_buffer"
-                            else:
-                                original_buffer_name = "PL_SC_original_buffer"
-                            
-                            original_buffer_name = generate_unique_name(output_gdb, original_buffer_name)
-                            original_buffer_fc = os.path.join(output_workspace, original_buffer_name)
-                            
-                            if non_overlap_count > 0:
-                                # Vytvoř 30cm buffer z původních linií bez rozhraní
-                                arcpy.analysis.Buffer(
-                                    in_features=non_overlapping_fc,
-                                    out_feature_class=original_buffer_fc,
-                                    buffer_distance_or_field="0.3 Meters",
-                                    line_side="FULL",
-                                    line_end_type="FLAT",
-                                    dissolve_option="NONE"
-                                )
-                                arcpy.AddMessage(f"Vytvořen 30cm buffer z původních linií: {original_buffer_name}")
-                            
-                            # 6. FINÁLNÍ KOMBINOVANÁ VRSTVA BUFFERŮ
-                            final_name = generate_unique_name(output_gdb, split_buffer_name.replace("split", "final"))
-                            final_fc = os.path.join(output_workspace, final_name)
-                            
-                            if non_overlap_count > 0:
-                                # Merge buffer ze splitnutých linií + buffer z původních linií
-                                arcpy.Merge_management([split_fc, original_buffer_fc], final_fc)
-                                arcpy.AddMessage(f"Vytvořena finální kombinovaná vrstva bufferů: {final_name}")
-                                arcpy.AddMessage(f"  - Splitnuté buffery s rozhraními: {int(arcpy.GetCount_management(split_fc)[0])}")
-                                arcpy.AddMessage(f"  - Původní buffery bez rozhraní: {non_overlap_count}")
-                            else:
-                                # Pouze splitnuté buffery
-                                arcpy.CopyFeatures_management(split_fc, final_fc)
-                                arcpy.AddMessage(f"Finální vrstva obsahuje pouze splitnuté buffery: {final_name}")
-                            
-                            # Cleanup dočasných vrstev
-                            temp_layers = [original_merged_fc, feature_to_line_fc, dissolved_fc, connected_fc, spatial_join_fc, 
-                                         lines_with_boundaries_fc, split_fc, connected_buffer_fc, non_overlapping_fc, original_buffer_fc]
-                            for temp_fc in temp_layers:
-                                if arcpy.Exists(temp_fc):
-                                    arcpy.Delete_management(temp_fc)
-                            
-                        else:
-                            arcpy.AddMessage("Žádné spojené linie s body rozhraní - zachována původní merged vrstva")
-                            # Cleanup dočasných vrstev
-                            temp_layers = [original_merged_fc, feature_to_line_fc, dissolved_fc, connected_fc, spatial_join_fc, lines_with_boundaries_fc]
-                            for temp_fc in temp_layers:
-                                if arcpy.Exists(temp_fc):
-                                    arcpy.Delete_management(temp_fc)
-                        
-                    except Exception as e:
-                        arcpy.AddWarning(f"Chyba při vytváření finální kombinované vrstvy: {e}")
-                
-                except Exception as e:
-                    arcpy.AddWarning(f"Chyba při intersect operaci: {e}")
-                
-            except Exception as e:
-                arcpy.AddWarning(f"Chyba při snap operaci: {e}")
-
-        # Zpracování VR na bod vrstvy - multipart to singlepart a filtrování uzavřených linií (kruhy)
-        if vr_na_bod_layer and arcpy.Exists(vr_na_bod_layer):
-            try:
-                # Název pro singlepart vrstvu
-                if out_prefix:
-                    singlepart_name = f"{out_prefix}302110_VR_bod_singlepart_LN"
+                        final_cleaned_count = get_feature_count(sc_final_split)
+                        log_message(f"Po čištění falešných rozhraní: {final_cleaned_count} segmentů", "OK")
+                        log_message(f"Odstraněno {segments_to_delete - merged_count} falešných řezů", "OK")
+                    else:
+                        log_message("Žádné segmenty s falešnými rozhraními nenalezeny", "DEBUG")
                 else:
-                    singlepart_name = "PL_302110_VR_bod_singlepart_LN"
+                    log_message("Všechny koncové body odpovídají skutečným rozhraním", "OK")
                 
-                singlepart_name = generate_unique_name(output_gdb, singlepart_name)
-                singlepart_fc = os.path.join(output_workspace, singlepart_name)
+                sc_cleaned = sc_final_split
                 
-                # Multipart to Singlepart
-                arcpy.management.MultipartToSinglepart(vr_na_bod_layer, singlepart_fc)
-                arcpy.AddMessage("VR na bod převedeno na singlepart")
-                
-                # Filtrování pouze uzavřených linií (kruhy)
-                # Název pro finální vrstvu s kruhy
-                if out_prefix:
-                    circles_name = f"{out_prefix}302110_VR_bod_circles_LN"
-                else:
-                    circles_name = "Z302110_BL_VR_na_bod"
-                
-                circles_name = generate_unique_name(output_gdb, circles_name)
-                circles_fc = os.path.join(output_workspace, circles_name)
-                
-                # Vytvoření prázdné kopie pro kruhy
-                arcpy.management.CreateFeatureclass(
-                    out_path=output_workspace,
-                    out_name=circles_name.split(os.sep)[-1],
-                    geometry_type="POLYLINE",
-                    template=singlepart_fc,
-                    spatial_reference=output_sr
-                )
-                
-                # Kopírování pouze uzavřených linií
-                circles_count = 0
-                # Získání seznamu polí (bez OBJECTID který se generuje automaticky)
-                field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
-                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
-                
-                with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
-                    with arcpy.da.InsertCursor(circles_fc, ["SHAPE@"] + field_names) as insert_cursor:
-                        for row in search_cursor:
-                            geometry = row[0]
-                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
-                                insert_cursor.insertRow(row)
-                                circles_count += 1
-                
-                arcpy.AddMessage(f"Nalezeno a zachováno {circles_count} uzavřených linií (kruhů) pro VR na bod")
-                
-                # Smazání dočasné singlepart vrstvy
-                arcpy.Delete_management(singlepart_fc)
-                
-            except Exception as e:
-                arcpy.AddWarning(f"Chyba při zpracování VR na bod: {e}")
+            else:
+                log_message("Žádná rozhraní - přeskakuji čištění", "DEBUG")
+                sc_cleaned = sc_final_split
         
-        # Zpracování VR na linii vrstvy - multipart to singlepart a filtrování uzavřených linií
-        if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
-            try:
-                # Název pro singlepart vrstvu
-                if out_prefix:
-                    singlepart_name = f"{out_prefix}302210_VR_singlepart_LN"
-                else:
-                    singlepart_name = "PL_302210_VR_singlepart_LN"
-                
-                singlepart_name = generate_unique_name(output_gdb, singlepart_name)
-                singlepart_fc = os.path.join(output_workspace, singlepart_name)
-                
-                # Multipart to Singlepart
-                arcpy.management.MultipartToSinglepart(vr_na_linii_layer, singlepart_fc)
-                arcpy.AddMessage("VR na linii převedeno na singlepart")
-                
-                # Filtrování pouze uzavřených linií (kruhy)
-                # Název pro finální vrstvu s kruhy
-                if out_prefix:
-                    circles_name = f"{out_prefix}302210_VR_circles_LN"
-                else:
-                    circles_name = "PL_302210_VR_circles_LN"
-                
-                circles_name = generate_unique_name(output_gdb, circles_name)
-                circles_fc = os.path.join(output_workspace, circles_name)
-                
-                # Vytvoření prázdné kopie pro kruhy
-                arcpy.management.CreateFeatureclass(
-                    out_path=output_workspace,
-                    out_name=circles_name.split(os.sep)[-1],
-                    geometry_type="POLYLINE",
-                    template=singlepart_fc,
-                    spatial_reference=output_sr
-                )
-                
-                # Kopírování pouze uzavřených linií
-                circles_count = 0
-                # Získání seznamu polí (bez OBJECTID který se generuje automaticky)
-                field_names = [field.name for field in arcpy.ListFields(singlepart_fc) 
-                              if field.type != "OID" and field.name.upper() != "OBJECTID"]
-                
-                with arcpy.da.SearchCursor(singlepart_fc, ["SHAPE@"] + field_names) as search_cursor:
-                    with arcpy.da.InsertCursor(circles_fc, ["SHAPE@"] + field_names) as insert_cursor:
-                        for row in search_cursor:
-                            geometry = row[0]
-                            if geometry and geometry.firstPoint.X == geometry.lastPoint.X and geometry.firstPoint.Y == geometry.lastPoint.Y:
-                                insert_cursor.insertRow(row)
-                                circles_count += 1
-                
-                arcpy.AddMessage(f"Nalezeno a zachováno {circles_count} uzavřených linií (kruhů)")
-                
-                # Smazání dočasné singlepart vrstvy
-                arcpy.Delete_management(singlepart_fc)
-                
-            except Exception as e:
-                arcpy.AddWarning(f"Chyba při zpracování VR na linii: {e}")
-
-        # SPATIAL JOIN EXISTUJÍCÍHO BUFFERU S KRUHY
-        # Najdi finální buffer vrstvu a kruhy
-        buffer_fc = None
-        circles_fc = None
+        except Exception as e:
+            log_message(f"Chyba při čištění falešných rozhraní: {e}", "WARN")
+            log_message("Pokračuji s nečištěnými segmenty", "WARN")
+            sc_cleaned = sc_final_split
         
-        # Hledání finálního bufferu
-        original_workspace = arcpy.env.workspace
-        try:
-            arcpy.env.workspace = output_workspace
-            buffer_classes = arcpy.ListFeatureClasses("*final_buffer*")
-            if buffer_classes:
-                buffer_fc = os.path.join(output_workspace, buffer_classes[0])
-                arcpy.AddMessage(f"Nalezena finální buffer vrstva: {buffer_classes[0]}")
-            
-            # Hledání vrstvy kruhů
-            circle_classes = arcpy.ListFeatureClasses("*circles*")
-            if circle_classes:
-                circles_fc = os.path.join(output_workspace, circle_classes[0])
-                arcpy.AddMessage(f"Nalezena vrstva kruhů: {circle_classes[0]}")
-        finally:
-            arcpy.env.workspace = original_workspace
+        # DEBUG - kontrola SC_TYPE
+        fields = [f.name for f in arcpy.ListFields(sc_cleaned)]
+        if "SC_TYPE" in fields:
+            sc_types_found = set()
+            with arcpy.da.SearchCursor(sc_cleaned, ["SC_TYPE"]) as cursor:
+                for row in cursor:
+                    if row[0]:
+                        sc_types_found.add(row[0])
+            log_message(f"SC_TYPE zachováno: {len(sc_types_found)} typů", "DEBUG")
         
-        # Pokud existují obě vrstvy, proveď spatial join
-        if buffer_fc and circles_fc and arcpy.Exists(buffer_fc) and arcpy.Exists(circles_fc):
+        # ============================================================
+        # FÁZE 8: FINÁLNÍ PŘIPOJENÍ ATRIBUTŮ (podle notebooku)
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 8: FINÁLNÍ PŘIPOJENÍ ATRIBUTŮ", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        sc_final_with_vr = None
+        
+        if vr_circles and arcpy.Exists(vr_circles) and sc_cleaned:
             try:
-                # Spatial join bufferu s kruhy
-                if out_prefix:
-                    spatial_join_name = f"{out_prefix}SC_buffer_with_circles"
-                else:
-                    spatial_join_name = "PL_SC_buffer_with_circles"
-                
-                spatial_join_name = generate_unique_name(output_gdb, spatial_join_name)
-                spatial_join_fc = os.path.join(output_workspace, spatial_join_name)
+                # Finální SpatialJoin s VR bloky (podle notebooku)
+                log_message("Finální SpatialJoin s VR bloky...", "STEP")
                 
                 arcpy.analysis.SpatialJoin(
-                    target_features=buffer_fc,
-                    join_features=circles_fc,
-                    out_feature_class=spatial_join_fc,
-                    join_operation="JOIN_ONE_TO_ONE",
+                    target_features=sc_cleaned,
+                    join_features=vr_circles,
+                    out_feature_class=r"memory\sc_final_sj",
+                    join_operation="JOIN_ONE_TO_MANY",
                     join_type="KEEP_ALL",
                     match_option="INTERSECT"
                 )
                 
-                circles_joined = int(arcpy.GetCount_management(spatial_join_fc)[0])
-                arcpy.AddMessage(f"Vytvořen spatial join s kruhy: {spatial_join_name}")
-                arcpy.AddMessage(f"Buffer prvků s informacemi o kruzích: {circles_joined}")
+                sj_count = get_feature_count(r"memory\sc_final_sj")
+                log_message(f"SpatialJoin výsledek: {sj_count} záznamů", "DEBUG")
                 
-                # VYTVOŘENÍ CENTERLINE Z BUFFERU S KRUHY
-                try:
-                    # Zkontroluj licenci pro Production Mapping nebo Foundation (potřebné pro PolygonToCenterline)
-                    if arcpy.CheckExtension("Foundation") == "Available":
-                        arcpy.CheckOutExtension("Foundation")
-                        
-                        # Název pro centerline vrstvu
-                        if out_prefix:
-                            centerline_name = f"{out_prefix}SC_centerline_LN"
-                        else:
-                            centerline_name = "PL_SC_centerline_LN"
-                        
-                        centerline_name = generate_unique_name(output_gdb, centerline_name)
-                        centerline_fc = os.path.join(output_workspace, centerline_name)
-                        
-                        # Výpis atributů které budou přeneseny
-                        buffer_fields = [field.name for field in arcpy.ListFields(spatial_join_fc) 
-                                        if field.type not in ["OID", "Geometry"] and field.name.upper() not in ["SHAPE_LENGTH", "SHAPE_AREA", "OBJECTID"]]
-                        arcpy.AddMessage(f"Atributy k přenosu z bufferu: {', '.join(buffer_fields)}")
-                        
-                        # Vytvoření centerline z buffer polygonů
-                        # PolygonToCenterline automaticky zachovává VŠECHNY atributy ze vstupních polygonů
-                        arcpy.topographic.PolygonToCenterline(
-                            in_features=spatial_join_fc,
-                            out_feature_class=centerline_fc
-                        )
-                        
-                        centerline_count = int(arcpy.GetCount_management(centerline_fc)[0])
-                        arcpy.AddMessage(f"Vytvořena centerline vrstva: {centerline_name}")
-                        arcpy.AddMessage(f"Počet centerline prvků: {centerline_count}")
-                        
-                        # EXPLICITNÍ PŘENOS ATRIBUTŮ pomocí JoinField
-                        # PolygonToCenterline vytváří pole FID které odpovídá OBJECTID vstupního polygonu
-                        try:
-                            # Nejdřív zkontroluj jaká pole má centerline
-                            centerline_fields_before = [field.name for field in arcpy.ListFields(centerline_fc)]
-                            arcpy.AddMessage(f"Pole v centerline před join: {', '.join(centerline_fields_before)}")
-                            
-                            # Najdi pole které obsahuje odkaz na původní polygon (může být FID, ORIG_FID, nebo ObjectID)
-                            join_field_name = None
-                            if "FID" in centerline_fields_before:
-                                join_field_name = "FID"
-                            elif "ORIG_FID" in centerline_fields_before:
-                                join_field_name = "ORIG_FID"
-                            elif "OriginalOID" in centerline_fields_before:
-                                join_field_name = "OriginalOID"
-                            
-                            if not join_field_name:
-                                raise Exception("Nebylo nalezeno pole pro propojení (FID, ORIG_FID, OriginalOID)")
-                            
-                            arcpy.AddMessage(f"Použiji pole '{join_field_name}' pro propojení s OBJECTID bufferu")
-                            
-                            # Získej seznam polí k přenosu (všechna kromě OID, Shape, Shape_Length, Shape_Area)
-                            buffer_fields_to_join = [field.name for field in arcpy.ListFields(spatial_join_fc) 
-                                                    if field.type not in ["OID", "Geometry"] 
-                                                    and field.name.upper() not in ["SHAPE_LENGTH", "SHAPE_AREA", "OBJECTID", "SHAPE", "FID"]]
-                            
-                            arcpy.AddMessage(f"Připojuji {len(buffer_fields_to_join)} polí z bufferu do centerline...")
-                            
-                            # JoinField - propojí centerline s bufferem přes FID -> OBJECTID
-                            arcpy.management.JoinField(
-                                in_data=centerline_fc,
-                                in_field=join_field_name,  # Pole v centerline (FID)
-                                join_table=spatial_join_fc,
-                                join_field="OBJECTID",  # OBJECTID bufferu
-                                fields=buffer_fields_to_join  # Všechna pole k přenosu
-                            )
-                            
-                            # Ověření že se atributy přenesly
-                            centerline_fields = [field.name for field in arcpy.ListFields(centerline_fc) 
-                                                if field.type not in ["OID", "Geometry"] and field.name.upper() not in ["SHAPE_LENGTH", "OBJECTID"]]
-                            arcpy.AddMessage(f"✓ Všechny atributy byly připojeny do centerline")
-                            arcpy.AddMessage(f"Celkem polí v centerline: {len(centerline_fields)}")
-                            
-                            # DEBUG - zkontroluj která pole mají data
-                            arcpy.AddMessage("DEBUG: Kontrola polí s daty...")
-                            fields_with_data = []
-                            fields_without_data = []
-                            
-                            with arcpy.da.SearchCursor(centerline_fc, centerline_fields) as cursor:
-                                row = next(cursor, None)  # První řádek
-                                if row:
-                                    for i, field_name in enumerate(centerline_fields):
-                                        if row[i] is not None and row[i] != '':
-                                            fields_with_data.append(field_name)
-                                        else:
-                                            fields_without_data.append(field_name)
-                            
-                            arcpy.AddMessage(f"DEBUG: Pole s daty ({len(fields_with_data)}): {', '.join(fields_with_data[:30])}")  # Prvních 30
-                            if len(fields_with_data) > 30:
-                                arcpy.AddMessage(f"DEBUG: ... a dalších {len(fields_with_data) - 30} polí")
-                            
-                            # PONECHÁNÍ POUZE POŽADOVANÝCH POLÍ
-                            # Zachováme:
-                            # 1. Layer - identifikace původní vrstvy
-                            # 2. Pole z kruhů (Join_Count a ostatní z circles) - typicky mají suffix podle toho kolikrát se joinovalo
-                            # 3. CAD atributy které obsahují výškové informace
-                            
-                            # Začneme se základními CAD poli a Layer
-                            keep_fields = [
-                                "Layer",  # Identifikace vrstvy
-                                "Join_Count",  # Počet kruhů které se protínají
-                                # CAD atributy z circles (mohou mít různé suffixy _1, _12 atd.)
-                                "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
-                                "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
-                                "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
-                            ]
-                            
-                            # Přidej všechny varianty s různými suffixy (_1, _12, atd.)
-                            expanded_keep_fields = set(keep_fields)
-                            for field in centerline_fields:
-                                for base_field in keep_fields:
-                                    if field.startswith(base_field):
-                                        expanded_keep_fields.add(field)
-                            
-                            keep_fields = list(expanded_keep_fields)
-                            arcpy.AddMessage(f"DEBUG: Pole k zachování: {', '.join(sorted(keep_fields))}")
-                            
-                            # Najdi pole ke smazání (všechna kromě keep_fields a povinných systémových)
-                            all_fields = arcpy.ListFields(centerline_fc)
-                            fields_to_delete = []
-                            
-                            for field in all_fields:
-                                # Nesmažeme systémová pole a pole ze seznamu keep_fields
-                                if (field.type not in ["OID", "Geometry"] and 
-                                    not field.required and 
-                                    field.name not in keep_fields and
-                                    field.name.upper() not in ["OBJECTID", "SHAPE", "SHAPE_LENGTH", "FID"]):
-                                    fields_to_delete.append(field.name)
-                            
-                            # Smazání nepotřebných polí
-                            if fields_to_delete:
-                                arcpy.AddMessage(f"Mažu {len(fields_to_delete)} nepotřebných polí...")
-                                arcpy.management.DeleteField(centerline_fc, fields_to_delete)
-                                arcpy.AddMessage(f"✓ Zachováno pouze {len(keep_fields)} požadovaných polí")
-                            else:
-                                arcpy.AddMessage("Všechna pole jsou potřebná - žádné pole ke smazání")
-                            
-                            # Finální výpis polí
-                            final_fields = [field.name for field in arcpy.ListFields(centerline_fc) 
-                                          if field.type not in ["OID", "Geometry"] and field.name.upper() not in ["SHAPE_LENGTH", "OBJECTID"]]
-                            arcpy.AddMessage(f"Finální pole v centerline: {', '.join(final_fields)}")
-                            
-                        except Exception as join_error:
-                            arcpy.AddWarning(f"Varování při připojování atributů: {join_error}")
-                            arcpy.AddWarning("Centerline byla vytvořena, ale některé atributy se nemusely přenést")
-                        
-                        # ÚPRAVA GEOMETRIE CENTERLINE - ALIGN K PŮVODNÍM LINIÍM
-                        try:
-                            # Najdi původní merged SC linie
-                            original_lines_fc = None
-                            arcpy.env.workspace = output_workspace
-                            
-                            # Hledej PL_SC_all nebo merged vrstvu
-                            lines_classes = arcpy.ListFeatureClasses("*SC_all*")
-                            if not lines_classes:
-                                lines_classes = arcpy.ListFeatureClasses("*SC_all_LN*")
-                            
-                            if lines_classes:
-                                original_lines_fc = os.path.join(output_workspace, lines_classes[0])
-                                arcpy.AddMessage(f"Nalezeny původní SC linie: {lines_classes[0]}")
-                                
-                                # ALIGN FEATURES - inteligentně srovná centerline s původními liniemi
-                                # Zachová topologii (spojení/rozpojení) ale přizpůsobí geometrii
-                                arcpy.AddMessage("Srovnávám geometrii centerline s původními liniemi...")
-                                arcpy.AddMessage("  (zachovává topologii, upravuje pouze tvar)")
-                                
-                                # Align s search distance 2 metry pro nalezení odpovídajících linií
-                                arcpy.edit.AlignFeatures(
-                                    in_features=centerline_fc,      # Centerline (správná topologie)
-                                    target_features=original_lines_fc,  # Původní linie (správná geometrie)
-                                    search_distance="2.0 Meters"    # Vzdálenost hledání
-                                )
-                                
-                                arcpy.AddMessage("✓ Geometrie centerline srovnána s původními liniemi")
-                                arcpy.AddMessage("  - Topologie zachována (spojení/rozpojení z centerline)")
-                                arcpy.AddMessage("  - Geometrie upravena (přesné rohy z původních linií)")
-                                arcpy.AddMessage("  - Pole AF_CONF přidáno (0-100, confidence alignment)")
-                                
-                            else:
-                                arcpy.AddWarning("Původní SC linie nebyly nalezeny - geometrie centerline zůstává nezměněna")
-                                
-                        except Exception as align_error:
-                            arcpy.AddWarning(f"Chyba při srovnávání geometrie centerline: {align_error}")
-                            arcpy.AddWarning("Centerline má geometrii z PolygonToCenterline (může být zaoblená)")
-                            arcpy.AddWarning("Zkus zvýšit search_distance nebo zkontroluj že linie jsou blízko sebe")
-                        
-                        # Vrácení licence
-                        arcpy.CheckInExtension("Foundation")
-                        
-                    else:
-                        # FALLBACK: Použití 3rd party balíčku 'centerline' (Voronoi based)
-                        # Optimalizovaná verze pro co nejpodobnější výsledek jako PolygonToCenterline
-                        arcpy.AddWarning("Foundation/Production Mapping extension není dostupná")
-                        arcpy.AddMessage("Zkouším alternativní metodu pomocí balíčku 'centerline' (Voronoi diagram)...")
-                        
-                        try:
-                            from centerline.geometry import Centerline as VoronoiCenterline
-                            from shapely.geometry import shape, mapping, LineString, MultiLineString
-                            from shapely.ops import linemerge, unary_union
-                            import json
-                            
-                            arcpy.AddMessage("✓ Balíček 'centerline' nalezen - používám optimalizovanou Voronoi metodu")
-                            
-                            # Název pro centerline vrstvu
-                            if out_prefix:
-                                centerline_name = f"{out_prefix}SC_centerline_LN"
-                            else:
-                                centerline_name = "PL_SC_centerline_LN"
-                            
-                            centerline_name = generate_unique_name(output_gdb, centerline_name)
-                            centerline_fc = os.path.join(output_workspace, centerline_name)
-                            
-                            # Získání spatial reference z bufferu
-                            sr = arcpy.Describe(spatial_join_fc).spatialReference
-                            
-                            # Vytvoření výstupní feature class pro centerline
-                            arcpy.CreateFeatureclass_management(
-                                out_path=output_workspace,
-                                out_name=os.path.basename(centerline_fc),
-                                geometry_type="POLYLINE",
-                                spatial_reference=sr
-                            )
-                            
-                            # Přidání pole pro původní OBJECTID (pro pozdější join atributů)
-                            arcpy.AddField_management(centerline_fc, "ORIG_FID", "LONG")
-                            
-                            # Získání seznamu atributových polí z bufferu
-                            buffer_fields = [field.name for field in arcpy.ListFields(spatial_join_fc) 
-                                            if field.type not in ["OID", "Geometry"] 
-                                            and field.name.upper() not in ["SHAPE_LENGTH", "SHAPE_AREA", "OBJECTID", "SHAPE"]]
-                            
-                            total_polygons = int(arcpy.GetCount_management(spatial_join_fc)[0])
-                            arcpy.AddMessage(f"Zpracovávám {total_polygons} buffer polygonů...")
-                            
-                            # Pomocná funkce pro filtrování krátkých větví (Voronoi artefaktů)
-                            def filter_short_branches(geom, min_length=0.15):
-                                """Odstraní krátké větve které jsou Voronoi artefakty"""
-                                if geom is None or geom.is_empty:
-                                    return None
-                                
-                                if geom.geom_type == 'LineString':
-                                    return geom if geom.length >= min_length else None
-                                elif geom.geom_type == 'MultiLineString':
-                                    # Filtruj krátké segmenty
-                                    valid_lines = [line for line in geom.geoms if line.length >= min_length]
-                                    if not valid_lines:
-                                        return None
-                                    elif len(valid_lines) == 1:
-                                        return valid_lines[0]
-                                    else:
-                                        return MultiLineString(valid_lines)
-                                return geom
-                            
-                            # Pomocná funkce pro simplifikaci geometrie
-                            def simplify_centerline(geom, tolerance=0.05):
-                                """Zjednodušení geometrie pro hladší výsledek"""
-                                if geom is None or geom.is_empty:
-                                    return None
-                                return geom.simplify(tolerance, preserve_topology=True)
-                            
-                            # Zpracování každého buffer polygonu
-                            centerline_count = 0
-                            failed_count = 0
-                            
-                            with arcpy.da.SearchCursor(spatial_join_fc, ["SHAPE@", "OID@"]) as search_cursor:
-                                with arcpy.da.InsertCursor(centerline_fc, ["SHAPE@", "ORIG_FID"]) as insert_cursor:
-                                    for row in search_cursor:
-                                        polygon_geom = row[0]
-                                        oid = row[1]
-                                        
-                                        try:
-                                            # Převod ArcPy geometry na Shapely
-                                            polygon_json = polygon_geom.JSON
-                                            shapely_polygon = shape(json.loads(polygon_json))
-                                            
-                                            # Validace polygonu
-                                            if not shapely_polygon.is_valid:
-                                                shapely_polygon = shapely_polygon.buffer(0)
-                                            
-                                            # Vytvoření centerline pomocí Voronoi
-                                            # interpolation_distance=0.3 pro hustější body = přesnější Voronoi
-                                            voronoi_cl = VoronoiCenterline(shapely_polygon, interpolation_distance=0.3)
-                                            
-                                            # Získání geometrie centerline
-                                            cl_geom = voronoi_cl.geometry
-                                            
-                                            if cl_geom and not cl_geom.is_empty:
-                                                # 1. Filtrování krátkých větví (Voronoi artefakty)
-                                                # Min délka 15cm (polovina šířky bufferu 30cm)
-                                                cl_geom = filter_short_branches(cl_geom, min_length=0.15)
-                                                
-                                                if cl_geom and not cl_geom.is_empty:
-                                                    # 2. Sloučení linií do jedné pokud je to MultiLineString
-                                                    if cl_geom.geom_type == 'MultiLineString':
-                                                        merged = linemerge(cl_geom)
-                                                        cl_geom = merged
-                                                    
-                                                    # 3. Simplifikace pro hladší výsledek (tolerance 5cm)
-                                                    cl_geom = simplify_centerline(cl_geom, tolerance=0.05)
-                                                    
-                                                    if cl_geom and not cl_geom.is_empty:
-                                                        # Převod Shapely geometry zpět na ArcPy
-                                                        cl_json = mapping(cl_geom)
-                                                        arcpy_geom = arcpy.AsShape(cl_json, True)
-                                                        
-                                                        # Vložení do výstupní feature class
-                                                        insert_cursor.insertRow([arcpy_geom, oid])
-                                                        centerline_count += 1
-                                        except Exception as poly_error:
-                                            failed_count += 1
-                                            if failed_count <= 3:
-                                                arcpy.AddWarning(f"  Polygon OID {oid}: {poly_error}")
-                            
-                            if failed_count > 3:
-                                arcpy.AddWarning(f"  ... a dalších {failed_count - 3} chyb")
-                            
-                            arcpy.AddMessage(f"✓ Vytvořeno {centerline_count} centerline prvků (Voronoi metoda)")
-                            if failed_count > 0:
-                                arcpy.AddWarning(f"  {failed_count} polygonů se nepodařilo zpracovat")
-                            
-                            # Připojení atributů z bufferu pomocí JoinField
-                            if centerline_count > 0:
-                                arcpy.AddMessage("Připojuji atributy z bufferu...")
-                                
-                                arcpy.management.JoinField(
-                                    in_data=centerline_fc,
-                                    in_field="ORIG_FID",
-                                    join_table=spatial_join_fc,
-                                    join_field="OBJECTID",
-                                    fields=buffer_fields
-                                )
-                                
-                                arcpy.AddMessage(f"✓ Připojeno {len(buffer_fields)} atributových polí")
-                                
-                                # PONECHÁNÍ POUZE POŽADOVANÝCH POLÍ (stejně jako u Foundation verze)
-                                keep_fields = [
-                                    "Layer", "Join_Count", "ORIG_FID",
-                                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
-                                    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
-                                    "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
-                                ]
-                                
-                                # Rozšíření o varianty s suffixy
-                                centerline_fields = [f.name for f in arcpy.ListFields(centerline_fc)]
-                                expanded_keep_fields = set(keep_fields)
-                                for field in centerline_fields:
-                                    for base_field in keep_fields:
-                                        if field.startswith(base_field):
-                                            expanded_keep_fields.add(field)
-                                
-                                keep_fields = list(expanded_keep_fields)
-                                
-                                # Smazání nepotřebných polí
-                                all_fields = arcpy.ListFields(centerline_fc)
-                                fields_to_delete = []
-                                
-                                for field in all_fields:
-                                    if (field.type not in ["OID", "Geometry"] and 
-                                        not field.required and 
-                                        field.name not in keep_fields and
-                                        field.name.upper() not in ["OBJECTID", "SHAPE", "SHAPE_LENGTH"]):
-                                        fields_to_delete.append(field.name)
-                                
-                                if fields_to_delete:
-                                    arcpy.management.DeleteField(centerline_fc, fields_to_delete)
-                                    arcpy.AddMessage(f"✓ Zachováno pouze {len(keep_fields)} požadovaných polí")
-                                
-                                # ÚPRAVA GEOMETRIE - PŘICHYCENÍ K PŮVODNÍM LINIÍM
-                                try:
-                                    arcpy.env.workspace = output_workspace
-                                    lines_classes = arcpy.ListFeatureClasses("*SC_all*")
-                                    if not lines_classes:
-                                        lines_classes = arcpy.ListFeatureClasses("*SC_all_LN*")
-                                    
-                                    if lines_classes:
-                                        original_lines_fc = os.path.join(output_workspace, lines_classes[0])
-                                        arcpy.AddMessage(f"Srovnávám geometrii s původními liniemi: {lines_classes[0]}")
-                                        
-                                        # 1. Densifikace pro více bodů k přichycení
-                                        arcpy.edit.Densify(centerline_fc, "DISTANCE", "0.5 Meters")
-                                        
-                                        # 2. Snap k hranám a vrcholům původních linií
-                                        snap_env = [
-                                            [original_lines_fc, "EDGE", "0.4 Meters"],
-                                            [original_lines_fc, "VERTEX", "0.2 Meters"]
-                                        ]
-                                        arcpy.edit.Snap(centerline_fc, snap_env)
-                                        
-                                        # 3. Generalizace pro vyhlazení výsledku
-                                        arcpy.edit.Generalize(centerline_fc, "0.02 Meters")
-                                        
-                                        arcpy.AddMessage("✓ Geometrie centerline přichycena a vyhlazena")
-                                        arcpy.AddMessage("  - Densifikace: 0.5m")
-                                        arcpy.AddMessage("  - Snap EDGE: 0.4m, VERTEX: 0.2m")
-                                        arcpy.AddMessage("  - Generalizace: 0.02m")
-                                except Exception as snap_error:
-                                    arcpy.AddWarning(f"Úprava geometrie se nezdařila: {snap_error}")
-                            
-                            arcpy.AddMessage(f"Výsledná centerline vrstva: {centerline_name}")
-                            
-                        except ImportError:
-                            arcpy.AddWarning("Balíček 'centerline' není nainstalován.")
-                            arcpy.AddWarning("Pro instalaci spusťte: pip install centerline")
-                            arcpy.AddWarning("Nebo: conda install -c conda-forge centerline")
-                            arcpy.AddWarning("Centerline se nevytvoří - použijte ArcGIS Foundation extension nebo nainstalujte balíček 'centerline'")
-                        except Exception as fallback_error:
-                            arcpy.AddWarning(f"Chyba při vytváření centerline (Voronoi metoda): {fallback_error}")
-                        
-                except Exception as e:
-                    arcpy.AddWarning(f"Chyba při vytváření centerline: {e}")
-                    # Pokus o vrácení licence i v případě chyby
-                    try:
-                        arcpy.CheckInExtension("Foundation")
-                    except:
-                        pass
+                # DEBUG - kontrola SC_TYPE po SpatialJoin
+                fields_sj = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                if "SC_TYPE" in fields_sj:
+                    log_message("SC_TYPE nalezeno po SpatialJoin", "DEBUG")
+                else:
+                    log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po SpatialJoin!", "WARN")
                 
-            except Exception as e:
-                arcpy.AddWarning(f"Chyba při vytváření spatial join: {e}")
-        else:
-            if not buffer_fc:
-                arcpy.AddMessage("Finální buffer vrstva nebyla nalezena - spatial join se neprovede")
-            if not circles_fc:
-                arcpy.AddMessage("Vrstva kruhů nebyla nalezena - spatial join se neprovede")
-
-        # FINÁLNÍ SPLIT A CLEANUP - na úplném konci po všech operacích
-        arcpy.AddMessage("=" * 60)
-        arcpy.AddMessage("FINÁLNÍ ZPRACOVÁNÍ")
-        arcpy.AddMessage("=" * 60)
-        
-        # Najdi centerline vrstvu
-        arcpy.env.workspace = output_workspace
-        centerline_fcs = arcpy.ListFeatureClasses("*centerline*")
-        
-        if centerline_fcs:
-            centerline_fc = os.path.join(output_workspace, centerline_fcs[0])
-            arcpy.AddMessage(f"Nalezena centerline vrstva: {centerline_fcs[0]}")
-            
-            try:
-                # SPLIT BY ATTRIBUTES - rozdělení centerline podle Layer pole
-                arcpy.AddMessage("Rozdělování centerline podle atributu 'Layer'...")
+                # ============================================================
+                # PROPAGACE ATRIBUTŮ MEZI ROZHRANÍMI
+                # ============================================================
+                # ============================================================
+                # PROPAGACE ATRIBUTŮ (SIBLING & SERIAL)
+                # ============================================================
+                log_message("Spouštím pokročilou propagaci atributů...", "STEP")
                 
-                # Zkontroluj zda existuje pole Layer
-                centerline_fields = [field.name for field in arcpy.ListFields(centerline_fc)]
+                if vr_circles and arcpy.Exists(vr_circles):
+                    vr_attributes = get_vr_attributes(vr_circles)
+                else:
+                    vr_attributes = []
                 
-                if "Layer" in centerline_fields:
-                    # Vytvoř pomocné pole s prefixem Z pro validní názvy
-                    temp_field = "Layer_Z"
-                    arcpy.AddField_management(centerline_fc, temp_field, "TEXT", field_length=100)
+                fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                available_height_attrs = [attr for attr in vr_attributes if attr in fields]
+                
+                if available_height_attrs:
+                    # 1. PŘÍPRAVA DATA STRUKTUR
+                    # Načtení bariér (všechna rozhraní)
+                    barrier_coords = set()
+                    if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                        with arcpy.da.SearchCursor(rozhrani_body_all, ["SHAPE@XY"]) as cursor:
+                            for row in cursor:
+                                if row[0]:
+                                    barrier_coords.add((round(row[0][0], 3), round(row[0][1], 3)))
                     
-                    # Zkopíruj Layer s prefixem Z a použij generate_unique_name pro unikátnost
-                    unique_layer_names = {}
-                    with arcpy.da.UpdateCursor(centerline_fc, ["Layer", temp_field]) as cursor:
+                    # Načtení povolených bariér (false endpoints) - místa kde chceme propagovat i přes rozhraní
+                    whitelist_coords = set()
+                    if arcpy.Exists(r"memory\false_endpoints"):
+                        with arcpy.da.SearchCursor(r"memory\false_endpoints", ["SHAPE@XY"]) as cursor:
+                            for row in cursor:
+                                if row[0]:
+                                    whitelist_coords.add((round(row[0][0], 3), round(row[0][1], 3)))
+                    
+                    log_message(f"Bariér: {len(barrier_coords)}, Whitelist: {len(whitelist_coords)}", "DEBUG")
+
+                    # Načtení segmentů do paměti
+                    # OID -> {start, end, attrs, has_data}
+                    segments_data = {}
+                    # Endpoint map: coord -> [OID, ...]
+                    endpoint_map = {}
+                    
+                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID", "SHAPE@", "SHAPE@ALL"] + available_height_attrs) as cursor:
+                        for row in cursor:
+                            oid = row[0]
+                            # Rychlejší přístup k souřadnicím bez full geometry object overhead v loopu
+                            # Ale potřebujeme First/Last point. SHAPE@ je OK.
+                            geom = row[1]
+                            attrs = list(row[3:]) # Skip OID, Shape, ShapeAll
+                            has_data = any(a is not None for a in attrs)
+                            
+                            start_pt = (round(geom.firstPoint.X, 3), round(geom.firstPoint.Y, 3))
+                            end_pt = (round(geom.lastPoint.X, 3), round(geom.lastPoint.Y, 3))
+                            
+                            segments_data[oid] = {
+                                "start": start_pt, 
+                                "end": end_pt, 
+                                "attrs": attrs, 
+                                "has_data": has_data,
+                                "endpoints_set": frozenset([start_pt, end_pt]) # Pro sibling check
+                            }
+                            
+                            # Registrace do mapy
+                            if start_pt not in endpoint_map: endpoint_map[start_pt] = []
+                            endpoint_map[start_pt].append(oid)
+                            if end_pt not in endpoint_map: endpoint_map[end_pt] = []
+                            endpoint_map[end_pt].append(oid)
+
+                    # 2. SIBLING PROPAGATION (Paralelní segmenty - sdílí Start i End)
+                    # Prioritní - ignoruje bariéry (protože jde o "stejný" úsek)
+                    sibling_updates = {}
+                    for target_oid, target_info in segments_data.items():
+                        if not target_info["has_data"]:
+                            target_set = target_info["endpoints_set"]
+                            # Najdi dárce
+                            for source_oid, source_info in segments_data.items():
+                                if source_oid != target_oid and source_info["has_data"]:
+                                    if source_info["endpoints_set"] == target_set:
+                                        sibling_updates[target_oid] = source_info["attrs"]
+                                        break
+                    
+                    if sibling_updates:
+                        log_message(f"Sibling Propagace: {len(sibling_updates)} segmentů", "DEBUG")
+                        # Apply updates local & DB
+                        for oid, attrs in sibling_updates.items():
+                            segments_data[oid]["attrs"] = attrs
+                            segments_data[oid]["has_data"] = True
+                        
+                        with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
+                            for row in cursor:
+                                if row[0] in sibling_updates:
+                                    u_attrs = sibling_updates[row[0]]
+                                    for k, val in enumerate(u_attrs): row[k+1] = val
+                                    cursor.updateRow(row)
+
+                    # 3. SERIAL PROPAGATION (Navazující segmenty)
+                    # Respektuje bariéry, pokud nejsou na whitelistu
+                    max_iterations = 10
+                    for i in range(max_iterations):
+                        serial_updates = {}
+                        null_segments = [k for k, v in segments_data.items() if not v["has_data"]]
+                        
+                        if not null_segments:
+                            break
+                            
+                        for null_oid in null_segments:
+                            null_info = segments_data[null_oid]
+                            candidate_attrs = None
+                            
+                            # Zkus oba konce
+                            for check_pt in [null_info["start"], null_info["end"]]:
+                                # Je tento bod blokován?
+                                is_barrier = (check_pt in barrier_coords)
+                                is_whitelisted = (check_pt in whitelist_coords)
+                                
+                                # Pokud je bariéra A NENÍ na whitelistu -> STOP
+                                if is_barrier and not is_whitelisted:
+                                    continue
+                                
+                                # Hledej sousedy
+                                neighbors = endpoint_map.get(check_pt, [])
+                                for n_oid in neighbors:
+                                    if n_oid == null_oid: continue
+                                    n_info = segments_data[n_oid]
+                                    
+                                    if n_info["has_data"]:
+                                        candidate_attrs = n_info["attrs"]
+                                        break
+                                
+                                if candidate_attrs:
+                                    break
+                            
+                            if candidate_attrs:
+                                serial_updates[null_oid] = candidate_attrs
+                        
+                        if serial_updates:
+                            log_message(f"Serial Iterace {i+1}: {len(serial_updates)} segmentů", "DEBUG")
+                             # Apply updates local & DB
+                            for oid, attrs in serial_updates.items():
+                                segments_data[oid]["attrs"] = attrs
+                                segments_data[oid]["has_data"] = True
+                            
+                            with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
+                                for row in cursor:
+                                    if row[0] in serial_updates:
+                                        u_attrs = serial_updates[row[0]]
+                                        for k, val in enumerate(u_attrs): row[k+1] = val
+                                        cursor.updateRow(row)
+                        else:
+                            break
+                    
+                    # Cleanup barriers
+                    if arcpy.Exists(r"memory\rozhrani_buffer"):
+                        arcpy.Delete_management(r"memory\rozhrani_buffer")
+
+                
+                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
+
+
+                
+                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
+                log_message("Dissolve pro detekci chyb...", "STEP")
+                
+                # Dynamicky získej VR atributy z bloků
+                if vr_circles and arcpy.Exists(vr_circles):
+                    vr_attributes = get_vr_attributes(vr_circles)
+                    log_message(f"VR atributy z bloků pro dissolve: {', '.join(vr_attributes) if vr_attributes else 'žádné'}", "DEBUG")
+                else:
+                    vr_attributes = []
+                
+                # Zjisti dostupné výškové atributy v sc_final_sj
+                fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                available_height_attrs = []
+                for attr in vr_attributes:
+                    if attr in fields:
+                        available_height_attrs.append(attr)
+                
+                log_message(f"Dostupné výškové atributy v finální vrstvě: {', '.join(available_height_attrs)}", "DEBUG")
+                
+                # Statistiky pro VŠECHNY výškové atributy
+                stats_fields = []
+                for attr in available_height_attrs:
+                    stats_fields.append(f"{attr} FIRST")
+                    stats_fields.append(f"{attr} COUNT")
+                    stats_fields.append(f"{attr} UNIQUE")
+                
+                stats = ";".join(stats_fields) if stats_fields else ""
+                
+                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY výškové atributy
+                # Tím se NESLOUČÍ segmenty s různými výškami!
+                dissolve_fields = ["TARGET_FID", "SC_TYPE"] + available_height_attrs
+                
+                log_message(f"Dissolve fields: {', '.join(dissolve_fields)}", "DEBUG")
+                
+                arcpy.management.Dissolve(
+                    in_features=r"memory\sc_final_sj",
+                    out_feature_class=r"memory\sc_final_dissolved",
+                    dissolve_field=dissolve_fields,
+                    statistics_fields=stats,
+                    multi_part="SINGLE_PART",
+                    unsplit_lines="DISSOLVE_LINES"
+                )
+                
+                sc_final_with_vr = r"memory\sc_final_dissolved"
+                final_count = get_feature_count(sc_final_with_vr)
+                log_message(f"Finální vrstva po dissolve: {final_count} segmentů", "OK")
+                
+                # DEBUG - kontrola SC_TYPE po finálním dissolve
+                fields_final = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
+                if "SC_TYPE" in fields_final:
+                    sc_types_found = set()
+                    with arcpy.da.SearchCursor(sc_final_with_vr, ["SC_TYPE"]) as cursor:
                         for row in cursor:
                             if row[0]:
-                                base_name = f"Z{row[0]}"
-                                # Pokud ještě nemáme unikátní název pro tento Layer, vytvoř ho
-                                if base_name not in unique_layer_names:
-                                    unique_layer_names[base_name] = generate_unique_name(output_gdb, base_name)
-                                row[1] = unique_layer_names[base_name]
-                                cursor.updateRow(row)
-                    
-                    arcpy.AddMessage("Vytvořeno pomocné pole Layer_Z s unikátními názvy")
-                    
-                    # Split by Layer_Z attribute
-                    arcpy.analysis.SplitByAttributes(
-                        Input_Table=centerline_fc,
-                        Target_Workspace=output_workspace,
-                        Split_Fields=[temp_field]
-                    )
-                    
-                    arcpy.AddMessage("✓ Centerline rozdělena podle atributu 'Layer_Z'")
-                    
-                    # DEBUG - výpis všech feature classes PŘED mazáním
-                    arcpy.env.workspace = output_workspace
-                    all_fcs_before = arcpy.ListFeatureClasses()
-                    arcpy.AddMessage(f"DEBUG: Celkem feature classes před cleanup: {len(all_fcs_before)}")
-                    arcpy.AddMessage(f"DEBUG: Seznam všech FC: {', '.join(sorted(all_fcs_before))}")
-                    
-                    # CLEANUP - smazání všech podpůrných vrstev
-                    arcpy.AddMessage("Mažu podpůrné vrstvy...")
-                    
-                    # Seznam všech feature classes v output workspace
-                    arcpy.env.workspace = output_workspace
-                    all_fcs = arcpy.ListFeatureClasses()
-                    
-                    deleted_count = 0
-                    kept_count = 0
-                    for fc in all_fcs:
-                        fc_path = os.path.join(output_workspace, fc)
-                        
-                        # Smaž všechny kromě těch které vznikly splitováním
-                        # Split vytváří názvy přímo podle hodnoty v poli Layer_Z
-                        # Zachováme pouze fc které začínají "Z" (výsledky split s naším prefixem)
-                        if not fc.startswith("Z"):
-                            try:
-                                arcpy.Delete_management(fc_path)
-                                deleted_count += 1
-                                arcpy.AddMessage(f"  Smazáno: {fc}")
-                            except Exception as del_error:
-                                arcpy.AddWarning(f"Nepodařilo se smazat {fc}: {del_error}")
-                        else:
-                            kept_count += 1
-                            arcpy.AddMessage(f"  Zachováno: {fc}")
-                    
-                    arcpy.AddMessage(f"✓ Smazáno {deleted_count} podpůrných vrstev")
-                    arcpy.AddMessage(f"✓ Zachováno {kept_count} výsledných vrstev")
-                    
-                    # Výpis finálních vrstev
-                    arcpy.env.workspace = output_workspace
-                    final_fcs = arcpy.ListFeatureClasses("Z*")
-                    arcpy.AddMessage(f"✓ Finální výstup: {len(final_fcs)} vrstev rozdělených podle 'Layer':")
-                    for final_fc in sorted(final_fcs):
-                        count = int(arcpy.GetCount_management(os.path.join(output_workspace, final_fc))[0])
-                        arcpy.AddMessage(f"  - {final_fc}: {count} prvků")
-                    
+                                sc_types_found.add(row[0])
+                    log_message(f"SC_TYPE po finálním dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
                 else:
-                    arcpy.AddWarning("Pole 'Layer' nebylo nalezeno v centerline - split se neprovede")
-                    arcpy.AddMessage("Dostupná pole: " + ", ".join(centerline_fields))
-                    
-            except Exception as split_error:
-                arcpy.AddWarning(f"Chyba při finálním split a cleanup: {split_error}")
+                    log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po finálním dissolve!", "WARN")
+                
+                arcpy.Delete_management(r"memory\sc_final_sj")
+                
+            except Exception as e:
+                log_message(f"Chyba při finálním připojení atributů: {e}", "ERROR")
+                sc_final_with_vr = sc_cleaned
         else:
-            arcpy.AddMessage("Centerline vrstva nebyla nalezena - split se neprovede")
+            # Pokud nejsou VR bloky, použij jen vyčištěné SC
+            log_message("VR bloky nebyly nalezeny - pokračuji bez výškových atributů", "WARN")
+            sc_final_with_vr = sc_cleaned
+        
+        # ============================================================
+        # FÁZE 9: ROZDĚLENÍ PODLE TYPŮ SC + DETEKCE CHYB
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 9: ROZDĚLENÍ PODLE TYPŮ SC + DETEKCE CHYB", "STEP")
+        log_message("=" * 60, "INFO")
+        
+        final_outputs = []
+        errors_outputs = []
+        
+        if sc_final_with_vr:
+            try:
+                # DEBUG - detailní kontrola SC_TYPE před rozdělením
+                fields = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
+                log_message(f"Dostupná pole před rozdělením: {', '.join(fields)}", "DEBUG")
+                
+                if "SC_TYPE" not in fields:
+                    log_message("CHYBA: SC_TYPE pole NEEXISTUJE v finální vrstvě!", "ERROR")
+                    log_message("Pravděpodobně bylo ztraceno během dissolve operace", "ERROR")
+                    sc_types = [None]
+                else:
+                    # Zjisti dostupné typy SC s počtem
+                    sc_types = set()
+                    sc_type_counts = {}
+                    null_count = 0
+                    
+                    with arcpy.da.SearchCursor(sc_final_with_vr, ["SC_TYPE"]) as cursor:
+                        for row in cursor:
+                            if row[0]:
+                                sc_types.add(row[0])
+                                sc_type_counts[row[0]] = sc_type_counts.get(row[0], 0) + 1
+                            else:
+                                null_count += 1
+                    
+                    if not sc_types:
+                        log_message(f"SC_TYPE pole existuje, ale všechny hodnoty jsou NULL ({null_count} prvků)", "WARN")
+                        log_message("Pravděpodobně bylo pole ztraceno během dissolve", "WARN")
+                        sc_types = [None]
+                    else:
+                        log_message(f"Nalezeno {len(sc_types)} typů SC:", "OK")
+                        for sc_type in sorted(sc_types):
+                            log_message(f"  - {sc_type}: {sc_type_counts[sc_type]} segmentů", "DEBUG")
+                        if null_count > 0:
+                            log_message(f"  - NULL hodnot: {null_count} segmentů", "WARN")
+                
+                # Pro každý typ SC vytvoř samostatnou vrstvu
+                for sc_type in sorted(sc_types):
+                    if sc_type:
+                        log_message("=" * 60, "INFO")
+                        log_message(f"Zpracovávám typ: {sc_type}", "STEP")
+                        
+                        # Export s WHERE clause (místo selection - feature class nepodporuje selection)
+                        if out_prefix:
+                            output_name = f"{out_prefix}{sc_type}"
+                        else:
+                            output_name = f"Z_{sc_type}"
+                        
+                        output_name = generate_unique_name(output_gdb, output_name)
+                        this_output = os.path.join(output_workspace, output_name)
+                        
+                        # WHERE clause s escapovaným názvem pole
+                        field_delimited = arcpy.AddFieldDelimiters(sc_final_with_vr, "SC_TYPE")
+                        where_clause = f"{field_delimited} = '{sc_type}'"
+                        
+                        log_message(f"WHERE: {where_clause}", "DEBUG")
+                        
+                        arcpy.conversion.ExportFeatures(
+                            in_features=sc_final_with_vr,
+                            out_features=this_output,
+                            where_clause=where_clause
+                        )
+                        
+                        final_count = get_feature_count(this_output)
+                        log_message(f"Exportováno: {output_name} ({final_count} segmentů)", "OK")
+                        
+                        if final_count == 0:
+                            log_message(f"VAROVÁNÍ: Žádné segmenty pro {sc_type}!", "WARN")
+                            continue
+                        
+                        final_outputs.append((this_output, sc_type))
+                        
+                        # Detekce chyb (segmenty s více bloky S RŮZNÝMI hodnotami)
+                        # Použij dynamické VR atributy místo hardcoded HEIGHT_ATTRIBUTES
+                        if vr_circles and arcpy.Exists(vr_circles):
+                            vr_attributes = get_vr_attributes(vr_circles)
+                        else:
+                            vr_attributes = []
+                        
+                        fields = [f.name for f in arcpy.ListFields(this_output)]
+                        unique_field = None
+                        for attr in vr_attributes:
+                            if attr in fields:
+                                unique_field = attr
+                                break
+                        
+                        if unique_field:
+                            count_field_name = f"COUNT_{unique_field}"
+                            unique_field_name = f"UNIQUE_{unique_field}"
+                            
+                            if count_field_name in fields and unique_field_name in fields:
+                                # Spočítej chyby ručně
+                                manual_errors = 0
+                                with arcpy.da.SearchCursor(this_output, [count_field_name, unique_field_name]) as cursor:
+                                    for row in cursor:
+                                        if row[0] is not None and row[0] > 0 and row[1] is not None and row[1] > 1:
+                                            manual_errors += 1
+                                
+                                if manual_errors > 0:
+                                    # WHERE clause pro chyby
+                                    where_errors = f"{count_field_name} IS NOT NULL AND {count_field_name} > 0 AND {unique_field_name} > 1"
+                                    
+                                    if out_prefix:
+                                        errors_name = f"{out_prefix}{sc_type}_Errors"
+                                    else:
+                                        errors_name = f"Z_{sc_type}_Errors"
+                                    
+                                    errors_name = generate_unique_name(output_gdb, errors_name)
+                                    this_errors = os.path.join(output_workspace, errors_name)
+                                    
+                                    arcpy.conversion.ExportFeatures(
+                                        in_features=this_output,
+                                        out_features=this_errors,
+                                        where_clause=where_errors
+                                    )
+                                    
+                                    log_message(f"⚠️ {manual_errors} chyb → {errors_name}", "WARN")
+                                    errors_outputs.append((this_errors, sc_type))
+                                else:
+                                    log_message("✅ Žádné chyby", "OK")
+                    else:
+                        # SC_TYPE bylo None - export jako jednu vrstvu
+                        if out_prefix:
+                            output_name = f"{out_prefix}VyskovaRegulaceNaLinii_l"
+                        else:
+                            output_name = "Z_VyskovaRegulaceNaLinii_l"
+                        
+                        output_name = generate_unique_name(output_gdb, output_name)
+                        this_output = os.path.join(output_workspace, output_name)
+                        
+                        arcpy.CopyFeatures_management(sc_final_with_vr, this_output)
+                        
+                        final_count = get_feature_count(this_output)
+                        log_message(f"Exportováno: {output_name} ({final_count} segmentů) - bez rozdělení typů", "OK")
+                        final_outputs.append((this_output, "všechny_typy"))
+                
+                # FILTRACE ATRIBUTŮ PRO VŠECHNY VÝSTUPNÍ VRSTVY
+                # (OZNACENI, NAZEV_BLOK, DRUH_UP, DRUH_INFO, NP_MAX, NUP_MAX, RIMSA_MAX, VYSKA_VB, VYSKA_VB_I, DOK_NAZEV)
+                allowed_fields = [
+                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", 
+                    "NP_MAX", "NUP_MAX", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV",
+                    "SC_TYPE" # Ponecháme i identifikaci typu
+                ]
+                
+                log_message("Provádím čištění atributů ve výstupních vrstvách...", "STEP")
+                for output_path, _ in final_outputs:
+                    try:
+                        # Získej seznam všech polí
+                        all_fields = [f.name for f in arcpy.ListFields(output_path)]
+                        
+                        # Pole k smazání = Všechna - (Povolená + Systémová)
+                        fields_to_delete = []
+                        for field in all_fields:
+                            field_upper = field.upper()
+                            name_only_upper = field.split('.')[-1].upper()
+                            
+                            # Přeskoč systémová pole (OID, Shape, Length, Area atd.) - ROBUSTNĚJŠÍ CHECK
+                            if name_only_upper.startswith("SHAPE") or name_only_upper in ["OBJECTID", "FID", "OID", "GLOBALID"]:
+                                continue
+                            
+                            # Pokud pole není v povolených (case insensitive check), smaž ho
+                            is_allowed = False
+                            for allowed in allowed_fields:
+                                if field_upper == allowed.upper():
+                                    is_allowed = True
+                                    break
+                            
+                            if not is_allowed:
+                                fields_to_delete.append(field)
+                        
+                        if fields_to_delete:
+                            arcpy.management.DeleteField(output_path, fields_to_delete)
+                            log_message(f"Vyčištěno {len(fields_to_delete)} polí z {os.path.basename(output_path)}", "DEBUG")
+                    except Exception as e:
+                        log_message(f"Chyba při čištění atributů u {os.path.basename(output_path)}: {e}", "WARN")
 
-        arcpy.AddMessage(f"Hotovo! Exportováno {exported_count} vrstev.")
-        arcpy.AddMessage("✓ Všechny podpůrné vrstvy smazány, zachovány pouze finální vrstvy rozdělené podle 'Layer'")
+            except Exception as e:
+                log_message(f"Chyba při rozdělování podle typů SC: {e}", "ERROR")
+
+        # ============================================================
+        # EXPORT OSTATNÍCH VRSTEV (VR na bod)
+        # ============================================================
+        if vr_na_bod_layer and arcpy.Exists(vr_na_bod_layer):
+            try:
+                if out_prefix:
+                    vr_point_name = f"{out_prefix}302110_BL_VR_na_bod"
+                else:
+                    vr_point_name = "Z_302110_BL_VR_na_bod" # Předpona Z_ pro konzistenci
+                
+                vr_point_name = generate_unique_name(output_gdb, vr_point_name)
+                vr_point_output = os.path.join(output_workspace, vr_point_name)
+                
+                arcpy.CopyFeatures_management(vr_na_bod_layer, vr_point_output)
+                
+                # Aplikovat stejný filtr atributů i na bodovou vrstvu?
+                # Uživatel psal "a atributy tech vyskovych car zacisteny aby mely pouze..."
+                # Předpokládáme, že bodová vrstva ("se kterym nic nedleam ze") má zůstat jak je, NEBO se jí má týkat taky?
+                # "atributy tech vyskovych car" -> zřejmě linií.
+                # Ale pro jistotu vyčistíme i bodovku, pokud obsahuje ty dynamické bloky, dává to smysl.
+                
+                # Zkusíme vyčistit i bodovku
+                try:
+                    all_fields = [f.name for f in arcpy.ListFields(vr_point_output)]
+                    fields_to_delete = []
+                    for field in all_fields:
+                        field_upper = field.upper()
+                        name_only_upper = field.split('.')[-1].upper()
+                        
+                        if name_only_upper.startswith("SHAPE") or name_only_upper in ["OBJECTID", "FID", "OID", "GLOBALID"]:
+                            continue
+                        is_allowed = False
+                        for allowed in allowed_fields: 
+                            if field_upper == allowed.upper():
+                                is_allowed = True
+                                break
+                        if not is_allowed:
+                            fields_to_delete.append(field)
+                    
+                    if fields_to_delete:
+                        arcpy.management.DeleteField(vr_point_output, fields_to_delete)
+                except:
+                    pass 
+
+                point_count = get_feature_count(vr_point_output)
+                log_message(f"Export VR na bod: {vr_point_name} ({point_count} prvků)", "OK")
+                final_outputs.append((vr_point_output, "VR_bod"))
+            except Exception as e:
+                log_message(f"Chyba při exportu VR na bod: {e}", "WARN")
+
+        # ============================================================
+        # FÁZE 10: CLEANUP
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("FÁZE 10: CLEANUP DOČASNÝCH VRSTEV", "STEP")
+        
+        # Smazání perzistentní vrstvy kruhů (PL_302210_BL_VR_na_linii_circles), která byla vytvořena v GDB
+        if vr_circles and arcpy.Exists(vr_circles):
+             try:
+                 arcpy.Delete_management(vr_circles)
+                 log_message(f"Smazána pomocná vrstva kruhů: {os.path.basename(vr_circles)}", "DEBUG")
+             except Exception as e:
+                 log_message(f"Nepodařilo se smazat vrstvu kruhů: {e}", "WARN")
+        log_message("=" * 60, "INFO")
+        
+        # Export rozhraní pro kontrolu (před cleanup)
+        if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+            pass
+            # POŽADAVEK: "ve vysledne gdb byly pouze typy stavebnich car"
+            # Debug vrstvy vypínáme pro finální verzi.
+            # try:
+            #     if out_prefix:
+            #         rozhrani_name = f"{out_prefix}Rozhrani_body_kontrola"
+            #     else:
+            #         rozhrani_name = "Z_Rozhrani_body_kontrola"
+            #     
+            #     rozhrani_name = generate_unique_name(output_gdb, rozhrani_name)
+            #     rozhrani_output = os.path.join(output_workspace, rozhrani_name)
+            #     
+            #     arcpy.CopyFeatures_management(rozhrani_body_all, rozhrani_output)
+            #     rozhrani_count = get_feature_count(rozhrani_output)
+            #     log_message(f"Export bodů rozhraní: {rozhrani_name} ({rozhrani_count} bodů)", "DEBUG")
+            # except Exception as e:
+            #     log_message(f"Nepodařilo se exportovat body rozhraní: {e}", "WARN")
+
+        
+        # Export CAD linie rozhraní pro kontrolu - VYPÍNÁME
+        if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
+            pass
+            # try:
+            #     if out_prefix:
+            #         rozhrani_line_name = f"{out_prefix}Rozhrani_linie_CAD"
+            #     else:
+            #         rozhrani_line_name = "Z_Rozhrani_linie_CAD"
+            #     
+            #     rozhrani_line_name = generate_unique_name(output_gdb, rozhrani_line_name)
+            #     rozhrani_line_output = os.path.join(output_workspace, rozhrani_line_name)
+            #     
+            #     arcpy.CopyFeatures_management(vr_rozhrani_layer, rozhrani_line_output)
+            #     rozhrani_line_count = get_feature_count(rozhrani_line_output)
+            #     log_message(f"Export CAD linií rozhraní: {rozhrani_line_name} ({rozhrani_line_count} linií)", "DEBUG")
+            # except Exception as e:
+            #     log_message(f"Nepodařilo se exportovat CAD linie rozhraní: {e}", "WARN")
+
+        
+        # Seznam memory vrstev k smazání
+        memory_layers = [
+            r"memory\sc_all_merged",
+            r"memory\rozhrani_body_cad",
+            r"memory\rozhrani_all",
+            r"memory\sc_split_cad",
+            r"memory\sc_with_vr",
+            r"memory\sc_with_vr_temp",
+            r"memory\sc_dissolve_clean",
+            r"memory\sc_final_split",
+            r"memory\sc_cleaned"
+        ]
+        
+        deleted = 0
+        for mem_layer in memory_layers:
+            if arcpy.Exists(mem_layer):
+                try:
+                    arcpy.Delete_management(mem_layer)
+                    deleted += 1
+                except:
+                    pass
+        
+        log_message(f"Smazáno {deleted} dočasných vrstev z paměti", "OK")
+        
+        # Smazání pomocných vrstev z output workspace
+        try:
+            if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
+                arcpy.Delete_management(vr_rozhrani_layer)
+            # Smazání původních SC vrstev (jsou nahrazeny finálními výstupy s SC_TYPE)
+            for sc_layer in sc_layers:
+                if arcpy.Exists(sc_layer):
+                    arcpy.Delete_management(sc_layer)
+        except:
+            pass
+
+        # ============================================================
+        # SHRNUTÍ
+        # ============================================================
+        log_message("=" * 60, "INFO")
+        log_message("HOTOVO!", "OK")
+        log_message("=" * 60, "INFO")
+        
+        if final_outputs:
+            log_message(f"Vytvořeno {len(final_outputs)} výstupních vrstev:", "OK")
+            for output_path, type_name in final_outputs:
+                log_message(f"  • {os.path.basename(output_path)}", "OK")
+        
+        if errors_outputs:
+            log_message(f"Vrstvy s chybami ({len(errors_outputs)}):", "WARN")
+            for error_path, type_name in errors_outputs:
+                log_message(f"  • {os.path.basename(error_path)}", "WARN")
+        
+        log_message(f"Output GDB: {output_gdb}", "INFO")
+

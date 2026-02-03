@@ -1084,28 +1084,91 @@ class HeightRegulationImport(object):
                 fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
                 available_height_attrs = [attr for attr in vr_attributes if attr in fields]
                 
-                if available_height_attrs and rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                if available_height_attrs:
                     # 1. Vytvoř buffer kolem rozhraní (to jsou bariéry)
-                    # Tolerance 5cm - pokud se segmenty dotýkají blíž než 5cm od rozhraní, považujeme to za přerušení
-                    try:
-                        arcpy.analysis.Buffer(rozhrani_body_all, r"memory\rozhrani_buffer", "0.05 Meters")
-                        # Načti buffer jako geometrii pro rychlý test
-                        barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
-                    except Exception as e:
-                        log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
-                        barrier_geom = None
+                    # Používáme POUZE rozhrani_body (z CADu), nikoliv rozhrani_body_all (které obsahuje i dogenerované)
+                    # Chceme, aby se atributy přelily přes dogenerovaná rozhraní (která vznikla jen proto, že tam chyběla data),
+                    # ale aby se zastavily o skutečná CAD rozhraní.
+                    
+                    barrier_geom = None
+                    barrier_source = None
+                    
+                    if rozhrani_body and arcpy.Exists(rozhrani_body):
+                        barrier_source = rozhrani_body
+                    elif vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
+                         # Fallback na linie, kdyby body nebyly (nemělo by nastat)
+                        barrier_source = vr_rozhrani_layer
+                    
+                    if barrier_source:
+                        try:
+                            # Tolerance 2cm (trochu víc než snap 1cm)
+                            arcpy.analysis.Buffer(barrier_source, r"memory\rozhrani_buffer", "0.02 Meters")
+                            # Načti buffer jako geometrii pro rychlý test
+                            if int(arcpy.GetCount_management(r"memory\rozhrani_buffer")[0]) > 0:
+                                barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
+                        except Exception as e:
+                            log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
+                            barrier_geom = None
+                    else:
+                        log_message("Žádná CAD rozhraní - propagace poběží bez bariér", "INFO")
 
                     # 2. Načti segmenty
-                    # OID -> {geom, attrs, has_data}
+                    # OID -> {geom, attrs, has_data, orig_fid, sc_type}
                     segments_data = {}
                     
-                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID", "SHAPE@"] + available_height_attrs) as cursor:
+                    # Zkontrolujeme pole
+                    fields_in_sc = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                    
+                    has_orig_fid_field = "ORIG_FID" in fields_in_sc
+                    has_sc_type_field = "SC_TYPE" in fields_in_sc
+                    
+                    cursor_fields = ["OBJECTID", "SHAPE@"] + available_height_attrs
+                    if has_orig_fid_field: cursor_fields.append("ORIG_FID")
+                    if has_sc_type_field: cursor_fields.append("SC_TYPE")
+                    
+                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", cursor_fields) as cursor:
                         for row in cursor:
                             oid = row[0]
                             geom = row[1]
-                            attrs = list(row[2:])
-                            has_data = any(a is not None for a in attrs)
-                            segments_data[oid] = {"geom": geom, "attrs": attrs, "has_data": has_data}
+                            attr_len = len(available_height_attrs)
+                            attrs = list(row[2:2+attr_len])
+                            
+                            # Parsuj extra fieldy
+                            current_idx = 2 + attr_len
+                            
+                            orig_fid = -1
+                            if has_orig_fid_field:
+                                orig_fid = row[current_idx]
+                                current_idx += 1
+                                
+                            sc_type = None
+                            if has_sc_type_field:
+                                raw_type = row[current_idx]
+                                if raw_type:
+                                    sc_type = str(raw_type).strip().lower() # Normalizace pro porovnání
+                                else:
+                                    sc_type = None
+                                current_idx += 1
+                            
+                            # Determine has_data, strictly excluding ORIG_FID or generic fields
+                            # attrs list corresponds to available_height_attrs
+                            has_real_data = False
+                            for idx, attr_val in enumerate(attrs):
+                                field_name = available_height_attrs[idx]
+                                # Ignorujeme technická pole pro určení, zda má segment "data" k propagaci
+                                if "ORIG_FID" in field_name or "SC_TYPE" in field_name or "TARGET_FID" in field_name:
+                                    continue
+                                if attr_val is not None:
+                                    has_real_data = True
+                                    break
+                            
+                            segments_data[oid] = {
+                                "geom": geom, 
+                                "attrs": attrs, 
+                                "has_data": has_real_data, 
+                                "orig_fid": orig_fid,
+                                "sc_type": sc_type
+                            }
 
                     # 3. Iterativní propagace
                     max_iterations = 10
@@ -1121,34 +1184,76 @@ class HeightRegulationImport(object):
                         if not null_segments:
                             break
                             
+                        log_message(f"Iterace {i+1}: Segmentů bez dat: {len(null_segments)}, s daty: {len(filled_segments)}", "DEBUG")
+
                         # Pro každý prázdný segment
                         for null_oid, null_info in null_segments.items():
                             null_geom = null_info["geom"]
+                            null_fid = null_info["orig_fid"]
+                            null_type = null_info["sc_type"]
                             
                             # Najdi souseda s daty
-                            # Optimalizace: nejdřív check extent? Prozatím brute-force over filled (pro malé počty OK, pro velké pomalé)
-                            # Pro zrychlení použijeme Index nebo jen 'touches'
-                            
                             candidate_attrs = None
                             
                             for fill_oid, fill_info in filled_segments.items():
                                 fill_geom = fill_info["geom"]
+                                fill_fid = fill_info["orig_fid"]
+                                fill_type = fill_info["sc_type"]
                                 
+                                # Rychlý check disjoint (bounding box) - jen pro orientaci, distanceTo řeší vše
                                 if null_geom.disjoint(fill_geom):
-                                    continue
+                                    pass 
+
+                                # Check distance (tolerance 5cm pro napojení)
+                                dist = null_geom.distanceTo(fill_geom)
+                                
+                                if dist < 0.05: 
+                                    # Jsou propojené (nebo skoro)
+                                    # log_message(f"  > OID {null_oid} (Type '{null_type}', FID {null_fid}) blízko OID {fill_oid} (Type '{fill_type}', FID {fill_fid}) (dist={dist:.4f}m)", "DEBUG")
                                     
-                                if null_geom.touches(fill_geom):
-                                    # Mají společný bod
-                                    # Získej průnik (bod dotyku)
-                                    touch_point = null_geom.intersect(fill_geom, 1) # 1 = bod
+                                    # Kde se dotýkají? 
+                                    connection_point = None
+                                    start_pt = null_geom.firstPoint
+                                    if fill_geom.distanceTo(start_pt) < 0.05:
+                                        connection_point = start_pt
+                                    else:
+                                        end_pt = null_geom.lastPoint
+                                        if fill_geom.distanceTo(end_pt) < 0.05:
+                                            connection_point = end_pt
+                                    
+                                    if not connection_point:
+                                        connection_point = null_geom.firstPoint
                                     
                                     # Je tento bod chráněn bariérou?
                                     is_blocked = False
-                                    if barrier_geom and touch_point:
-                                        if not barrier_geom.disjoint(touch_point):
-                                            is_blocked = True
+                                    if barrier_geom and connection_point:
+                                        if not barrier_geom.disjoint(connection_point):
+                                            # Bariéra nalezena.
+                                            
+                                            # LOGIKA ODBLOKOVÁNÍ:
+                                            # 1. Pokud jsou to RŮZNÉ TYPY čar (např. roh bloku), bariéru ignorujeme.
+                                            type_match = False
+                                            if null_type is not None and fill_type is not None:
+                                                 if null_type == fill_type:
+                                                     type_match = True
+                                            elif null_type is None and fill_type is None:
+                                                type_match = True # Oba None považujeme za stejné (nedefinované)
+                                            
+                                            if not type_match:
+                                                is_blocked = False
+                                                # log_message(f"    - Bariéra ignorována (Různé SC_TYPE: '{null_type}' vs '{fill_type}')", "DEBUG")
+                                            
+                                            # 2. Fallback na ORIG_FID 
+                                            elif null_fid != -1 and fill_fid != -1 and null_fid != fill_fid:
+                                                is_blocked = False
+                                                # log_message(f"    - Bariéra ignorována (Různé ORIG_FID: {null_fid} vs {fill_fid})", "DEBUG")
+                                            
+                                            else:
+                                                is_blocked = True
+                                                # log_message(f"    - Spojení blokováno bariérou (Stejný typ '{null_type}' i FID {null_fid})", "DEBUG")
                                     
                                     if not is_blocked:
+                                        # log_message(f"    - Spojení OK -> Přebírám atributy", "DEBUG")
                                         candidate_attrs = fill_info["attrs"]
                                         break # Našli jsme dárce
                             
@@ -1161,6 +1266,7 @@ class HeightRegulationImport(object):
                             log_message(f"Iterace {i+1}: Propagováno {len(updates)} segmentů", "DEBUG")
                             
                             # Update DB
+                            updated_sample_oid = None
                             with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
                                 for row in cursor:
                                     oid = row[0]
@@ -1169,6 +1275,14 @@ class HeightRegulationImport(object):
                                         for k, val in enumerate(new_attrs):
                                             row[k+1] = val
                                         cursor.updateRow(row)
+                                        if updated_sample_oid is None:
+                                            updated_sample_oid = oid
+                                        
+                            # VERIFICATION READ
+                            if updated_sample_oid is not None:
+                                with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs, where_clause=f"OBJECTID = {updated_sample_oid}") as verify_cursor:
+                                    for v_row in verify_cursor:
+                                        log_message(f"VERIFICATION READ for OID {updated_sample_oid}: {v_row[1:]}", "DEBUG")
                                         
                             # Update local cache
                             for oid, new_attrs in updates.items():
