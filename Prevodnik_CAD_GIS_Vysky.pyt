@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-MADASPRU CAD Import - Výšky v2
-Metoda: SplitLineAtPoint (bez buffer/centerline)
-Logika převzata z HeightRegulationLine.ipynb
-"""
 import arcpy
 import os
 
@@ -137,7 +132,7 @@ class Toolbox(object):
 
 class HeightRegulationImport(object):
     def __init__(self):
-        self.label = "Import CAD vrstev (Výšky) - SplitLine metoda"
+        self.label = "Import CAD vrstev (Výšky)"
         self.alias = "heightRegulationImport"
         self.canRunInBackground = False
 

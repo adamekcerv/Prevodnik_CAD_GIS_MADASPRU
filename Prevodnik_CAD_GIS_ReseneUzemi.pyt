@@ -1591,7 +1591,24 @@ class ExportLayer(object):
 
     def getParameterInfo(self):
         self.parameters[0].filter.list = ["dwg", "dxf", "dgn"]
-        self.parameters[2].filter.list = ["Local Database", "Remote Database"]
+        
+        # Output GDB filter
+        self.parameters[2].filter.list = ["Local Database"]
+        
+        # Nastavení výchozí hodnoty - aktuální projekt GDB nebo C:\GIS_Data\Output.gdb
+        try:
+            # Zkus použít Default.gdb z aktuálního projektu
+            aprx = arcpy.mp.ArcGISProject("CURRENT")
+            self.parameters[2].value = aprx.defaultGeodatabase
+        except:
+            # Fallback - pokud není projekt nebo selže
+            try:
+                default_path = r"C:\GIS_Data\Output.gdb"
+                if arcpy.Exists(default_path):
+                    self.parameters[2].value = default_path
+            except:
+                pass
+
         self.parameters[1].enabled = False
         return self.parameters
 

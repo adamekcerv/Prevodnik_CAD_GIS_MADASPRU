@@ -25,7 +25,7 @@ vysky_path = os.path.join(current_dir, "Prevodnik_CAD_GIS_Vysky.pyt")
 vysky_globals = {}
 with open(vysky_path, 'r', encoding='utf-8') as f:
     exec(f.read(), vysky_globals)
-SimpleCADImport = vysky_globals['SimpleCADImport']
+HeightRegulationImport = vysky_globals['HeightRegulationImport']
 
 
 class Toolbox(object):
@@ -35,4 +35,4 @@ class Toolbox(object):
         self.alias = "MADASPRU_CAD_Import"
         
         # Oba nástroje pod jednou střechou
-        self.tools = [ExportLayer, SimpleCADImport]
+        self.tools = [ExportLayer, HeightRegulationImport]
