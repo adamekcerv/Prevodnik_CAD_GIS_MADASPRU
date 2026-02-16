@@ -1043,6 +1043,40 @@ class HeightRegulationImport(object):
                     match_option="INTERSECT"
                 )
                 
+                # OPRAVA: Přenést atributy z napojovaných polí (s suffixem _1) do hlavních polí
+                # Protože target features už ta pole mají (ale prázdná), ArcGIS je při joinu přejmenuje (např. RIMSA_MAX_1)
+                # Musíme je zkopírovat zpět.
+                
+                # Zjisti skutečné názvy polí v toolu
+                sj_fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                
+                # Seznam atributů k opravě
+                attrs_to_fix = [
+                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO",
+                    "NP_MAX", "NUP_MAX", "RIMSA_MAX", 
+                    "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
+                ]
+                
+                # log_message("Opravuji hodnoty atributů po Spatial Join...", "DEBUG")
+                
+                for attr in attrs_to_fix:
+                    # Hledáme varianty s suffixem (např. RIMSA_MAX_1)
+                    source_field = None
+                    for f in sj_fields:
+                        if f == f"{attr}_1" or f == f"{attr}_12": # _12 může vzniknout pokud už tam _1 bylo
+                            source_field = f
+                            break
+                    
+                    if source_field and attr in sj_fields:
+                        # Přenést data z source_field do attr
+                        # log_message(f"  - Přenáším {source_field} -> {attr}", "DEBUG")
+                        with arcpy.da.UpdateCursor(r"memory\sc_final_sj", [attr, source_field]) as cursor:
+                            for row in cursor:
+                                # Pokud je hlavní pole prázdné a vedlejší má hodnotu -> update
+                                if row[0] is None and row[1] is not None:
+                                    row[0] = row[1]
+                                    cursor.updateRow(row)
+                
                 sj_count = get_feature_count(r"memory\sc_final_sj")
                 log_message(f"SpatialJoin výsledek: {sj_count} záznamů", "DEBUG")
                 

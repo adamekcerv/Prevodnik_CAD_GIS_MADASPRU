@@ -776,22 +776,25 @@ class CadFile(object):
 
             for src_base, target_name in FIELD_MAPPING.items():
                 # Zkusíme různé varianty názvu ve zdroji (s suffixem _1, s prefixem VR_, atd.)
+                # Zkusíme různé varianty názvu ve zdroji (s suffixem _1, s prefixem VR_, atd.)
+                # Priorita: 1. Suffix _1 (z joinu, pokud existuje kolize), 2. Prefix VR_, 3. Základ
                 possible_src_names = [
-                    src_base, 
                     f"{src_base}_1", 
+                    f"VR_{src_base}_1",
                     f"VR_{src_base}", 
-                    f"VR_{src_base}_1"
+                    src_base
                 ]
                 
                 # Specialita pro NUP/NPU překlepy - pokud hledáme NPU_MAX, zkusíme i NUP_MAX varianty
                 if src_base == "NPU_MAX":
-                    possible_src_names.extend(["NUP_MAX", "NUP_MAX_1", "VR_NUP_MAX", "VR_NUP_MAX_1"])
+                    possible_src_names.extend(["NUP_MAX_1", "VR_NUP_MAX_1", "VR_NUP_MAX", "NUP_MAX"])
 
                 found_src_name = None
                 
                 for name in possible_src_names:
                     if name in temp_fields_map:
                         found_src_name = name
+                        # arcpy.AddMessage(f"[add_vyska_attributes] DEBUG: Pro cíl '{target_name}' nalezen zdroj '{found_src_name}'")
                         break
                 
                 if found_src_name:
@@ -1530,22 +1533,22 @@ class CadFile(object):
             "Z_2021_UlicniProstranstvi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "uliční prostranství",
-                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI"]
+                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI"] + VYSKOVA_REGULACE_ATTRS
             },
             "Z_2031_StavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "stavební blok",
-                "ATTRS": ["OZNACENI"]
+                "ATTRS": ["OZNACENI"] + VYSKOVA_REGULACE_ATTRS
             },
             "Z_2041_NestavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "nestavební blok",
-                "ATTRS": ["OZNACENI"]
+                "ATTRS": ["OZNACENI"] + VYSKOVA_REGULACE_ATTRS
             },
             "Z_2051_JinaCastUzemi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "jiná část území",
-                "ATTRS": ["PODTYP", "OZNACENI"]
+                "ATTRS": ["PODTYP", "OZNACENI"] + VYSKOVA_REGULACE_ATTRS
             },
             "Z_3011_StavebniCara": {
                 "SKNAZEV": "regulace struktury",
