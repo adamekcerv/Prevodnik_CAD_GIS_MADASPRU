@@ -438,10 +438,25 @@ class CadFile(object):
                             # Analýza "within" i bez bodu
                             self.add_within_analysis(main_analysis_fc, main_polygon_fc, output_workspace, out_prefix)
                     
-                    # Smazat původní polygonovou vrstvu, protože máme už tu s body
+                    # Smazat původní polygonová vrstva (již máme rozdělené) - ZDE OPRAVA: Původní kód mazal ZResene_uzemi_PL, ale v logu vidíme, že Z200000... zůstává
                     try:
-                        arcpy.Delete_management(polygon_fc)
-                        arcpy.AddMessage(f"[export_layers] Smazána původní polygonová vrstva: {os.path.basename(polygon_fc)}")
+                        if polygon_fc in exported_layers:
+                            # polygon_fc je ZResene_uzemi_PL - to chceme smazat, protože máme splitnuté části
+                            exported_layers.remove(polygon_fc)
+                            arcpy.Delete_management(polygon_fc)
+                            arcpy.AddMessage(f"[export_layers] Smazána původní polygonová vrstva: {os.path.basename(polygon_fc)}")
+
+                        # Smazat Z200000_PL_Cast_uzemi_LN - pomocná linie pro tvorbu polygonů
+                        # Musíme ji najít v exported_layers, protože má dynamický název (suffix _LN_20 atd.)
+                        lines_to_remove = []
+                        for layer in exported_layers:
+                            if "200000_PL_Cast_uzemi" in layer:
+                                lines_to_remove.append(layer)
+                        
+                        for layer in lines_to_remove:
+                            exported_layers.remove(layer)
+                            arcpy.Delete_management(layer)
+                            arcpy.AddMessage(f"[export_layers] Smazána pomocná linie: {os.path.basename(layer)}")
                     except Exception as e:
                         arcpy.AddWarning(f"[export_layers] Nelze smazat původní polygon: {e}")
                     
@@ -461,6 +476,13 @@ class CadFile(object):
                         main_analysis_fc, output_workspace, out_prefix
                     )
                     if split_results:
+                        # Pokud proběhl split, POUZE tyto vrstvy jsou finální výsledek (kromě chyb)
+                        # Odstraníme předchozí "hlavní" polygony ze seznamu exportovaných, pokud tam jsou
+                        if updated_main_polygon_fc and updated_main_polygon_fc in exported_layers:
+                            exported_layers.remove(updated_main_polygon_fc)
+                        if main_polygon_fc and main_polygon_fc in exported_layers:
+                            exported_layers.remove(main_polygon_fc)
+                            
                         exported_layers.extend(split_results)
                         
                         # SAMOSTATNÝ SPATIAL JOIN VÝŠKOVÝCH BODŮ ke splitnutým polygonům
@@ -499,6 +521,8 @@ class CadFile(object):
                     # Smazat bodové vrstvy - již se nepoužívají
                     for point_fc in point_layers_for_join:
                         try:
+                            if point_fc in exported_layers:
+                                exported_layers.remove(point_fc) # Odstranit ze seznamu výstupů
                             arcpy.Delete_management(point_fc)
                             arcpy.AddMessage(f"[export_layers] Smazána bodová vrstva: {os.path.basename(point_fc)}")
                         except Exception as e:
@@ -507,6 +531,9 @@ class CadFile(object):
                     # Smazat výškové centroidy - již se nepoužívají
                     if vyska_centroids_fc:
                         try:
+                            # Centroidy nebyly v exported_layers, ale pro jistotu
+                            if vyska_centroids_fc in exported_layers:
+                                exported_layers.remove(vyska_centroids_fc)
                             arcpy.Delete_management(vyska_centroids_fc)
                             arcpy.AddMessage(f"[export_layers] Smazána bodová vrstva výškových centroidů: {os.path.basename(vyska_centroids_fc)}")
                         except Exception as e:
@@ -515,6 +542,8 @@ class CadFile(object):
                     # Smazat bod Resene_uzemi - již se nepoužívá
                     if resene_point_fc:
                         try:
+                            if resene_point_fc in exported_layers:
+                                exported_layers.remove(resene_point_fc)
                             arcpy.Delete_management(resene_point_fc)
                             arcpy.AddMessage(f"[export_layers] Smazán bod Resene_uzemi: {os.path.basename(resene_point_fc)}")
                         except Exception as e:
@@ -526,6 +555,8 @@ class CadFile(object):
                     # Smazat původní výškové kruhy (Z302310_BL_VR_na_plochu_LN)
                     if vyska_circles_fc:
                         try:
+                            if vyska_circles_fc in exported_layers:
+                                exported_layers.remove(vyska_circles_fc)
                             arcpy.Delete_management(vyska_circles_fc)
                             arcpy.AddMessage(f"[export_layers] Smazána původní vrstva výškových kruhů: {os.path.basename(vyska_circles_fc)}")
                         except Exception as e:
@@ -549,6 +580,9 @@ class CadFile(object):
                     # Smazat ZResene_uzemi_Polygon_with_Points (pokud existuje)
                     if updated_main_polygon_fc:
                         try:
+                            # Zde je klíčová oprava - odstranit ze seznamu !
+                            if updated_main_polygon_fc in exported_layers:
+                                exported_layers.remove(updated_main_polygon_fc)
                             arcpy.Delete_management(updated_main_polygon_fc)
                             arcpy.AddMessage(f"[export_layers] Smazána pomocná vrstva: {os.path.basename(updated_main_polygon_fc)}")
                         except Exception as e:
@@ -557,11 +591,53 @@ class CadFile(object):
                     # Smazat rozhraní výškových kruhů (Z302311_PL_VR_na_plochu_rozhrani_LN)
                     if vyska_rozhrani_fc:
                         try:
+                            if vyska_rozhrani_fc in exported_layers:
+                                exported_layers.remove(vyska_rozhrani_fc)
                             arcpy.Delete_management(vyska_rozhrani_fc)
                             arcpy.AddMessage(f"[export_layers] Smazána vrstva rozhraní výškových kruhů: {os.path.basename(vyska_rozhrani_fc)}")
                         except Exception as e:
                             arcpy.AddWarning(f"[export_layers] Nelze smazat rozhraní: {e}")
                     
+                    # 7. Finalizace atributů pro ostatní vrstvy (linie, body co nešly do spatial joinu)
+                    # Projdeme všechny vrstvy co zbyly v exported_layers a pokud to nejsou ty co jsme už řešili (splitnuté polygony),
+                    # tak pro ně taky zavoláme finalize_layer_attributes
+                    
+                    arcpy.AddMessage("[export_layers] Finalizuji atributy pro ostatní vrstvy...")
+                    for layer in exported_layers:
+                        # Přeskočit už zpracované (splitnuté polygony to nejsou, ty jsou nové FC, ale v exported_layers mohou být jiné)
+                        # Zkusíme finalizovat vše co zbylo - finalize_layer_attributes si poradí (buď najde definici nebo warning)
+                        
+                        # Ale pozor, nechceme to volat na vrstvy co už byly smazány (ale ty by neměly být v seznamu)
+                        if arcpy.Exists(layer):
+                           try:
+                               basename = os.path.basename(layer)
+                               # Pokud to má formát Zxxxxxx_..., tak to zkusíme použít
+                               # Hledáme kód 201110 atd.
+                               potential_code = None
+                               
+                               # Varianta 1: Zkratka out_prefix (Z) + kód 6 číslic
+                               if out_prefix and basename.startswith(out_prefix) and len(basename) >= len(out_prefix) + 6:
+                                   check_code = basename[len(out_prefix):len(out_prefix)+6]
+                                   if check_code.isdigit():
+                                       potential_code = check_code
+                                
+                               # Varianta 2: Bez prefixu nebo jiný formát - zkusíme najít první 6číslí
+                               if not potential_code:
+                                   import re
+                                   match = re.search(r"\d{6}", basename)
+                                   if match:
+                                       potential_code = match.group(0)
+                               
+                               if potential_code:
+                                   # Máme kód, použijeme ho jako "layer_name" pro detekci
+                                   self.finalize_layer_attributes(layer, potential_code)
+                               else:
+                                   # Fallback - pošleme celý název
+                                   self.finalize_layer_attributes(layer, basename)
+                                   
+                           except Exception as e:
+                               arcpy.AddWarning(f"[export_layers] Chyba při finalizaci {basename}: {e}")
+
                     arcpy.AddMessage("[export_layers] ✓ Finální cleanup dokončen")
                     
             except Exception as e:
@@ -677,68 +753,106 @@ class CadFile(object):
                 match_option="CONTAINS"
             )
             
-            # Seznam výškových atributů k přenosu
-            vyska_fields = [
-                "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
-                "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
-                "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D"
-            ]
+            # Slovník mapování: Název pole v CADu/Výškopisu -> Název pole v GIS Modelu
+            # Eliminujeme prefix VR_ a používáme standardní názvy
+            FIELD_MAPPING = {
+                "RIMSA_MIN": "RIMSA_MIN",
+                "RIMSA_MAX": "RIMSA_MAX",
+                "VYSKA_VB": "VYSKA_VB",
+                "VYSKA_VB_I": "VYSKA_VB_I",
+                "NP_MIN": "NP_MIN",
+                "NP_MAX": "NP_MAX",
+                # Oprava překlepu: v CADu může být NUP, ale v modelu je NPU_MAX
+                # Zkusíme namapovat obě možné varianty ze zdroje na správný cíl
+                "NUP_MAX": "NPU_MAX", 
+                "NPU_MAX": "NPU_MAX",
+                "VYSKA_MAX": "VYSKA_MAX"
+            }
             
-            # Najít která pole skutečně existují v temp_join
-            temp_fields = [f.name for f in arcpy.ListFields(temp_join_fc)]
-            fields_to_transfer = []
+            # Zjistíme, která pole v temp_joinu existují (mají suffix _1)
+            temp_fields_map = {f.name: f for f in arcpy.ListFields(temp_join_fc)}
             
-            for field in vyska_fields:
-                # Hledat pole s suffixem _1 (z join)
-                if f"{field}_1" in temp_fields:
-                    fields_to_transfer.append(field)
+            valid_transfers = [] # Tuples: (source_field_name, target_field_name, field_type, field_length)
+
+            for src_base, target_name in FIELD_MAPPING.items():
+                # Zkusíme různé varianty názvu ve zdroji (s suffixem _1, s prefixem VR_, atd.)
+                possible_src_names = [
+                    src_base, 
+                    f"{src_base}_1", 
+                    f"VR_{src_base}", 
+                    f"VR_{src_base}_1"
+                ]
+                
+                # Specialita pro NUP/NPU překlepy - pokud hledáme NPU_MAX, zkusíme i NUP_MAX varianty
+                if src_base == "NPU_MAX":
+                    possible_src_names.extend(["NUP_MAX", "NUP_MAX_1", "VR_NUP_MAX", "VR_NUP_MAX_1"])
+
+                found_src_name = None
+                
+                for name in possible_src_names:
+                    if name in temp_fields_map:
+                        found_src_name = name
+                        break
+                
+                if found_src_name:
+                    # Pole nalezeno ve zdroji
+                    src_field = temp_fields_map[found_src_name]
+                    valid_transfers.append({
+                        "src": found_src_name,
+                        "target": target_name,
+                        "type": src_field.type,
+                        "length": src_field.length if src_field.type == "String" else None
+                    })
             
-            if not fields_to_transfer:
+            if not valid_transfers:
                 arcpy.AddMessage(f"[add_vyska_attributes] Žádné výškové atributy k přenosu")
                 arcpy.Delete_management(temp_join_fc)
                 return
             
-            # Přidat nová pole do původního polygonu (pokud neexistují)
-            for field in fields_to_transfer:
-                target_field_name = f"VR_{field}"  # Prefix VR_ pro rozlišení od klasifikačních atributů
-                
-                # Zkontrolovat zda pole už existuje
-                existing_fields = [f.name for f in arcpy.ListFields(polygon_fc)]
-                if target_field_name not in existing_fields:
-                    # Zjistit typ pole ze source
-                    source_field = [f for f in arcpy.ListFields(temp_join_fc) if f.name == f"{field}_1"][0]
-                    arcpy.AddField_management(
+            # Přidat nová pole do cílového polygonu
+            existing_target_fields = [f.name for f in arcpy.ListFields(polygon_fc)]
+            
+            fields_to_add = [] # Ty co musíme přidat
+            
+            for item in valid_transfers:
+                if item["target"] not in existing_target_fields:
+                    arcpy.management.AddField(
                         polygon_fc,
-                        target_field_name,
-                        source_field.type,
-                        field_length=source_field.length if source_field.type == "String" else None
+                        item["target"],
+                        item["type"],
+                        field_length=item["length"]
                     )
+                    fields_to_add.append(item["target"])
             
-            # Přenést hodnoty pomocí Update Cursor
-            poly_fields = ["OBJECTID"] + [f"VR_{field}" for field in fields_to_transfer]
-            temp_fields_to_read = ["TARGET_FID"] + [f"{field}_1" for field in fields_to_transfer]
+            # Přenést hodnoty
+            # Cursor fields: OID + targets
+            cursor_fields = ["OBJECTID"] + [item["target"] for item in valid_transfers]
             
-            # Vytvoření mapy hodnot z temp_join
+            # Temp fields: TARGET_FID + sources
+            temp_cursor_fields = ["TARGET_FID"] + [item["src"] for item in valid_transfers]
+            
+            # Načtení hodnot z temp
             value_map = {}
-            with arcpy.da.SearchCursor(temp_join_fc, temp_fields_to_read) as cursor:
+            with arcpy.da.SearchCursor(temp_join_fc, temp_cursor_fields) as cursor:
                 for row in cursor:
                     target_fid = row[0]
-                    values = row[1:]
-                    value_map[target_fid] = values
+                    vals = row[1:]
+                    value_map[target_fid] = vals
             
-            # Aktualizace původních polygonů
+            # Update
             updated_count = 0
-            with arcpy.da.UpdateCursor(polygon_fc, poly_fields) as cursor:
+            with arcpy.da.UpdateCursor(polygon_fc, cursor_fields) as cursor:
                 for row in cursor:
                     oid = row[0]
                     if oid in value_map:
-                        # Zkopírovat hodnoty
-                        for i, value in enumerate(value_map[oid]):
-                            row[i + 1] = value
+                        source_vals = value_map[oid]
+                        # Zapsat hodnoty
+                        for i, val in enumerate(source_vals):
+                            row[i+1] = val
                         cursor.updateRow(row)
                         updated_count += 1
             
-            arcpy.AddMessage(f"[add_vyska_attributes] ✓ Aktualizováno {updated_count} polygonů, přeneseno {len(fields_to_transfer)} atributů")
+            arcpy.AddMessage(f"[add_vyska_attributes] ✓ Aktualizováno {updated_count} polygonů, přeneseno {len(valid_transfers)} atributů")
             
             # Cleanup
             arcpy.Delete_management(temp_join_fc)
@@ -1361,8 +1475,8 @@ class CadFile(object):
                     
                     count = arcpy.GetCount_management(final_fc).getOutput(0)
                     
-                    # Filtrovat atributy - ponechat pouze požadované
-                    self.keep_only_required_fields(final_fc)
+                    # Filtrovat atributy - ponechat pouze požadované a doplnit systémové
+                    self.finalize_layer_attributes(final_fc, layer_value)
                     
                     split_results.append(final_fc)
                     arcpy.AddMessage(f"[split_analysis_by_layer] Vytvořena vrstva: {split_fc_name} ({count} prvků)")
@@ -1377,55 +1491,246 @@ class CadFile(object):
         
         return split_results
 
-    def keep_only_required_fields(self, feature_class):
+    def finalize_layer_attributes(self, feature_class, layer_name):
         """
-        Ponechá pouze požadované atributy ve feature class.
-        Všechny ostatní atributy budou odstraněny.
+        Finalizuje atributy vrstvy podle GIS datového modelu.
+        1. Přidá povinné systémové atributy (SKNAZEV, OBTYPNAZEV, ID_LOKAL).
+        2. Naplní je konstantami podle typu vrstvy.
+        3. Ponechá pouze povolené atributy pro daný typ vrstvy.
+        4. Odstraní všechny ostatní (včetně pomocných a CAD atributů).
         """
-        arcpy.AddMessage(f"[keep_only_required_fields] Filtruji atributy v: {os.path.basename(feature_class)}")
+        arcpy.AddMessage(f"[finalize_layer_attributes] Finalizuji atributy pro: {os.path.basename(feature_class)}")
         
-        # Seznam požadovaných atributů
-        required_fields = [
-            "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", "DOK_NAZEV",
-            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_VB", "VYSKA_VB_I", "PODTYP",
-            "NP_MIN", "NP_MAX", "NUP_MAX", "VYSKA_MAX", "VYSKA_VB_D",
-            "bod", "pozice_resene_uzemi",
-            # Výškové atributy s prefixem VR_
-            "VR_OZNACENI", "VR_NAZEV_BLOK", "VR_DRUH_UP", "VR_DRUH_INFO", "VR_DOK_NAZEV",
-            "VR_RIMSA_MIN", "VR_RIMSA_MAX", "VR_VYSKA_VB", "VR_VYSKA_VB_I", "VR_PODTYP",
-            "VR_NP_MIN", "VR_NP_MAX", "VR_NUP_MAX", "VR_VYSKA_MAX", "VR_VYSKA_VB_D"
+        # --- 1. Definice metadat a schématu pro jednotlivé vrstvy ---
+        
+        # Slovník mapování: Název vrstvy (část) -> (SKNAZEV, OBTYPNAZEV, Seznam povolených atributů)
+        # Poznámka: ID_LOKAL je povinné u všech.
+        
+        # Společné atributy pro výškové regulace
+        VYSKOVA_REGULACE_ATTRS = [
+            "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX", 
+            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
         ]
         
-        try:
-            # Získání seznamu všech polí
-            all_fields = arcpy.ListFields(feature_class)
+        # Společné atributy pro popis
+        COMMON_ATTRS = ["OZNACENI", "DOK_NAZEV"]
+
+        # Definice modelu
+        LAYER_DEFINITIONS = {
+            "Z_1011_ReseneUzemi": {
+                "SKNAZEV": "metadata dokumentace",
+                "OBTYPNAZEV": "řešené území",
+                "ATTRS": ["DOK_NAZEV"]
+            },
+            "Z_2011_UlicniCara": {
+                "SKNAZEV": "členění území",
+                "OBTYPNAZEV": "uliční čára",
+                "ATTRS": ["ID_LOKAL"] # Specifické atributy zatím nejsou v kódu řešeny (DRUH_SC atd.), ponecháme ID_LOKAL
+            },
+            "Z_2021_UlicniProstranstvi": {
+                "SKNAZEV": "členění území",
+                "OBTYPNAZEV": "uliční prostranství",
+                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI"]
+            },
+            "Z_2031_StavebniBlok": {
+                "SKNAZEV": "členění území",
+                "OBTYPNAZEV": "stavební blok",
+                "ATTRS": ["OZNACENI"]
+            },
+            "Z_2041_NestavebniBlok": {
+                "SKNAZEV": "členění území",
+                "OBTYPNAZEV": "nestavební blok",
+                "ATTRS": ["OZNACENI"]
+            },
+            "Z_2051_JinaCastUzemi": {
+                "SKNAZEV": "členění území",
+                "OBTYPNAZEV": "jiná část území",
+                "ATTRS": ["PODTYP", "OZNACENI"]
+            },
+            "Z_3011_StavebniCara": {
+                "SKNAZEV": "regulace struktury",
+                "OBTYPNAZEV": "stavební čára",
+                "ATTRS": ["DRUH_SC", "DRUH_INFO"] # DRUH_SC se asi bere z CADu?
+            },
+            "Z_3021_VyskovaRegulaceNaBod": {
+                "SKNAZEV": "regulace struktury",
+                "OBTYPNAZEV": "výšková regulace na bod",
+                "ATTRS": VYSKOVA_REGULACE_ATTRS
+            },
+             "Z_3022_VyskovaRegulaceNaLinii": { # Přidáno pro úplnost
+                "SKNAZEV": "regulace struktury",
+                "OBTYPNAZEV": "výšková regulace na linii",
+                "ATTRS": VYSKOVA_REGULACE_ATTRS
+            },
+            "Z_3023_VyskovaRegulaceNaPlochu": {
+                "SKNAZEV": "regulace struktury",
+                "OBTYPNAZEV": "výšková regulace na plochu",
+                "ATTRS": VYSKOVA_REGULACE_ATTRS
+            },
+            "chyba_bod": {
+                "SKNAZEV": "chyba",
+                "OBTYPNAZEV": "chyba bodu",
+                "ATTRS": ["bod"]
+            },
+            "chyba_resene_uzemi": {
+                "SKNAZEV": "chyba",
+                "OBTYPNAZEV": "mimo řešené území",
+                "ATTRS": [] # Specifický atribut není, chyba je dána geometrií
+            }
+        }
+        
+        # --- 2. Identifikace typu vrstvy podle názvu ---
+        current_def = None
+        found_key = None
+        
+        # Priorita 1: Identifikace podle původního názvu vrstvy (layer_name)
+        # layer_name je např. "203110_BL_Cast_uzemi_SB" (z CADu)
+        if layer_name:
+            # Normalizace layer_name: odstranit podtržítka, uppercase
+            norm_layer = layer_name.replace("_", "").upper()
             
-            # Systémová pole, která nesmíme smazat
-            system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE"]
-            
-            # Pole ke smazání
-            fields_to_delete = []
-            
-            for field in all_fields:
-                # Přeskočit systémová pole a požadované pole
-                if field.name.upper() in [f.upper() for f in system_fields]:
-                    continue
-                if field.name in required_fields:
-                    continue
+            for key in LAYER_DEFINITIONS:
+                # Klíč v definici: "Z_2031_StavebniBlok" -> kód "2031"
+                # Layer name: "203110..." -> kód "203110"
                 
-                # Pole není v požadovaných - smazat
-                if not field.required:  # Pouze pokud není povinné
-                    fields_to_delete.append(field.name)
+                # Získáme číslo z klíče
+                key_code = "".join(filter(str.isdigit, key))
+                # Získáme číslo z layer_name
+                layer_code = "".join(filter(str.isdigit, layer_name))
+                
+                # Pokud klíč kód je obsažen v layer kódu (např. 2031 je v 203110)
+                if key_code and layer_code and layer_code.startswith(key_code):
+                    found_key = key
+                    break
+        
+        # Priorita 2: Identifikace podle názvu feature class (fc_basename)
+        if not found_key:
+            fc_basename = os.path.basename(feature_class)
             
-            # Smazání nepotřebných polí
-            if fields_to_delete:
-                arcpy.AddMessage(f"[keep_only_required_fields] Mažu {len(fields_to_delete)} nepotřebných polí")
+            for key in LAYER_DEFINITIONS:
+                # Zkusíme najít číslo z klíče v názvu FC
+                key_code = "".join(filter(str.isdigit, key))
+                fc_code = "".join(filter(str.isdigit, fc_basename))
+                
+                if key_code and fc_code and fc_code.startswith(key_code):
+                    found_key = key
+                    break
+            
+            # Speciální případ pro chybové vrstvy (nemají číslo)
+            if not found_key:
+                if "chyba_bod" in fc_basename:
+                    found_key = "chyba_bod"
+                elif "chyba_resene_uzemi" in fc_basename:
+                    found_key = "chyba_resene_uzemi"
+        
+        if found_key:
+            current_def = LAYER_DEFINITIONS[found_key]
+            arcpy.AddMessage(f"[finalize_layer_attributes] Rozpoznán typ: {found_key}")
+        else:
+            # Fallback pro ostatní nebo nerozpoznané vrstvy - zkusíme odhadnout nebo použijeme obecné
+            arcpy.AddWarning(f"[finalize_layer_attributes] POZOR: Nerozpoznaný typ vrstvy '{fc_basename}'. Používám obecná metadata.")
+            
+            # Pokud jde o chybovou vrstvu, chceme zachovat atribut 'bod'
+            extra_attrs = []
+            if "chyba_bod" in fc_basename:
+                extra_attrs.append("bod")
+                arcpy.AddMessage(f"[finalize_layer_attributes] Rozpoznána chybová vrstva - zachovávám atribut 'bod'")
+
+            current_def = {
+                "SKNAZEV": "nezarazeno",
+                "OBTYPNAZEV": "nezarazeno",
+                "ATTRS": COMMON_ATTRS + extra_attrs # Ponechat aspoň základní + specifické pro chyby
+            }
+
+        # --- 2.5 Mapování atributů (přejmenování) ---
+        # Pokud má vrstva mít OZNACENI, zkusíme ho naplnit z RefName nebo Text (CAD atributy)
+        if "OZNACENI" in current_def["ATTRS"]:
+            field_names = [f.name for f in arcpy.ListFields(feature_class)]
+            
+            # Pokud OZNACENI neexistuje nebo je prázdné (může být vytvořeno dříve ale nenaplněno)
+            # Pro jistotu zkontrolujeme kandidáty na zdroj
+            source_col = None
+            if "RefName" in field_names:
+                source_col = "RefName"
+            elif "Text" in field_names:
+                source_col = "Text"
+            elif "NAZEV_BLOK" in field_names:
+                source_col = "NAZEV_BLOK"
+            
+            if source_col:
+                # Pokud OZNACENI neexistuje, vytvoříme ho
+                if "OZNACENI" not in field_names:
+                    arcpy.management.AddField(feature_class, "OZNACENI", "TEXT", field_length=50)
+                
+                arcpy.AddMessage(f"[finalize_layer_attributes] Mapuji '{source_col}' -> 'OZNACENI'")
+                # Calculate field, pouze pokud OZNACENI je null nebo prázdné (což předpokládáme u nového exportu)
+                # Použijeme jednoduchý Python výraz
+                try:
+                    arcpy.management.CalculateField(feature_class, "OZNACENI", f"!{source_col}!", "PYTHON3")
+                except Exception as e:
+                    arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při mapování OZNACENI: {e}")
+
+        # --- 3. Přidání a naplnění povinných polí ---
+        
+        # SKNAZEV
+        if not any(f.name == "SKNAZEV" for f in arcpy.ListFields(feature_class)):
+            arcpy.management.AddField(feature_class, "SKNAZEV", "TEXT", field_length=50)
+            
+        # OBTYPNAZEV
+        if not any(f.name == "OBTYPNAZEV" for f in arcpy.ListFields(feature_class)):
+            arcpy.management.AddField(feature_class, "OBTYPNAZEV", "TEXT", field_length=50)
+            
+        # ID_LOKAL
+        if not any(f.name == "ID_LOKAL" for f in arcpy.ListFields(feature_class)):
+            arcpy.management.AddField(feature_class, "ID_LOKAL", "SHORT")
+
+        # Hromadný update nových polí konstantami
+        with arcpy.da.UpdateCursor(feature_class, ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]) as cursor:
+            for row in cursor:
+                row[0] = current_def["SKNAZEV"]
+                row[1] = current_def["OBTYPNAZEV"]
+                row[2] = 0 # Defaultní hodnota pro ID_LOKAL
+                cursor.updateRow(row)
+                
+        # --- 4. Filtrace atributů (Ponechat jen povolené + systémové) ---
+        
+        # Seznam všech povolených polí pro tento typ
+        allowed_fields = set(current_def["ATTRS"])
+        allowed_fields.add("SKNAZEV")
+        allowed_fields.add("OBTYPNAZEV")
+        allowed_fields.add("ID_LOKAL")
+        
+        # Systémové pole, která nesmíme smazat
+        system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE"]
+        
+        # Získání seznamu existujících polí
+        existing_fields = arcpy.ListFields(feature_class)
+        fields_to_delete = []
+        
+        for field in existing_fields:
+            name = field.name
+            
+            # 1. Systémová pole - přeskočit
+            if name.upper() in [f.upper() for f in system_fields]:
+                continue
+                
+            # 2. Povolená pole - přeskočit
+            if name in allowed_fields:
+                continue
+                
+            # 3. Ostatní pole -> SMAZAT
+            # (To zahrnuje: bod, pozice_resene_uzemi, NAZEV_BLOK, VR_..., VYSKA_VB_D atd.)
+            if not field.required:
+                fields_to_delete.append(name)
+        
+        if fields_to_delete:
+            arcpy.AddMessage(f"[finalize_layer_attributes] Mažu {len(fields_to_delete)} nadbytečných polí: {', '.join(fields_to_delete[:5])}...")
+            try:
                 arcpy.management.DeleteField(feature_class, fields_to_delete)
-            else:
-                arcpy.AddMessage(f"[keep_only_required_fields] Žádná pole ke smazání")
-                
-        except Exception as e:
-            arcpy.AddWarning(f"[keep_only_required_fields] Chyba při filtrování polí: {e}")
+            except Exception as e:
+                arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při mazání polí: {e}")
+        else:
+            arcpy.AddMessage("[finalize_layer_attributes] Žádná nadbytečná pole.")
 
     def create_error_polygon_bod(self, analysis_fc, output_workspace, out_prefix):
         """
@@ -1472,14 +1777,15 @@ class CadFile(object):
             arcpy.AddMessage(f"[create_error_polygon_bod] Nalezeno {error_count} polygonů s chybou bodu")
             
             # Dissolve (sloučení) všech chybových polygonů do jednoho
-            error_fc_name = f"{out_prefix}chyba_bod" if out_prefix else "chyba_bod"
+            # Na žádost uživatele bez prefixu ("stačí chyba")
+            error_fc_name = "chyba_bod"
             error_fc = os.path.join(output_workspace, generate_unique_fc_name(error_fc_name, root_gdb))
             
             arcpy.AddMessage(f"[create_error_polygon_bod] Provádím dissolve do: {error_fc_name}")
             arcpy.management.Dissolve(
                 in_features=temp_error,
                 out_feature_class=error_fc,
-                dissolve_field=[],  # Sloučit vše do jednoho polygonu
+                dissolve_field="bod",  # Sloučit podle typu chyby
                 multi_part="MULTI_PART"
             )
             
@@ -1540,7 +1846,7 @@ class CadFile(object):
             arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Nalezeno {error_count} polygonů mimo řešené území")
             
             # Dissolve (sloučení) všech chybových polygonů do jednoho
-            error_fc_name = f"{out_prefix}chyba_resene_uzemi" if out_prefix else "chyba_resene_uzemi"
+            error_fc_name = "chyba_resene_uzemi"
             error_fc = os.path.join(output_workspace, generate_unique_fc_name(error_fc_name, root_gdb))
             
             arcpy.AddMessage(f"[create_error_polygon_resene_uzemi] Provádím dissolve do: {error_fc_name}")
@@ -1628,6 +1934,7 @@ class ExportLayer(object):
                     "101110_PL_Resene_uzemi": ["Polyline"],
                     "200000_PL_Cast_uzemi": ["Polyline", "Point"], 
                     "101111_BL_Resene_uzemi": ["Point"],  # Speciální zpracování pro linii
+                    "201110_PL_Ulicni_cara": ["Polyline"], # Uliční čára
                     "202110_BL_Cast_uzemi_UP": ["Point"],
                     "203110_BL_Cast_uzemi_SB": ["Point"], 
                     "204110_BL_Cast_uzemi_NB": ["Point"],
