@@ -485,16 +485,38 @@ class CadFile(object):
                             
                         exported_layers.extend(split_results)
                         
-                        # SAMOSTATNÝ SPATIAL JOIN VÝŠKOVÝCH BODŮ ke splitnutým polygonům
-                        # (po rozdělení, aby se atributy připojily k finálním vrstvám)
+                        # SAMOSTATNÝ SPATIAL JOIN VÝŠKOVÝCH BODŮ - NOVÁ LOGIKA
                         if vyska_centroids_fc:
                             try:
-                                arcpy.AddMessage("[export_layers] Připojuji výškové atributy k finálním polygonům...")
+                                vyska_polygons_list = []
+                                arcpy.AddMessage("[export_layers] Vytvářím samostatné polygony výškové regulace na plochu...")
                                 for split_fc in split_results:
-                                    self.add_vyska_attributes(split_fc, vyska_centroids_fc)
-                                arcpy.AddMessage("[export_layers] ✓ Výškové atributy připojeny ke všem finálním polygonům")
+                                    # Vytvoří novou vrstvu (fragment), pokud se v polygonu nachází výškový bod
+                                    # Fragmenty se pojmenují dočasně, pak se sloučí
+                                    vyska_fragment = self.create_vyska_polygon_layer(split_fc, vyska_centroids_fc, output_workspace, out_prefix)
+                                    if vyska_fragment:
+                                        vyska_polygons_list.append(vyska_fragment)
+                                
+                                # Sloučení všech fragmentů do jedné vrstvy Z_3023_VyskovaRegulaceNaPlochu_p
+                                if vyska_polygons_list:
+                                    final_vyska_name = f"{out_prefix}Z_3023_VyskovaRegulaceNaPlochu_p"
+                                    # Kontrola, zda jméno už existuje (teoreticky nemělo být vytvořeno v split_results, protože tam jsou jiné Layery)
+                                    final_vyska_fc = os.path.join(output_workspace, generate_unique_fc_name(final_vyska_name, output_workspace))
+                                    
+                                    arcpy.AddMessage(f"[export_layers] Slučuji {len(vyska_polygons_list)} fragmentů do finální vrstvy: {os.path.basename(final_vyska_fc)}")
+                                    arcpy.management.Merge(vyska_polygons_list, final_vyska_fc)
+                                    
+                                    # Finalizace atributů nové vrstvy
+                                    self.finalize_layer_attributes(final_vyska_fc, "Z_3023_VyskovaRegulaceNaPlochu_p")
+                                    exported_layers.append(final_vyska_fc)
+                                    
+                                    # Smazání fragmentů
+                                    for fragment in vyska_polygons_list:
+                                        arcpy.Delete_management(fragment)
+                                        
+                                arcpy.AddMessage("[export_layers] ✓ Vytváření polygonů výškové regulace dokončeno")
                             except Exception as e:
-                                arcpy.AddWarning(f"[export_layers] Chyba při připojování výškových atributů: {e}")
+                                arcpy.AddWarning(f"[export_layers] Chyba při vytváření polygonů výškové regulace: {e}")
                     
                     # Vytvoření chybových polygonů (sloučené polygony s chybami)
                     # 1. Chybový polygon pro špatné body (bez bodu nebo více bodů)
@@ -732,136 +754,116 @@ class CadFile(object):
             arcpy.AddError(f"[split_polygons_vyska] Chyba při rozdělování polygonů: {e}")
             return polygon_fc  # V případě chyby vrátit původní
 
-    def add_vyska_attributes(self, polygon_fc, vyska_points_fc):
+    def create_vyska_polygon_layer(self, polygon_fc, points_fc, output_workspace, out_prefix):
         """
-        Připojí výškové atributy z bodů k polygonům pomocí spatial join.
-        Nepřepisuje existující polygony, jen přidává nová pole.
+        Vytvoří novou polygonovou vrstvu, která vznikne průnikem (spatial joinem) 
+        vstupních polygonů a bodů výškové regulace.
+        Přenese atributy z bodů do výsledných polygonů.
         """
+        arcpy.AddMessage(f"[create_vyska_polygon_layer] Analyzuji výškovou regulaci pro: {os.path.basename(polygon_fc)}")
+        
         try:
-            arcpy.AddMessage(f"[add_vyska_attributes] Připojuji výškové atributy k: {os.path.basename(polygon_fc)}")
-            
-            # Vytvoření dočasné vrstvy se spatial join
-            temp_join_name = f"temp_vyska_join_{os.path.basename(polygon_fc)}"
-            temp_join_fc = os.path.join("in_memory", temp_join_name)
-            
-            arcpy.analysis.SpatialJoin(
-                target_features=polygon_fc,
-                join_features=vyska_points_fc,
-                out_feature_class=temp_join_fc,
-                join_operation="JOIN_ONE_TO_ONE",
-                join_type="KEEP_ALL",
-                match_option="CONTAINS"
-            )
-            
-            # Slovník mapování: Název pole v CADu/Výškopisu -> Název pole v GIS Modelu
-            # Eliminujeme prefix VR_ a používáme standardní názvy
-            FIELD_MAPPING = {
-                "RIMSA_MIN": "RIMSA_MIN",
-                "RIMSA_MAX": "RIMSA_MAX",
-                "VYSKA_VB": "VYSKA_VB",
-                "VYSKA_VB_I": "VYSKA_VB_I",
-                "NP_MIN": "NP_MIN",
-                "NP_MAX": "NP_MAX",
-                # Oprava překlepu: v CADu může být NUP, ale v modelu je NPU_MAX
-                # Zkusíme namapovat obě možné varianty ze zdroje na správný cíl
-                "NUP_MAX": "NPU_MAX", 
-                "NPU_MAX": "NPU_MAX",
-                "VYSKA_MAX": "VYSKA_MAX"
-            }
-            
-            # Zjistíme, která pole v temp_joinu existují (mají suffix _1)
-            temp_fields_map = {f.name: f for f in arcpy.ListFields(temp_join_fc)}
-            
-            valid_transfers = [] # Tuples: (source_field_name, target_field_name, field_type, field_length)
-
-            for src_base, target_name in FIELD_MAPPING.items():
-                # Zkusíme různé varianty názvu ve zdroji (s suffixem _1, s prefixem VR_, atd.)
-                # Zkusíme různé varianty názvu ve zdroji (s suffixem _1, s prefixem VR_, atd.)
-                # Priorita: 1. Suffix _1 (z joinu, pokud existuje kolize), 2. Prefix VR_, 3. Základ
-                possible_src_names = [
-                    f"{src_base}_1", 
-                    f"VR_{src_base}_1",
-                    f"VR_{src_base}", 
-                    src_base
-                ]
+            # Získání kořenové geodatabáze
+            desc_ws = arcpy.Describe(output_workspace)
+            if desc_ws.datatype == "FeatureDataset":
+                root_gdb = os.path.dirname(output_workspace)
+            else:
+                root_gdb = output_workspace
                 
-                # Specialita pro NUP/NPU překlepy - pokud hledáme NPU_MAX, zkusíme i NUP_MAX varianty
-                if src_base == "NPU_MAX":
-                    possible_src_names.extend(["NUP_MAX_1", "VR_NUP_MAX_1", "VR_NUP_MAX", "NUP_MAX"])
-
-                found_src_name = None
-                
-                for name in possible_src_names:
-                    if name in temp_fields_map:
-                        found_src_name = name
-                        # arcpy.AddMessage(f"[add_vyska_attributes] DEBUG: Pro cíl '{target_name}' nalezen zdroj '{found_src_name}'")
+            # Dočasný soubor pro join
+            temp_join_fc = "in_memory\\temp_vyska_join"
+            
+            # Seznam atributů k přenosu (výškové atributy) - dle modelu
+            transfer_attrs = [
+                "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX", 
+                "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
+            ]
+            
+            # Mapování polí pro FieldMappings: zachovat polygon, přidat body
+            field_mappings = arcpy.FieldMappings()
+            
+            # 1. Přidat všechna pole z polygonu
+            field_mappings.addTable(polygon_fc)
+            
+            # 2. Přidat výškové atributy z bodů
+            # Musíme najít správná pole ve zdrojové vrstvě (points_fc)
+            points_fields_map = {f.name.upper(): f.name for f in arcpy.ListFields(points_fc)}
+            
+            found_any = False
+            for target_attr in transfer_attrs:
+                # Hledáme atribut ve zdroji (case-insensitive, různé varianty názvu)
+                # Varianty: NÁZEV, VR_NÁZEV
+                possible_names = [target_attr, f"VR_{target_attr}"]
+                if target_attr == "NPU_MAX": # Specifický fix pro překlepy
+                    possible_names.extend(["NUP_MAX", "VR_NUP_MAX"])
+                    
+                src_field_name = None
+                for n in possible_names:
+                    if n.upper() in points_fields_map:
+                        src_field_name = points_fields_map[n.upper()]
                         break
                 
-                if found_src_name:
-                    # Pole nalezeno ve zdroji
-                    src_field = temp_fields_map[found_src_name]
-                    valid_transfers.append({
-                        "src": found_src_name,
-                        "target": target_name,
-                        "type": src_field.type,
-                        "length": src_field.length if src_field.type == "String" else None
-                    })
+                if src_field_name:
+                    # Vytvoření FieldMap pro jeden atribut
+                    fm = arcpy.FieldMap()
+                    fm.addInputField(points_fc, src_field_name)
+                    
+                    # Nastavení výstupního pole
+                    out_field = fm.outputField
+                    out_field.name = target_attr
+                    out_field.aliasName = target_attr
+                    fm.outputField = out_field
+                    
+                    # Přidání do mappings
+                    # Pozor: pokud pole už existuje z polygonu (např. prázdné), FieldMappings ho sloučí?
+                    # Raději zkontrolujeme, jestli už v mappingu není
+                    existing_index = field_mappings.findFieldMapIndex(target_attr)
+                    if existing_index != -1:
+                        # Pokud existuje, nahradíme ho (chceme hodnotu z bodu, ne z polygonu)
+                        field_mappings.replaceFieldMap(existing_index, fm)
+                    else:
+                        field_mappings.addFieldMap(fm)
+                    
+                    found_any = True
             
-            if not valid_transfers:
-                arcpy.AddMessage(f"[add_vyska_attributes] Žádné výškové atributy k přenosu")
+            # Spatial Join (HAVE_THEIR_CENTER_IN - bod musí být uvnitř polygonu)
+            # Join type: KEEP_COMMON = INNER JOIN -> zůstanou jen polygony, které mají bod!
+            # Tím dostaneme jen ty "napojené" části
+            arcpy.analysis.SpatialJoin(
+                target_features=polygon_fc,
+                join_features=points_fc,
+                out_feature_class=temp_join_fc,
+                join_operation="JOIN_ONE_TO_ONE",
+                join_type="KEEP_COMMON",
+                match_option="CONTAINS", # Polygon obsahuje bod
+                field_mapping=field_mappings
+            )
+            
+            count = int(arcpy.GetCount_management(temp_join_fc).getOutput(0))
+            
+            if count == 0:
+                # Žádný průnik = žádná regulace v této části
                 arcpy.Delete_management(temp_join_fc)
-                return
+                return None
             
-            # Přidat nová pole do cílového polygonu
-            existing_target_fields = [f.name for f in arcpy.ListFields(polygon_fc)]
+            # Pokud něco nalezeno, uložíme to jako dočasný feature class na disk (fragment)
+            # Tyto fragmenty se pak sloučí
+            base_name = os.path.basename(polygon_fc) + "_VR_fragment"
+            out_name = generate_unique_fc_name(base_name, root_gdb)
+            out_fc = os.path.join(output_workspace, out_name)
             
-            fields_to_add = [] # Ty co musíme přidat
+            arcpy.management.CopyFeatures(temp_join_fc, out_fc)
             
-            for item in valid_transfers:
-                if item["target"] not in existing_target_fields:
-                    arcpy.management.AddField(
-                        polygon_fc,
-                        item["target"],
-                        item["type"],
-                        field_length=item["length"]
-                    )
-                    fields_to_add.append(item["target"])
-            
-            # Přenést hodnoty
-            # Cursor fields: OID + targets
-            cursor_fields = ["OBJECTID"] + [item["target"] for item in valid_transfers]
-            
-            # Temp fields: TARGET_FID + sources
-            temp_cursor_fields = ["TARGET_FID"] + [item["src"] for item in valid_transfers]
-            
-            # Načtení hodnot z temp
-            value_map = {}
-            with arcpy.da.SearchCursor(temp_join_fc, temp_cursor_fields) as cursor:
-                for row in cursor:
-                    target_fid = row[0]
-                    vals = row[1:]
-                    value_map[target_fid] = vals
-            
-            # Update
-            updated_count = 0
-            with arcpy.da.UpdateCursor(polygon_fc, cursor_fields) as cursor:
-                for row in cursor:
-                    oid = row[0]
-                    if oid in value_map:
-                        source_vals = value_map[oid]
-                        # Zapsat hodnoty
-                        for i, val in enumerate(source_vals):
-                            row[i+1] = val
-                        cursor.updateRow(row)
-                        updated_count += 1
-            
-            arcpy.AddMessage(f"[add_vyska_attributes] ✓ Aktualizováno {updated_count} polygonů, přeneseno {len(valid_transfers)} atributů")
+            arcpy.AddMessage(f"[create_vyska_polygon_layer] Nalezeno {count} polygonů s regulací -> {out_name}")
             
             # Cleanup
             arcpy.Delete_management(temp_join_fc)
             
+            return out_fc
+            
         except Exception as e:
-            arcpy.AddWarning(f"[add_vyska_attributes] Chyba: {e}")
+            arcpy.AddWarning(f"[create_vyska_polygon_layer] Chyba: {e}")
+            return None
 
     def process_vyska_circles_to_points(self, circles_fc, output_workspace, out_prefix, spatial_ref):
         """
@@ -1533,22 +1535,22 @@ class CadFile(object):
             "Z_2021_UlicniProstranstvi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "uliční prostranství",
-                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI"] + VYSKOVA_REGULACE_ATTRS
+                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"]
             },
             "Z_2031_StavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "stavební blok",
-                "ATTRS": ["OZNACENI"] + VYSKOVA_REGULACE_ATTRS
+                "ATTRS": ["OZNACENI", "ID_LOKAL"]
             },
             "Z_2041_NestavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "nestavební blok",
-                "ATTRS": ["OZNACENI"] + VYSKOVA_REGULACE_ATTRS
+                "ATTRS": ["OZNACENI", "ID_LOKAL"]
             },
             "Z_2051_JinaCastUzemi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "jiná část území",
-                "ATTRS": ["PODTYP", "OZNACENI"] + VYSKOVA_REGULACE_ATTRS
+                "ATTRS": ["PODTYP", "OZNACENI", "ID_LOKAL"]
             },
             "Z_3011_StavebniCara": {
                 "SKNAZEV": "regulace struktury",
