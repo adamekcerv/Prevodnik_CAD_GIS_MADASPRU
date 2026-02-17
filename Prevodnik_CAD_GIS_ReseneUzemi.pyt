@@ -27,10 +27,29 @@ def get_all_fc_names(gdb_path):
     Projde celou geodatabázi (včetně feature datasetů) a vrátí množinu všech existujících feature class názvů.
     """
     fc_names = set()
-    walk = arcpy.da.Walk(gdb_path, datatype="FeatureClass")
-    for dirpath, dirnames, filenames in walk:
-        for fc in filenames:
-            fc_names.add(fc)
+
+    if not arcpy.Exists(gdb_path):
+        return fc_names
+
+    # Pokud je gdb_path FeatureDataset, musíme získat parent GDB, abychom zkontrolovali unikátnost v celé GDB
+    # Jinak stačí gdb_path
+    search_root = gdb_path
+    try:
+        desc = arcpy.Describe(gdb_path)
+        if desc.datatype == "FeatureDataset":
+            search_root = os.path.dirname(gdb_path)
+    except:
+        pass # Pokud nejde describe, necháme původní
+
+    try:
+        # Použijeme walk na celou GDB
+        walk = arcpy.da.Walk(search_root, datatype="FeatureClass")
+        for dirpath, dirnames, filenames in walk:
+            for fc in filenames:
+                fc_names.add(fc)
+    except Exception as e:
+        arcpy.AddWarning(f"Chyba při kontrole unikátnosti názvů: {e}")
+            
     return fc_names
 
 def sanitize_fc_name(name):
@@ -60,13 +79,16 @@ def sanitize_fc_name(name):
 
 def generate_unique_fc_name(base, workspace):
     """
-    Vygeneruje unikátní název feature class v rámci workspace.
-    Pokud již jméno existuje, přidá se přípona _1, _2, atd.
+    Vygeneruje unikátní název feature class v rámci celé geodatabáze.
+    Pokud již jméno existuje kdekoli v GDB, přidá se přípona _1, _2, atd.
     """
     # Sanitizace základního názvu
     base = sanitize_fc_name(base)
     
+    # workspace může být Feature Dataset nebo GDB. 
+    # get_all_fc_names si s tím poradí a vrátí jména z celé GDB.
     existing = get_all_fc_names(workspace)
+    
     unique = base
     counter = 1
     while unique in existing:
@@ -499,7 +521,9 @@ class CadFile(object):
                                 
                                 # Sloučení všech fragmentů do jedné vrstvy Z_3023_VyskovaRegulaceNaPlochu_p
                                 if vyska_polygons_list:
-                                    final_vyska_name = f"{out_prefix}Z_3023_VyskovaRegulaceNaPlochu_p"
+                                    # out_prefix již obsahuje "_" na konci (zpracováno v execute)
+                                    # Takže pokud je prefix "Z_", výsledné jméno bude "Z_3023_..." (správně)
+                                    final_vyska_name = f"{out_prefix}3023_VyskovaRegulaceNaPlochu_p"
                                     # Kontrola, zda jméno už existuje (teoreticky nemělo být vytvořeno v split_results, protože tam jsou jiné Layery)
                                     final_vyska_fc = os.path.join(output_workspace, generate_unique_fc_name(final_vyska_name, output_workspace))
                                     
@@ -1458,6 +1482,10 @@ class CadFile(object):
                     if sanitized_layer.startswith("Z"):
                         sanitized_layer = sanitized_layer[1:]  # Odstranit prefix Z
                     
+                    # Pokud po odstranění Z začíná podtržítkem, taky odstranit (aby nevzniklo Z__xxx)
+                    if sanitized_layer.startswith("_"):
+                        sanitized_layer = sanitized_layer[1:]
+                    
                     # Vytvoření jména vrstvy z Layer hodnoty
                     split_fc_name = f"{out_prefix}{sanitized_layer}" if out_prefix else sanitized_layer
                     split_fc_name = generate_unique_fc_name(split_fc_name, root_gdb)
@@ -1992,6 +2020,10 @@ class ExportLayer(object):
         output_sr = parameters[6].value
         transform_method = parameters[7].valueAsText
         out_prefix = parameters[8].valueAsText or ""
+
+        # Ensure out_prefix ends with "_" if it is not empty
+        if out_prefix and not out_prefix.endswith("_"):
+            out_prefix += "_"
 
         # Nastavení defaultního spatial reference na S-JTSK pokud není specifikován
         if not output_sr:
