@@ -242,6 +242,52 @@ class CadFile(object):
         self.cad_file = cad_file
         self.display_map = self.get_layers()
         self.layer_display_names = sorted(self.display_map.keys())
+        
+        # Společné atributy pro výškové regulace
+        VYSKOVA_REGULACE_ATTRS = [
+            "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX", 
+            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
+        ]
+        
+        # Definice modelu pro přejmenování
+        self.LAYER_DEFINITIONS_REF = {
+            "Z_1011_ReseneUzemi": {
+                "TARGET_NAME": "1011_ReseneUzemi_p"
+            },
+            "Z_2011_UlicniCara": {
+                "TARGET_NAME": "2011_UlicniCara_l"
+            },
+            "Z_2021_UlicniProstranstvi": {
+                "TARGET_NAME": "2021_UlicniProstranstvi_p"
+            },
+            "Z_2031_StavebniBlok": {
+                "TARGET_NAME": "2031_StavebniBlok_p"
+            },
+            "Z_2041_NestavebniBlok": {
+                "TARGET_NAME": "2041_NestavebniBlok_p"
+            },
+            "Z_2051_JinaCastUzemi": {
+                "TARGET_NAME": "2051_JinaCastUzemi_p"
+            },
+            "Z_3011_StavebniCara": {
+                "TARGET_NAME": "3011_StavebniCara_l"
+            },
+            "Z_3021_VyskovaRegulaceNaBod": {
+                "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b"
+            },
+             "Z_3022_VyskovaRegulaceNaLinii": {
+                "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l"
+            },
+            "Z_3023_VyskovaRegulaceNaPlochu": {
+                "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p"
+            },
+            "chyba_bod": {
+                "TARGET_NAME": "chyba_bod"
+            },
+            "chyba_resene_uzemi": {
+                "TARGET_NAME": "chyba_resene_uzemi"
+            }
+        }
 
     def get_layers(self):
         """
@@ -684,6 +730,71 @@ class CadFile(object):
                            except Exception as e:
                                arcpy.AddWarning(f"[export_layers] Chyba při finalizaci {basename}: {e}")
 
+                    # --- PŘEJMENOVÁNÍ VRSTEV PODLE DATOVÉHO MODELU ---
+                    arcpy.AddMessage("[export_layers] Přejmenovávám vrstvy podle datového modelu...")
+                    arcpy.env.overwriteOutput = True
+                    
+                    # Získáme seznam všech vrstev v output_workspace
+                    arcpy.env.workspace = output_workspace
+                    all_fcs = arcpy.ListFeatureClasses()
+                    
+                    renamed_count = 0
+                    for fc in all_fcs:
+                        # Zkusíme zjistit typ vrstvy stejnou logikou jako ve finalize_layer_attributes
+                        found_key = None
+                        fc_basename = os.path.basename(fc)
+                        
+                        for key in self.LAYER_DEFINITIONS_REF:
+                            key_code = "".join(filter(str.isdigit, key))
+                            fc_code = "".join(filter(str.isdigit, fc_basename))
+                            if key_code and fc_code and fc_code.startswith(key_code):
+                                found_key = key
+                                break
+                        
+                        if not found_key:
+                            if "chyba_bod" in fc_basename:
+                                found_key = "chyba_bod"
+                            elif "chyba_resene_uzemi" in fc_basename:
+                                found_key = "chyba_resene_uzemi"
+                                
+                        if found_key and "TARGET_NAME" in self.LAYER_DEFINITIONS_REF[found_key]:
+                            target_name = self.LAYER_DEFINITIONS_REF[found_key]["TARGET_NAME"]
+                            # Přidáme prefix, pokud existuje a pokud už v target_name není
+                            if out_prefix and not target_name.startswith(out_prefix):
+                                base_final_name = f"{out_prefix}{target_name}"
+                            else:
+                                base_final_name = target_name
+                                
+                            # Přejmenování pouze pokud se název liší
+                            if fc_basename != base_final_name:
+                                # Zajištění unikátnosti názvu v rámci celé GDB
+                                existing_names = get_all_fc_names(output_workspace)
+                                # Odstraníme aktuální název, abychom ho nebrali jako kolizi
+                                if fc_basename in existing_names:
+                                    existing_names.remove(fc_basename)
+                                    
+                                final_name = base_final_name
+                                counter = 1
+                                while final_name in existing_names:
+                                    final_name = f"{base_final_name}_{counter}"
+                                    counter += 1
+                                
+                                # Ještě jedna kontrola, jestli se náhodou nevygeneroval stejný název (např. pokud už měl správnou příponu)
+                                if fc_basename != final_name:
+                                    try:
+                                        arcpy.management.Rename(fc, final_name)
+                                        arcpy.AddMessage(f"  - Přejmenováno: {fc_basename} -> {final_name}")
+                                        renamed_count += 1
+                                        
+                                        # Aktualizace v seznamu exported_layers, pokud tam je
+                                        for i, exp_layer in enumerate(exported_layers):
+                                            if os.path.basename(exp_layer) == fc_basename:
+                                                exported_layers[i] = os.path.join(output_workspace, final_name)
+                                                
+                                    except Exception as e:
+                                        arcpy.AddWarning(f"  - Nelze přejmenovat {fc_basename} na {final_name}: {e}")
+                    
+                    arcpy.AddMessage(f"[export_layers] ✓ Přejmenováno {renamed_count} vrstev.")
                     arcpy.AddMessage("[export_layers] ✓ Finální cleanup dokončen")
                     
             except Exception as e:
@@ -1580,62 +1691,74 @@ class CadFile(object):
             "Z_1011_ReseneUzemi": {
                 "SKNAZEV": "metadata dokumentace",
                 "OBTYPNAZEV": "řešené území",
-                "ATTRS": ["DOK_NAZEV"]
+                "ATTRS": ["DOK_NAZEV"],
+                "TARGET_NAME": "1011_ReseneUzemi_p"
             },
             "Z_2011_UlicniCara": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "uliční čára",
-                "ATTRS": ["ID_LOKAL"]
+                "ATTRS": ["ID_LOKAL"],
+                "TARGET_NAME": "2011_UlicniCara_l"
             },
             "Z_2021_UlicniProstranstvi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "uliční prostranství",
-                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"]
+                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"],
+                "TARGET_NAME": "2021_UlicniProstranstvi_p"
             },
             "Z_2031_StavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "stavební blok",
-                "ATTRS": ["OZNACENI", "ID_LOKAL"]
+                "ATTRS": ["OZNACENI", "ID_LOKAL"],
+                "TARGET_NAME": "2031_StavebniBlok_p"
             },
             "Z_2041_NestavebniBlok": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "nestavební blok",
-                "ATTRS": ["OZNACENI", "ID_LOKAL"]
+                "ATTRS": ["OZNACENI", "ID_LOKAL"],
+                "TARGET_NAME": "2041_NestavebniBlok_p"
             },
             "Z_2051_JinaCastUzemi": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "jiná část území",
-                "ATTRS": ["PODTYP", "OZNACENI", "ID_LOKAL"]
+                "ATTRS": ["PODTYP", "OZNACENI", "ID_LOKAL"],
+                "TARGET_NAME": "2051_JinaCastUzemi_p"
             },
             "Z_3011_StavebniCara": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "stavební čára",
-                "ATTRS": ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"] 
+                "ATTRS": ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
+                "TARGET_NAME": "3011_StavebniCara_l"
             },
             "Z_3021_VyskovaRegulaceNaBod": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na bod",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+                "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b"
             },
              "Z_3022_VyskovaRegulaceNaLinii": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na linii",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+                "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l"
             },
             "Z_3023_VyskovaRegulaceNaPlochu": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na plochu",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+                "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p"
             },
             "chyba_bod": {
                 "SKNAZEV": "chyba",
                 "OBTYPNAZEV": "chyba bodu",
-                "ATTRS": ["bod"]
+                "ATTRS": ["bod"],
+                "TARGET_NAME": "chyba_bod"
             },
             "chyba_resene_uzemi": {
                 "SKNAZEV": "chyba",
                 "OBTYPNAZEV": "mimo řešené území",
-                "ATTRS": [] 
+                "ATTRS": [],
+                "TARGET_NAME": "chyba_resene_uzemi"
             }
         }
         
