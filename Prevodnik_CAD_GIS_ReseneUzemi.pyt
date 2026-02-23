@@ -1532,6 +1532,7 @@ class CadFile(object):
         3. Ponechání pouze povolených atributů.
         """
         arcpy.AddMessage(f"[finalize_layer_attributes] Finalizuji atributy pro: {os.path.basename(feature_class)}")
+        validation_report = []
         
         # --- 1. Definice metadat a schématu ---
         
@@ -1712,21 +1713,28 @@ class CadFile(object):
                 # Pokud cíl je číslo a zdroj je text -> konverze
                 if is_numeric_target and is_text_current:
                     needs_conversion = True
-                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': TEXT -> {expected_type}")
+                    msg = f"Konverze '{attr_name}': TEXT -> {expected_type}"
+                    arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
+                    validation_report.append(msg)
                 
                 # Pokud cíl je FLOAT a zdroj je Integer/SmallInteger -> konverze (vynucení desetinných míst)
                 elif expected_type == "FLOAT" and current_field.type in ["Integer", "SmallInteger"]:
                     needs_conversion = True
-                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Float)")
+                    msg = f"Konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Float)"
+                    arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
+                    validation_report.append(msg)
                 
                 # Pokud cíl je SHORT a zdroj je Float/Double nebo Integer (Long) -> konverze (zaokrouhlení nebo zmenšení)
                 elif expected_type == "SHORT" and current_field.type in ["Single", "Double", "Integer"]:
                     needs_conversion = True
-                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Short)")
+                    msg = f"Konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Short)"
+                    arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
+                    validation_report.append(msg)
                 
             if not field_exists:
                 # Vytvoříme nové pole
                 arcpy.management.AddField(feature_class, attr_name, expected_type, field_length=expected_length, field_alias=expected_alias)
+                validation_report.append(f"Vytvořeno nové pole '{attr_name}' ({expected_type})")
                 if attr_name == "OZNACENI":
                     self._fill_oznaceni_from_cad(feature_class, existing_fields.keys())
                     
@@ -1783,6 +1791,13 @@ class CadFile(object):
         
         if fields_to_delete:
             arcpy.management.DeleteField(feature_class, fields_to_delete)
+
+        # --- 6. Souhrnný report ---
+        if validation_report:
+            arcpy.AddMessage(f"[finalize_layer_attributes] --- SOUHRN ÚPRAV ATRIBUTŮ: {os.path.basename(feature_class)} ---")
+            for msg in validation_report:
+                arcpy.AddMessage(f"  - {msg}")
+            arcpy.AddMessage("------------------------------------------------------")
 
     def _fill_oznaceni_from_cad(self, feature_class, existing_field_names):
         """Pomocná metoda pro naplnění OZNACENI z CAD atributů"""
