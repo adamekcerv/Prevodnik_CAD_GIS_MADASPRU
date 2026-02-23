@@ -1527,14 +1527,40 @@ class CadFile(object):
     def finalize_layer_attributes(self, feature_class, layer_name):
         """
         Finalizuje atributy vrstvy podle GIS datového modelu.
-        1. Přidá povinné systémové atributy (SKNAZEV, OBTYPNAZEV, ID_LOKAL).
-        2. Naplní je konstantami podle typu vrstvy.
-        3. Ponechá pouze povolené atributy pro daný typ vrstvy.
-        4. Odstraní všechny ostatní (včetně pomocných a CAD atributů).
+        1. Definice datových typů a validace.
+        2. Konverze hodnot (např. "15 m" -> 15.0).
+        3. Ponechání pouze povolených atributů.
         """
         arcpy.AddMessage(f"[finalize_layer_attributes] Finalizuji atributy pro: {os.path.basename(feature_class)}")
         
-        # --- 1. Definice metadat a schématu pro jednotlivé vrstvy ---
+        # --- 1. Definice metadat a schématu ---
+        
+        # Definice datových typů pro jednotlivé atributy
+        # (Název atributu) -> (Typ, Délka, Alias)
+        FIELD_SCHEMA = {
+            "SKNAZEV": ("TEXT", 50, "SKNAZEV"),
+            "OBTYPNAZEV": ("TEXT", 50, "OBTYPNAZEV"),
+            "DOK_NAZEV": ("TEXT", 255, "DOK_NAZEV"),
+            "ID_LOKAL": ("SHORT", None, "ID_LOKAL"),
+            "OZNACENI": ("TEXT", 25, "OZNACENI"),
+            "DRUH_UP": ("TEXT", 10, "DRUH_UP"),
+            "DRUH_INFO": ("TEXT", 255, "DRUH_INFO"),
+            "PODTYP": ("TEXT", 255, "PODTYP"),
+            "DRUH_SC": ("TEXT", 10, "DRUH_SC"),
+            
+            # Výškové atributy
+            "VYSKA_VB": ("TEXT", 10, "VYSKA_VB"),
+            "VYSKA_VB_I": ("TEXT", 255, "VYSKA_VB_I"),
+            "NP_MIN": ("SHORT", None, "NP_MIN"),
+            "NP_MAX": ("SHORT", None, "NP_MAX"),
+            "NPU_MAX": ("SHORT", None, "NPU_MAX"),
+            "RIMSA_MIN": ("FLOAT", None, "RIMSA_MIN"),
+            "RIMSA_MAX": ("FLOAT", None, "RIMSA_MAX"),
+            "VYSKA_MAX": ("FLOAT", None, "VYSKA_MAX"),
+            
+            # Chybové
+            "bod": ("TEXT", 255, "bod")
+        }
         
         # Slovník mapování: Název vrstvy (část) -> (SKNAZEV, OBTYPNAZEV, Seznam povolených atributů)
         # Poznámka: ID_LOKAL je povinné u všech.
@@ -1558,7 +1584,7 @@ class CadFile(object):
             "Z_2011_UlicniCara": {
                 "SKNAZEV": "členění území",
                 "OBTYPNAZEV": "uliční čára",
-                "ATTRS": ["ID_LOKAL"] # Specifické atributy zatím nejsou v kódu řešeny (DRUH_SC atd.), ponecháme ID_LOKAL
+                "ATTRS": ["ID_LOKAL"]
             },
             "Z_2021_UlicniProstranstvi": {
                 "SKNAZEV": "členění území",
@@ -1583,22 +1609,22 @@ class CadFile(object):
             "Z_3011_StavebniCara": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "stavební čára",
-                "ATTRS": ["DRUH_SC", "DRUH_INFO"] # DRUH_SC se asi bere z CADu?
+                "ATTRS": ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"] 
             },
             "Z_3021_VyskovaRegulaceNaBod": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na bod",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
             },
-             "Z_3022_VyskovaRegulaceNaLinii": { # Přidáno pro úplnost
+             "Z_3022_VyskovaRegulaceNaLinii": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na linii",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
             },
             "Z_3023_VyskovaRegulaceNaPlochu": {
                 "SKNAZEV": "regulace struktury",
                 "OBTYPNAZEV": "výšková regulace na plochu",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS
+                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"]
             },
             "chyba_bod": {
                 "SKNAZEV": "chyba",
@@ -1608,7 +1634,7 @@ class CadFile(object):
             "chyba_resene_uzemi": {
                 "SKNAZEV": "chyba",
                 "OBTYPNAZEV": "mimo řešené území",
-                "ATTRS": [] # Specifický atribut není, chyba je dána geometrií
+                "ATTRS": [] 
             }
         }
         
@@ -1617,21 +1643,11 @@ class CadFile(object):
         found_key = None
         
         # Priorita 1: Identifikace podle původního názvu vrstvy (layer_name)
-        # layer_name je např. "203110_BL_Cast_uzemi_SB" (z CADu)
         if layer_name:
-            # Normalizace layer_name: odstranit podtržítka, uppercase
             norm_layer = layer_name.replace("_", "").upper()
-            
             for key in LAYER_DEFINITIONS:
-                # Klíč v definici: "Z_2031_StavebniBlok" -> kód "2031"
-                # Layer name: "203110..." -> kód "203110"
-                
-                # Získáme číslo z klíče
                 key_code = "".join(filter(str.isdigit, key))
-                # Získáme číslo z layer_name
                 layer_code = "".join(filter(str.isdigit, layer_name))
-                
-                # Pokud klíč kód je obsažen v layer kódu (např. 2031 je v 203110)
                 if key_code and layer_code and layer_code.startswith(key_code):
                     found_key = key
                     break
@@ -1639,17 +1655,13 @@ class CadFile(object):
         # Priorita 2: Identifikace podle názvu feature class (fc_basename)
         if not found_key:
             fc_basename = os.path.basename(feature_class)
-            
             for key in LAYER_DEFINITIONS:
-                # Zkusíme najít číslo z klíče v názvu FC
                 key_code = "".join(filter(str.isdigit, key))
                 fc_code = "".join(filter(str.isdigit, fc_basename))
-                
                 if key_code and fc_code and fc_code.startswith(key_code):
                     found_key = key
                     break
             
-            # Speciální případ pro chybové vrstvy (nemají číslo)
             if not found_key:
                 if "chyba_bod" in fc_basename:
                     found_key = "chyba_bod"
@@ -1660,110 +1672,130 @@ class CadFile(object):
             current_def = LAYER_DEFINITIONS[found_key]
             arcpy.AddMessage(f"[finalize_layer_attributes] Rozpoznán typ: {found_key}")
         else:
-            # Fallback pro ostatní nebo nerozpoznané vrstvy - zkusíme odhadnout nebo použijeme obecné
             arcpy.AddWarning(f"[finalize_layer_attributes] POZOR: Nerozpoznaný typ vrstvy '{fc_basename}'. Používám obecná metadata.")
-            
-            # Pokud jde o chybovou vrstvu, chceme zachovat atribut 'bod'
             extra_attrs = []
             if "chyba_bod" in fc_basename:
                 extra_attrs.append("bod")
-                arcpy.AddMessage(f"[finalize_layer_attributes] Rozpoznána chybová vrstva - zachovávám atribut 'bod'")
-
             current_def = {
                 "SKNAZEV": "nezarazeno",
                 "OBTYPNAZEV": "nezarazeno",
-                "ATTRS": COMMON_ATTRS + extra_attrs # Ponechat aspoň základní + specifické pro chyby
+                "ATTRS": COMMON_ATTRS + extra_attrs
             }
 
-        # --- 2.5 Mapování atributů (přejmenování) ---
-        # Pokud má vrstva mít OZNACENI, zkusíme ho naplnit z RefName nebo Text (CAD atributy)
-        if "OZNACENI" in current_def["ATTRS"]:
-            field_names = [f.name for f in arcpy.ListFields(feature_class)]
-            
-            # Pokud OZNACENI neexistuje nebo je prázdné (může být vytvořeno dříve ale nenaplněno)
-            # Pro jistotu zkontrolujeme kandidáty na zdroj
-            source_col = None
-            if "RefName" in field_names:
-                source_col = "RefName"
-            elif "Text" in field_names:
-                source_col = "Text"
-            elif "NAZEV_BLOK" in field_names:
-                source_col = "NAZEV_BLOK"
-            
-            if source_col:
-                # Pokud OZNACENI neexistuje, vytvoříme ho
-                if "OZNACENI" not in field_names:
-                    arcpy.management.AddField(feature_class, "OZNACENI", "TEXT", field_length=50)
-                
-                arcpy.AddMessage(f"[finalize_layer_attributes] Mapuji '{source_col}' -> 'OZNACENI'")
-                # Calculate field, pouze pokud OZNACENI je null nebo prázdné (což předpokládáme u nového exportu)
-                # Použijeme jednoduchý Python výraz
-                try:
-                    arcpy.management.CalculateField(feature_class, "OZNACENI", f"!{source_col}!", "PYTHON3")
-                except Exception as e:
-                    arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při mapování OZNACENI: {e}")
-
-        # --- 3. Přidání a naplnění povinných polí ---
+        # --- 3. Přidání a validace atributů ---
         
-        # SKNAZEV
-        if not any(f.name == "SKNAZEV" for f in arcpy.ListFields(feature_class)):
-            arcpy.management.AddField(feature_class, "SKNAZEV", "TEXT", field_length=50)
+        target_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]
+        existing_fields = {f.name: f for f in arcpy.ListFields(feature_class)}
+        
+        for attr_name in target_attrs:
+            if attr_name not in FIELD_SCHEMA:
+                continue
+                
+            expected_type, expected_length, expected_alias = FIELD_SCHEMA[attr_name]
             
-        # OBTYPNAZEV
-        if not any(f.name == "OBTYPNAZEV" for f in arcpy.ListFields(feature_class)):
-            arcpy.management.AddField(feature_class, "OBTYPNAZEV", "TEXT", field_length=50)
+            field_exists = attr_name in existing_fields
+            needs_conversion = False
             
-        # ID_LOKAL
-        if not any(f.name == "ID_LOKAL" for f in arcpy.ListFields(feature_class)):
-            arcpy.management.AddField(feature_class, "ID_LOKAL", "SHORT")
+            if field_exists:
+                current_field = existing_fields[attr_name]
+                current_type_generalized = "TEXT"
+                if current_field.type in ["Integer", "SmallInteger"]:
+                    current_type_generalized = "SHORT"
+                elif current_field.type in ["Double", "Single"]:
+                    current_type_generalized = "FLOAT"
+                elif current_field.type == "String":
+                    current_type_generalized = "TEXT"
+                
+                is_numeric_target = expected_type in ["SHORT", "FLOAT"]
+                is_text_current = current_field.type == "String"
+                
+                # Pokud cíl je číslo a zdroj je text -> konverze
+                if is_numeric_target and is_text_current:
+                    needs_conversion = True
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': TEXT -> {expected_type}")
+                
+                # Pokud cíl je FLOAT a zdroj je Integer/SmallInteger -> konverze (vynucení desetinných míst)
+                elif expected_type == "FLOAT" and current_field.type in ["Integer", "SmallInteger"]:
+                    needs_conversion = True
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Float)")
+                
+                # Pokud cíl je SHORT a zdroj je Float/Double nebo Integer (Long) -> konverze (zaokrouhlení nebo zmenšení)
+                elif expected_type == "SHORT" and current_field.type in ["Single", "Double", "Integer"]:
+                    needs_conversion = True
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Detekována potřeba konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Short)")
+                
+            if not field_exists:
+                # Vytvoříme nové pole
+                arcpy.management.AddField(feature_class, attr_name, expected_type, field_length=expected_length, field_alias=expected_alias)
+                if attr_name == "OZNACENI":
+                    self._fill_oznaceni_from_cad(feature_class, existing_fields.keys())
+                    
+            elif needs_conversion:
+                # Konverze: Vytvoříme TEMP field -> update hodnot -> smazat starý -> přejmenovat TEMP
+                temp_field = f"{attr_name}_TMP"
+                arcpy.management.AddField(feature_class, temp_field, expected_type, field_alias=expected_alias)
+                
+                errors = []
+                with arcpy.da.UpdateCursor(feature_class, ["OID@", attr_name, temp_field]) as cursor:
+                    for row in cursor:
+                        oid, val = row[0], row[1]
+                        new_val = None
+                        if val:
+                            try:
+                                # Strip "m", space, replace comma with dot
+                                s_val = str(val).lower().replace("m", "").replace(" ", "").replace(",", ".")
+                                if expected_type == "SHORT":
+                                    new_val = int(float(s_val))
+                                else:
+                                    new_val = float(s_val)
+                            except:
+                                errors.append(f"OID {oid}: '{val}'")
+                        
+                        row[2] = new_val
+                        cursor.updateRow(row)
+                
+                if errors:
+                    arcpy.AddWarning(f"[finalize_layer_attributes] VAROVÁNÍ: Chyby konverze '{attr_name}' ({len(errors)}x). Příklady: {', '.join(errors[:3])}")
+                
+                try:
+                    arcpy.DeleteField_management(feature_class, attr_name)
+                    arcpy.management.AlterField(feature_class, temp_field, new_field_name=attr_name, new_field_alias=expected_alias)
+                except Exception as e:
+                    arcpy.AddWarning(f"Selhalo přejmenování pole {attr_name}: {e}")
 
-        # Hromadný update nových polí konstantami
+        # --- 4. Naplnění konstant ---
         with arcpy.da.UpdateCursor(feature_class, ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]) as cursor:
             for row in cursor:
-                row[0] = current_def["SKNAZEV"]
-                row[1] = current_def["OBTYPNAZEV"]
-                row[2] = 0 # Defaultní hodnota pro ID_LOKAL
+                if not row[0]: row[0] = current_def["SKNAZEV"]
+                if not row[1]: row[1] = current_def["OBTYPNAZEV"]
+                if row[2] is None: row[2] = 0
                 cursor.updateRow(row)
-                
-        # --- 4. Filtrace atributů (Ponechat jen povolené + systémové) ---
-        
-        # Seznam všech povolených polí pro tento typ
-        allowed_fields = set(current_def["ATTRS"])
-        allowed_fields.add("SKNAZEV")
-        allowed_fields.add("OBTYPNAZEV")
-        allowed_fields.add("ID_LOKAL")
-        
-        # Systémové pole, která nesmíme smazat
-        system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE"]
-        
-        # Získání seznamu existujících polí
-        existing_fields = arcpy.ListFields(feature_class)
+
+        # --- 5. Clean up ---
+        system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE", "Shape.STArea()", "Shape.STLength()"]
+        allowed_set = set(target_attrs)
+        existing_fields_final = arcpy.ListFields(feature_class)
         fields_to_delete = []
-        
-        for field in existing_fields:
-            name = field.name
-            
-            # 1. Systémová pole - přeskočit
-            if name.upper() in [f.upper() for f in system_fields]:
-                continue
-                
-            # 2. Povolená pole - přeskočit
-            if name in allowed_fields:
-                continue
-                
-            # 3. Ostatní pole -> SMAZAT
-            # (To zahrnuje: bod, pozice_resene_uzemi, NAZEV_BLOK, VR_..., VYSKA_VB_D atd.)
-            if not field.required:
-                fields_to_delete.append(name)
+        for field in existing_fields_final:
+            if field.name not in allowed_set and field.name not in system_fields and field.name.upper() not in [s.upper() for s in system_fields]:
+                if not field.required:
+                    fields_to_delete.append(field.name)
         
         if fields_to_delete:
-            arcpy.AddMessage(f"[finalize_layer_attributes] Mažu {len(fields_to_delete)} nadbytečných polí: {', '.join(fields_to_delete[:5])}...")
+            arcpy.management.DeleteField(feature_class, fields_to_delete)
+
+    def _fill_oznaceni_from_cad(self, feature_class, existing_field_names):
+        """Pomocná metoda pro naplnění OZNACENI z CAD atributů"""
+        source_col = None
+        if "RefName" in existing_field_names: source_col = "RefName"
+        elif "Text" in existing_field_names: source_col = "Text"
+        elif "NAZEV_BLOK" in existing_field_names: source_col = "NAZEV_BLOK"
+        
+        if source_col:
             try:
-                arcpy.management.DeleteField(feature_class, fields_to_delete)
-            except Exception as e:
-                arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při mazání polí: {e}")
-        else:
-            arcpy.AddMessage("[finalize_layer_attributes] Žádná nadbytečná pole.")
+                arcpy.management.CalculateField(feature_class, "OZNACENI", f"!{source_col}!", "PYTHON3")
+            except:
+                pass
 
     def create_error_polygon_bod(self, analysis_fc, output_workspace, out_prefix):
         """
