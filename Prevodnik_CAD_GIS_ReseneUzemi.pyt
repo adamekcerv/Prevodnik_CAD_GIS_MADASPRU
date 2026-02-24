@@ -922,22 +922,57 @@ class CadFile(object):
             
             # 2. Přidat výškové atributy z bodů
             # Musíme najít správná pole ve zdrojové vrstvě (points_fc)
+            all_fields = [f.name for f in arcpy.ListFields(points_fc)]
             points_fields_map = {f.name.upper(): f.name for f in arcpy.ListFields(points_fc)}
+            arcpy.AddMessage(f"[create_vyska_polygon_layer] Dostupné atributy v bodech: {all_fields}")
             
             found_any = False
             for target_attr in transfer_attrs:
                 # Hledáme atribut ve zdroji (case-insensitive, různé varianty názvu)
                 # Varianty: NÁZEV, VR_NÁZEV
-                possible_names = [target_attr, f"VR_{target_attr}"]
+                possible_keys = [target_attr, f"VR_{target_attr}"]
                 if target_attr == "NPU_MAX": # Specifický fix pro překlepy
-                    possible_names.extend(["NUP_MAX", "VR_NUP_MAX"])
-                    
+                    possible_keys.extend(["NUP_MAX", "VR_NUP_MAX"])
+                
+                # Běžné varianty v CADu
+                if target_attr == "NP_MIN":
+                    possible_keys.extend(["MIN_NP", "NPMIN", "VR_NPMIN", "NP MIN"])
+                elif target_attr == "NP_MAX":
+                    possible_keys.extend(["MAX_NP", "NPMAX", "VR_NPMAX", "NP MAX"])
+                elif target_attr == "RIMSA_MIN":
+                    possible_keys.extend(["MIN_RIMSA", "RIMSAMIN", "VR_RIMSAMIN", "RIMSA", "RIMSA MIN"]) # RIMSA bez suffixu často bývá MIN
+                elif target_attr == "RIMSA_MAX":
+                    possible_keys.extend(["MAX_RIMSA", "RIMSAMAX", "VR_RIMSAMAX", "RIMSA MAX"])
+                elif target_attr == "VYSKA_MAX":
+                    possible_keys.extend(["MAX_VYSKA", "VYSKAMAX", "VR_VYSKAMAX", "VYSKA", "VYSKA MAX", "VYSKA_TOTAL", "VYSKA_CELKEM"])
+                elif target_attr == "VYSKA_VB":
+                     possible_keys.extend(["VYSKAVB", "VR_VYSKAVB", "VYSKA VB"])
+                
                 src_field_name = None
-                for n in possible_names:
+                for n in possible_keys:
                     if n.upper() in points_fields_map:
                         src_field_name = points_fields_map[n.upper()]
                         break
                 
+                # Pokud stále nenalezeno, zkusíme najít pole končící na požadovaný název (např. BLK_NP_MIN)
+                if not src_field_name:
+                    for f_name_upper in points_fields_map:
+                        if f_name_upper.endswith(target_attr) or f_name_upper.endswith(f"_{target_attr}"):
+                             # Ochrana před konflikty (aby NP_MIN nebylo nalezeno v NPU_MIN)
+                             if target_attr == "NP_MIN" and "NPU" in f_name_upper: continue
+                             src_field_name = points_fields_map[f_name_upper]
+                             arcpy.AddMessage(f"[create_vyska_polygon_layer] Nalezeno pole '{src_field_name}' pro '{target_attr}' pomocí suffixu.")
+                             break
+                
+                # Pokud stále nenalezeno, zkusíme najít pole s mezerami (např. "NP MAX")
+                if not src_field_name:
+                    target_variations = [target_attr.replace("_", " "), target_attr.replace("_", "")]
+                    for var in target_variations:
+                         if var.upper() in points_fields_map:
+                             src_field_name = points_fields_map[var.upper()]
+                             arcpy.AddMessage(f"[create_vyska_polygon_layer] Nalezeno pole '{src_field_name}' pro '{target_attr}' (varianta: {var}).")
+                             break
+
                 if src_field_name:
                     # Vytvoření FieldMap pro jeden atribut
                     fm = arcpy.FieldMap()
@@ -956,10 +991,15 @@ class CadFile(object):
                     if existing_index != -1:
                         # Pokud existuje, nahradíme ho (chceme hodnotu z bodu, ne z polygonu)
                         field_mappings.replaceFieldMap(existing_index, fm)
+                        # arcpy.AddMessage(f"[create_vyska_polygon_layer] Nalezeno pole '{src_field_name}' pro '{target_attr}'.")
                     else:
                         field_mappings.addFieldMap(fm)
+                        # arcpy.AddMessage(f"[create_vyska_polygon_layer] Nalezeno pole '{src_field_name}' pro '{target_attr}'.")
                     
                     found_any = True
+                else:
+                     pass # Už nebudeme logovat nenašlezené pole jako warning, aby to uživatele nepletlo
+                     # arcpy.AddWarning(f"[create_vyska_polygon_layer] Pole pro '{target_attr}' nenalezeno v bodech.")
             
             # Spatial Join (HAVE_THEIR_CENTER_IN - bod musí být uvnitř polygonu)
             # Join type: KEEP_COMMON = INNER JOIN -> zůstanou jen polygony, které mají bod!
