@@ -1354,20 +1354,27 @@ class HeightRegulationImport(object):
                 log_message(f"Dostupné výškové atributy v finální vrstvě: {', '.join(available_height_attrs)}", "DEBUG")
                 
                 # Statistiky pro VŠECHNY výškové atributy
+                # Dissolve pouze podle TARGET_FID + SC_TYPE → výšky jsou STATS (FIRST + UNIQUE)
+                # Tím vzniknou UNIQUE_ pole pro detekci chyb (více VR bloků na jednom segmentu)
                 stats_fields = []
+                sj_field_names = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
                 for attr in available_height_attrs:
                     stats_fields.append(f"{attr} FIRST")
-                    stats_fields.append(f"{attr} COUNT")
                     stats_fields.append(f"{attr} UNIQUE")
-                
+                if "ID_LOKAL" in sj_field_names:
+                    stats_fields.append("ID_LOKAL FIRST")
+                if "DRUH_SC" in sj_field_names:
+                    stats_fields.append("DRUH_SC FIRST")
+                if "DRUH_INFO" in sj_field_names:
+                    stats_fields.append("DRUH_INFO FIRST")
+
                 stats = ";".join(stats_fields) if stats_fields else ""
-                
-                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY výškové atributy
-                # Tím se NESLOUČÍ segmenty s různými výškami!
-                dissolve_fields = ["TARGET_FID", "SC_TYPE"] + available_height_attrs
-                
+
+                # Dissolve pouze podle TARGET_FID + SC_TYPE (BEZ výškových atributů)
+                dissolve_fields = ["TARGET_FID", "SC_TYPE"]
+
                 log_message(f"Dissolve fields: {', '.join(dissolve_fields)}", "DEBUG")
-                
+
                 arcpy.management.Dissolve(
                     in_features=r"memory\sc_final_sj",
                     out_feature_class=r"memory\sc_final_dissolved",
@@ -1376,7 +1383,53 @@ class HeightRegulationImport(object):
                     multi_part="SINGLE_PART",
                     unsplit_lines="DISSOLVE_LINES"
                 )
-                
+
+                # Přejmenuj FIRST_ATTR → ATTR pro přehlednost dalšího zpracování
+                # (AlterField nepodporuje memory workspace → AddField + CalculateField + DeleteField)
+                _type_map = {"String": "TEXT", "Double": "DOUBLE", "Single": "FLOAT",
+                             "Short": "SHORT", "Long": "LONG", "Integer": "LONG", "Date": "DATE"}
+                dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                _attrs_to_rename = list(dict.fromkeys(available_height_attrs + ["ID_LOKAL", "DRUH_SC", "DRUH_INFO"]))
+                for attr in _attrs_to_rename:
+                    first_name = f"FIRST_{attr}"
+                    if first_name in dissolved_fields_dict and attr not in dissolved_fields_dict:
+                        try:
+                            first_field = dissolved_fields_dict[first_name]
+                            fld_type = _type_map.get(first_field.type, "TEXT")
+                            if first_field.type == "String":
+                                arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type,
+                                                          field_length=first_field.length)
+                            else:
+                                arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type)
+                            arcpy.management.CalculateField(r"memory\sc_final_dissolved", attr,
+                                                            f"!{first_name}!", "PYTHON3")
+                            arcpy.management.DeleteField(r"memory\sc_final_dissolved", [first_name])
+                            dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                        except Exception as e_ren:
+                            log_message(f"Přejmenování {first_name} selhalo: {e_ren}", "WARN")
+
+                # Rename known CAD field name aliases to canonical data model names
+                # NUP_MAX (CAD typo) → NPU_MAX (data model), plus UNIQUE_NUP_MAX → UNIQUE_NPU_MAX
+                dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                for cad_name, model_name in [("NUP_MAX", "NPU_MAX")]:
+                    for _rsrc, _rdst in [(cad_name, model_name),
+                                        (f"UNIQUE_{cad_name}", f"UNIQUE_{model_name}")]:
+                        if _rsrc in dissolved_fields_dict and _rdst not in dissolved_fields_dict:
+                            try:
+                                _rf = dissolved_fields_dict[_rsrc]
+                                _rftype = _type_map.get(_rf.type, "TEXT")
+                                if _rf.type == "String":
+                                    arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype,
+                                                              field_length=_rf.length)
+                                else:
+                                    arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype)
+                                arcpy.management.CalculateField(r"memory\sc_final_dissolved", _rdst,
+                                                                f"!{_rsrc}!", "PYTHON3")
+                                arcpy.management.DeleteField(r"memory\sc_final_dissolved", [_rsrc])
+                                dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                            except Exception as e_cad:
+                                log_message(f"Přejmenování CAD aliasu {_rsrc}→{_rdst} selhalo: {e_cad}", "WARN")
+
                 sc_final_with_vr = r"memory\sc_final_dissolved"
                 final_count = get_feature_count(sc_final_with_vr)
                 log_message(f"Finální vrstva po dissolve: {final_count} segmentů", "OK")
@@ -1507,20 +1560,19 @@ class HeightRegulationImport(object):
                 log_message("Tvořím Z_3022_VyskovaRegulaceNaLinii_l...", "STEP")
 
                 try:
-                    # Dissolve podle TARGET_FID + všechny výškové atributy
-                    # → sloučí sub-segmenty se stejnou výškou, zachová TARGET_FID pro detekci chyb
-                    dissolve_fields_3022 = ["TARGET_FID"] + available_height_attrs_final
+                    # Dissolve POUZE podle výškových atributů (BEZ SC_TYPE, BEZ TARGET_FID)
+                    # → segmenty od rozhraní k rozhraní se stejnou výškou se sloučí,
+                    #   nezáleží na tom, zda jsou z různých SC typů
+                    dissolve_fields_3022 = available_height_attrs_final if available_height_attrs_final else []
 
-                    # Statistiky: FIRST výšky + UNIQUE výšky (pro detekci chyb) + FIRST ID_LOKAL
+                    # Statistiky: ID_LOKAL + UNIQUE_ pole pro detekci chyb
                     stats_3022 = []
-                    for attr in available_height_attrs_final:
-                        stats_3022.append(f"{attr} FIRST")
-                        stats_3022.append(f"{attr} UNIQUE")
                     if "ID_LOKAL" in fields_in_final:
                         stats_3022.append("ID_LOKAL FIRST")
-                    if "DRUH_SC" in fields_in_final:
-                        stats_3022.append("DRUH_SC FIRST")
-                        stats_3022.append("DRUH_INFO FIRST")
+                    for attr in available_height_attrs_final:
+                        unique_fname = f"UNIQUE_{attr}"
+                        if unique_fname in fields_in_final:
+                            stats_3022.append(f"{unique_fname} MAX")
 
                     arcpy.management.Dissolve(
                         in_features=sc_final_with_vr,
@@ -1541,8 +1593,9 @@ class HeightRegulationImport(object):
                     # Přejmenuj FIRST_ pole zpět na čistá jména a přidej atributy datového modelu
                     vr_3022_fields = [f.name for f in arcpy.ListFields(vr_3022_fc)]
 
-                    # Přejmenování FIRST_ATTR → ATTR (ArcGIS přidává prefix FIRST_ po dissolve)
-                    for attr in available_height_attrs_final + ["ID_LOKAL", "DRUH_SC", "DRUH_INFO"]:
+                    # Výškové atributy jsou dissolve fields → jsou přímo jako VYSKA_VB, RIMSA_MAX atd.
+                    # Přejmenovat jen FIRST_ID_LOKAL → ID_LOKAL (ID_LOKAL bylo v stats)
+                    for attr in ["ID_LOKAL"]:
                         first_name = f"FIRST_{attr}"
                         if first_name in vr_3022_fields and attr not in vr_3022_fields:
                             arcpy.management.AlterField(vr_3022_fc, first_name, attr, attr)
@@ -1565,8 +1618,8 @@ class HeightRegulationImport(object):
                             cursor.updateRow(row)
 
                     # Smazat nadbytečná pole - zachovat jen pole datového modelu
+                    # + MAX_UNIQUE_* pole (potřebná pro error detection níže, smažou se po detekci)
                     keep_3022 = {"SKNAZEV", "OBTYPNAZEV", "ID_LOKAL",
-                                 "DRUH_SC", "DRUH_INFO",
                                  "VYSKA_VB", "VYSKA_VB_I",
                                  "NP_MIN", "NP_MAX", "NPU_MAX",
                                  "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"}
@@ -1574,6 +1627,9 @@ class HeightRegulationImport(object):
                     del_3022 = []
                     for fn in vr_3022_fields_now:
                         if fn in keep_3022:
+                            continue
+                        # Zachovat MAX_UNIQUE_* pro error detection (smažou se po detekci chyb)
+                        if fn.startswith("MAX_UNIQUE_"):
                             continue
                         fi = arcpy.ListFields(vr_3022_fc, fn)[0]
                         if fi.required or fi.type in ("OID", "Geometry"):
@@ -1594,32 +1650,35 @@ class HeightRegulationImport(object):
                     # (detekováno přes UNIQUE_RIMSA_MAX nebo UNIQUE jiného atributu > 1)
                     # --------------------------------------------------------
                     try:
-                        # Sestav where_clause pro detekci chyb - alespoň jeden UNIQUE_ atribut > 1
+                        # Detekce chyb: MAX_UNIQUE_ATTR > 1 = na alespoň jednom sub-segmentu
+                        # bylo více VR bloků s různými hodnotami
                         unique_fields_in_vr = [f.name for f in arcpy.ListFields(vr_3022_fc)
-                                               if f.name.startswith("UNIQUE_")]
+                                               if f.name.startswith("MAX_UNIQUE_")]
                         if unique_fields_in_vr:
                             error_where = " OR ".join([f"{uf} > 1" for uf in unique_fields_in_vr])
-                            arcpy.management.SelectLayerByAttribute(
-                                in_layer_or_view=vr_3022_fc,
-                                selection_type="NEW_SELECTION",
-                                where_clause=error_where
-                            )
-                            err_count = int(arcpy.GetCount_management(vr_3022_fc)[0])
+                            # MakeFeatureLayer required: GetCount + ExportFeatures respect selection
+                            # only when operating on a named layer, not a bare feature class path.
+                            _err_lyr = "_vr3022_err_check"
+                            arcpy.management.MakeFeatureLayer(vr_3022_fc, _err_lyr)
+                            try:
+                                arcpy.management.SelectLayerByAttribute(
+                                    in_layer_or_view=_err_lyr,
+                                    selection_type="NEW_SELECTION",
+                                    where_clause=error_where
+                                )
+                                err_count = int(arcpy.GetCount_management(_err_lyr)[0])
 
-                            if err_count > 0:
-                                vr_err_name = f"{out_prefix}3022_VyskovaRegulaceNaLinii_l_Errors" if out_prefix else "Z_3022_VyskovaRegulaceNaLinii_l_Errors"
-                                vr_err_name = generate_unique_name(output_gdb, vr_err_name)
-                                vr_err_fc = os.path.join(output_workspace, vr_err_name)
-                                arcpy.conversion.ExportFeatures(vr_3022_fc, vr_err_fc)
-                                log_message(f"Z_3022_Errors: {err_count} chybných segmentů → {vr_err_name}", "WARN")
-                                errors_outputs.append(vr_err_fc)
-                            else:
-                                log_message("Z_3022: Žádné chyby (všechny segmenty mají max. 1 VR blok)", "OK")
-
-                            arcpy.management.SelectLayerByAttribute(
-                                in_layer_or_view=vr_3022_fc,
-                                selection_type="CLEAR_SELECTION"
-                            )
+                                if err_count > 0:
+                                    vr_err_name = f"{out_prefix}3022_VyskovaRegulaceNaLinii_l_Errors" if out_prefix else "Z_3022_VyskovaRegulaceNaLinii_l_Errors"
+                                    vr_err_name = generate_unique_name(output_gdb, vr_err_name)
+                                    vr_err_fc = os.path.join(output_workspace, vr_err_name)
+                                    arcpy.conversion.ExportFeatures(_err_lyr, vr_err_fc)
+                                    log_message(f"Z_3022_Errors: {err_count} chybných segmentů → {vr_err_name}", "WARN")
+                                    errors_outputs.append(vr_err_fc)
+                                else:
+                                    log_message("Z_3022: Žádné chyby (všechny segmenty mají max. 1 VR blok)", "OK")
+                            finally:
+                                arcpy.management.Delete(_err_lyr)
 
                             # Smazat UNIQUE_ pole z výsledné vrstvy (jsou jen pro interní detekci chyb)
                             arcpy.management.DeleteField(vr_3022_fc, unique_fields_in_vr)
