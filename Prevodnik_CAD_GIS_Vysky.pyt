@@ -9,12 +9,32 @@ DEFAULT_LAYERS = [
     "302211_PL_VR_na_linii_rozhrani"
 ]
 
-# Výškové atributy pro dissolve a přenos
+# Výškové atributy pro dissolve a přenos (VYSKOVA_REGULACE_SPOLECNE_ATRIBUTY)
 HEIGHT_ATTRIBUTES = [
-    "RIMSA_MIN", "RIMSA_MAX",
+    "VYSKA_VB", "VYSKA_VB_I",
     "NP_MIN", "NP_MAX", "NPU_MAX",
-    "VYSKA_MAX", "VYSKA_VB", "VYSKA_VB_I"
+    "RIMSA_MIN", "RIMSA_MAX",
+    "VYSKA_MAX"
 ]
+
+# Mapování čísla CAD vrstvy na kód domény DRUH_STAVEBNI_CARY
+SC_DRUH_MAPPING = {
+    "301110": "SCU",   # stavební čára uzavřená
+    "301111": "SCPU",  # stavební čára polouzavřená
+    "301112": "SCO",   # stavební čára otevřená
+    "301113": "SCV",   # stavební čára volná
+    "301114": "SC",    # stavební čára bez rozlišení
+    "301115": "SCX",   # stavební čára jiná
+}
+
+def get_druh_sc_from_sc_type(sc_type):
+    """Vrátí kód DRUH_SC na základě názvu SC_TYPE (číslo vrstvy je prefix)."""
+    if not sc_type:
+        return None
+    for prefix, druh in SC_DRUH_MAPPING.items():
+        if str(sc_type).startswith(prefix):
+            return druh
+    return None
 
 def generate_unique_name(gdb_path, base_name):
     """Generuje unikátní název pro feature class v geodatabázi"""
@@ -810,7 +830,7 @@ class HeightRegulationImport(object):
                 out_feature_class=r"memory\sc_dissolve_clean",
                 dissolve_field="SC_TYPE",  # Zachovat typ SC
                 multi_part="SINGLE_PART",
-                unsplit_lines="DISSOLVE_LINES"
+                unsplit_lines="DISSOLVE_LINES" 
             )
             
             clean_count = get_feature_count(r"memory\sc_dissolve_clean")
@@ -1384,166 +1404,258 @@ class HeightRegulationImport(object):
             sc_final_with_vr = sc_cleaned
         
         # ============================================================
-        # FÁZE 9: ROZDĚLENÍ PODLE TYPŮ SC + DETEKCE CHYB
+        # FÁZE 9: TVORBA VÝSTUPNÍCH VRSTEV DLE DATOVÉHO MODELU
         # ============================================================
         log_message("=" * 60, "INFO")
-        log_message("FÁZE 9: ROZDĚLENÍ PODLE TYPŮ SC + DETEKCE CHYB", "STEP")
+        log_message("FÁZE 9: TVORBA VÝSTUPNÍCH VRSTEV DLE DATOVÉHO MODELU", "STEP")
         log_message("=" * 60, "INFO")
-        
+
         final_outputs = []
         errors_outputs = []
-        
+
         if sc_final_with_vr:
             try:
-                # DEBUG - detailní kontrola SC_TYPE před rozdělením
-                fields = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
-                log_message(f"Dostupná pole před rozdělením: {', '.join(fields)}", "DEBUG")
-                
-                if "SC_TYPE" not in fields:
-                    log_message("CHYBA: SC_TYPE pole NEEXISTUJE v finální vrstvě!", "ERROR")
-                    log_message("Pravděpodobně bylo ztraceno během dissolve operace", "ERROR")
-                    sc_types = [None]
-                else:
-                    # Zjisti dostupné typy SC s počtem
-                    sc_types = set()
-                    sc_type_counts = {}
-                    null_count = 0
-                    
-                    with arcpy.da.SearchCursor(sc_final_with_vr, ["SC_TYPE"]) as cursor:
+                fields_in_final = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
+
+                # Zjisti, které výškové atributy jsou dostupné ve výsledné vrstvě
+                available_height_attrs_final = [a for a in HEIGHT_ATTRIBUTES if a in fields_in_final]
+                log_message(f"Dostupné výškové atributy ve finální vrstvě: {', '.join(available_height_attrs_final)}", "DEBUG")
+
+                # --------------------------------------------------------
+                # 9A: Z_3011_StavebniCara_l
+                # Čistá geometrie SC (dissolve bez výškových atributů),
+                # s DRUH_SC mapovaným z SC_TYPE a atributy datového modelu.
+                # --------------------------------------------------------
+                log_message("Tvořím Z_3011_StavebniCara_l...", "STEP")
+
+                try:
+                    # Dissolve všech SC segmentů podle SC_TYPE (zachová typ čáry, sloučí segmenty)
+                    arcpy.management.Dissolve(
+                        in_features=sc_final_with_vr,
+                        out_feature_class=r"memory\sc_3011_dissolve",
+                        dissolve_field=["SC_TYPE"],
+                        statistics_fields=None,
+                        multi_part="SINGLE_PART",
+                        unsplit_lines="DISSOLVE_LINES"
+                    )
+
+                    sc_3011_name = f"{out_prefix}3011_StavebniCara_l" if out_prefix else "Z_3011_StavebniCara_l"
+                    sc_3011_name = generate_unique_name(output_gdb, sc_3011_name)
+                    sc_3011_fc = os.path.join(output_workspace, sc_3011_name)
+
+                    arcpy.conversion.ExportFeatures(r"memory\sc_3011_dissolve", sc_3011_fc)
+                    arcpy.Delete_management(r"memory\sc_3011_dissolve")
+
+                    # Přidat atributy datového modelu
+                    arcpy.management.AddField(sc_3011_fc, "SKNAZEV", "TEXT", field_length=50)
+                    arcpy.management.AddField(sc_3011_fc, "OBTYPNAZEV", "TEXT", field_length=50)
+                    arcpy.management.AddField(sc_3011_fc, "DRUH_SC", "TEXT", field_length=10)
+                    arcpy.management.AddField(sc_3011_fc, "DRUH_INFO", "TEXT", field_length=255)
+                    arcpy.management.AddField(sc_3011_fc, "ID_LOKAL", "SHORT")
+
+                    # Naplnit atributy
+                    with arcpy.da.UpdateCursor(sc_3011_fc, ["SC_TYPE", "SKNAZEV", "OBTYPNAZEV", "DRUH_SC"]) as cursor:
                         for row in cursor:
-                            if row[0]:
-                                sc_types.add(row[0])
-                                sc_type_counts[row[0]] = sc_type_counts.get(row[0], 0) + 1
+                            row[1] = "regulace struktury"
+                            row[2] = "stavební čára"
+                            row[3] = get_druh_sc_from_sc_type(row[0])
+                            cursor.updateRow(row)
+
+                    # Přenést DRUH_INFO z původní vrstvy (pokud existuje)
+                    if "DRUH_INFO" in fields_in_final:
+                        sc_3011_fields = [f.name for f in arcpy.ListFields(sc_3011_fc)]
+                        if "DRUH_INFO" in sc_3011_fields:
+                            # DRUH_INFO je prázdné, přenést z merged_sc_all pokud dostupné
+                            try:
+                                druh_info_map = {}
+                                with arcpy.da.SearchCursor(sc_final_with_vr, ["SC_TYPE", "DRUH_INFO"]) as sc:
+                                    for r in sc:
+                                        if r[0] and r[1]:
+                                            druh_info_map[r[0]] = r[1]
+                                with arcpy.da.UpdateCursor(sc_3011_fc, ["SC_TYPE", "DRUH_INFO"]) as uc:
+                                    for r in uc:
+                                        if r[0] in druh_info_map:
+                                            r[1] = druh_info_map[r[0]]
+                                            uc.updateRow(r)
+                            except Exception as e_di:
+                                log_message(f"Přenos DRUH_INFO selhal: {e_di}", "WARN")
+
+                    # Smazat pomocné pole SC_TYPE z výstupní vrstvy
+                    sc_3011_existing = [f.name for f in arcpy.ListFields(sc_3011_fc)]
+                    fields_to_remove_3011 = [f for f in sc_3011_existing
+                                              if f not in ("OBJECTID", "Shape", "Shape_Length",
+                                                           "SKNAZEV", "OBTYPNAZEV", "DRUH_SC",
+                                                           "DRUH_INFO", "ID_LOKAL")
+                                              and not arcpy.ListFields(sc_3011_fc, f)[0].required
+                                              and arcpy.ListFields(sc_3011_fc, f)[0].type not in ("OID", "Geometry")]
+                    if fields_to_remove_3011:
+                        arcpy.management.DeleteField(sc_3011_fc, fields_to_remove_3011)
+
+                    sc_3011_count = get_feature_count(sc_3011_fc)
+                    log_message(f"Z_3011_StavebniCara_l: {sc_3011_count} prvků → {sc_3011_name}", "OK")
+                    final_outputs.append(sc_3011_fc)
+
+                except Exception as e:
+                    log_message(f"Chyba při tvorbě Z_3011_StavebniCara_l: {e}", "ERROR")
+
+                # --------------------------------------------------------
+                # 9B: Z_3022_VyskovaRegulaceNaLinii_l
+                # Všechny SC segmenty (i bez výšky), s výškovými atributy
+                # přiřazenými spatial joinem. Obsahuje i NULL segmenty.
+                # Detekce chyb: segmenty s více než jedním VR blokem.
+                # --------------------------------------------------------
+                log_message("Tvořím Z_3022_VyskovaRegulaceNaLinii_l...", "STEP")
+
+                try:
+                    # Dissolve podle TARGET_FID + všechny výškové atributy
+                    # → sloučí sub-segmenty se stejnou výškou, zachová TARGET_FID pro detekci chyb
+                    dissolve_fields_3022 = ["TARGET_FID"] + available_height_attrs_final
+
+                    # Statistiky: FIRST výšky + UNIQUE výšky (pro detekci chyb) + FIRST ID_LOKAL
+                    stats_3022 = []
+                    for attr in available_height_attrs_final:
+                        stats_3022.append(f"{attr} FIRST")
+                        stats_3022.append(f"{attr} UNIQUE")
+                    if "ID_LOKAL" in fields_in_final:
+                        stats_3022.append("ID_LOKAL FIRST")
+                    if "DRUH_SC" in fields_in_final:
+                        stats_3022.append("DRUH_SC FIRST")
+                        stats_3022.append("DRUH_INFO FIRST")
+
+                    arcpy.management.Dissolve(
+                        in_features=sc_final_with_vr,
+                        out_feature_class=r"memory\sc_3022_dissolve",
+                        dissolve_field=dissolve_fields_3022,
+                        statistics_fields=";".join(stats_3022) if stats_3022 else "",
+                        multi_part="SINGLE_PART",
+                        unsplit_lines="DISSOLVE_LINES"
+                    )
+
+                    vr_3022_name = f"{out_prefix}3022_VyskovaRegulaceNaLinii_l" if out_prefix else "Z_3022_VyskovaRegulaceNaLinii_l"
+                    vr_3022_name = generate_unique_name(output_gdb, vr_3022_name)
+                    vr_3022_fc = os.path.join(output_workspace, vr_3022_name)
+
+                    arcpy.conversion.ExportFeatures(r"memory\sc_3022_dissolve", vr_3022_fc)
+                    arcpy.Delete_management(r"memory\sc_3022_dissolve")
+
+                    # Přejmenuj FIRST_ pole zpět na čistá jména a přidej atributy datového modelu
+                    vr_3022_fields = [f.name for f in arcpy.ListFields(vr_3022_fc)]
+
+                    # Přejmenování FIRST_ATTR → ATTR (ArcGIS přidává prefix FIRST_ po dissolve)
+                    for attr in available_height_attrs_final + ["ID_LOKAL", "DRUH_SC", "DRUH_INFO"]:
+                        first_name = f"FIRST_{attr}"
+                        if first_name in vr_3022_fields and attr not in vr_3022_fields:
+                            arcpy.management.AlterField(vr_3022_fc, first_name, attr, attr)
+
+                    # Aktualizuj seznam polí po přejmenování
+                    vr_3022_fields = [f.name for f in arcpy.ListFields(vr_3022_fc)]
+
+                    # Přidat SKNAZEV a OBTYPNAZEV pokud chybí
+                    if "SKNAZEV" not in vr_3022_fields:
+                        arcpy.management.AddField(vr_3022_fc, "SKNAZEV", "TEXT", field_length=50)
+                    if "OBTYPNAZEV" not in vr_3022_fields:
+                        arcpy.management.AddField(vr_3022_fc, "OBTYPNAZEV", "TEXT", field_length=50)
+                    if "ID_LOKAL" not in vr_3022_fields:
+                        arcpy.management.AddField(vr_3022_fc, "ID_LOKAL", "SHORT")
+
+                    with arcpy.da.UpdateCursor(vr_3022_fc, ["SKNAZEV", "OBTYPNAZEV"]) as cursor:
+                        for row in cursor:
+                            row[0] = "regulace struktury"
+                            row[1] = "výšková regulace na linii"
+                            cursor.updateRow(row)
+
+                    # Smazat nadbytečná pole - zachovat jen pole datového modelu
+                    keep_3022 = {"SKNAZEV", "OBTYPNAZEV", "ID_LOKAL",
+                                 "DRUH_SC", "DRUH_INFO",
+                                 "VYSKA_VB", "VYSKA_VB_I",
+                                 "NP_MIN", "NP_MAX", "NPU_MAX",
+                                 "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"}
+                    vr_3022_fields_now = [f.name for f in arcpy.ListFields(vr_3022_fc)]
+                    del_3022 = []
+                    for fn in vr_3022_fields_now:
+                        if fn in keep_3022:
+                            continue
+                        fi = arcpy.ListFields(vr_3022_fc, fn)[0]
+                        if fi.required or fi.type in ("OID", "Geometry"):
+                            continue
+                        if fn.lower() in ("shape_length", "shape_area"):
+                            continue
+                        del_3022.append(fn)
+                    if del_3022:
+                        arcpy.management.DeleteField(vr_3022_fc, del_3022)
+
+                    vr_3022_count = get_feature_count(vr_3022_fc)
+                    log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
+                    final_outputs.append(vr_3022_fc)
+
+                    # --------------------------------------------------------
+                    # 9C: Z_3022_VyskovaRegulaceNaLinii_l_Errors
+                    # Segmenty s více než jedním přiřazeným VR blokem
+                    # (detekováno přes UNIQUE_RIMSA_MAX nebo UNIQUE jiného atributu > 1)
+                    # --------------------------------------------------------
+                    try:
+                        # Sestav where_clause pro detekci chyb - alespoň jeden UNIQUE_ atribut > 1
+                        unique_fields_in_vr = [f.name for f in arcpy.ListFields(vr_3022_fc)
+                                               if f.name.startswith("UNIQUE_")]
+                        if unique_fields_in_vr:
+                            error_where = " OR ".join([f"{uf} > 1" for uf in unique_fields_in_vr])
+                            arcpy.management.SelectLayerByAttribute(
+                                in_layer_or_view=vr_3022_fc,
+                                selection_type="NEW_SELECTION",
+                                where_clause=error_where
+                            )
+                            err_count = int(arcpy.GetCount_management(vr_3022_fc)[0])
+
+                            if err_count > 0:
+                                vr_err_name = f"{out_prefix}3022_VyskovaRegulaceNaLinii_l_Errors" if out_prefix else "Z_3022_VyskovaRegulaceNaLinii_l_Errors"
+                                vr_err_name = generate_unique_name(output_gdb, vr_err_name)
+                                vr_err_fc = os.path.join(output_workspace, vr_err_name)
+                                arcpy.conversion.ExportFeatures(vr_3022_fc, vr_err_fc)
+                                log_message(f"Z_3022_Errors: {err_count} chybných segmentů → {vr_err_name}", "WARN")
+                                errors_outputs.append(vr_err_fc)
                             else:
-                                null_count += 1
-                    
-                    if not sc_types:
-                        log_message(f"SC_TYPE pole existuje, ale všechny hodnoty jsou NULL ({null_count} prvků)", "WARN")
-                        log_message("Pravděpodobně bylo pole ztraceno během dissolve", "WARN")
-                        sc_types = [None]
-                    else:
-                        log_message(f"Nalezeno {len(sc_types)} typů SC:", "OK")
-                        for sc_type in sorted(sc_types):
-                            log_message(f"  - {sc_type}: {sc_type_counts[sc_type]} segmentů", "DEBUG")
-                        if null_count > 0:
-                            log_message(f"  - NULL hodnot: {null_count} segmentů", "WARN")
-                
-                # Seznam polí, která chceme zachovat (kromě systémových)
-                KEEP_FIELDS = [
-                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO", 
-                    "NP_MAX", "NUP_MAX", "RIMSA_MAX", 
-                    "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
-                ]
+                                log_message("Z_3022: Žádné chyby (všechny segmenty mají max. 1 VR blok)", "OK")
 
-                # Pro každý nalezený typ SC
-                for sc_type in sc_types:
-                    if sc_type is None:
-                        continue
-                        
-                    # FILTR: Pouze typy začínající na 3011
-                    if not str(sc_type).startswith('3011'):
-                        continue
+                            arcpy.management.SelectLayerByAttribute(
+                                in_layer_or_view=vr_3022_fc,
+                                selection_type="CLEAR_SELECTION"
+                            )
 
-                    log_message("=" * 60, "INFO")
-                    log_message(f"Zpracovávám typ: {sc_type}", "STEP")
-                    
-                    # Construct valid output name
-                    safe_name = sanitize_name(sc_type)
-                    if out_prefix:
-                        out_name = f"{out_prefix}_{safe_name}"
-                    else:
-                        out_name = f"Z_{safe_name}"
-                        
-                    # Ensure checking for existence/uniqueness in the whole GDB
-                    # Use custom helper generate_unique_name which checks datasets too
-                    unique_out_name = generate_unique_name(output_gdb, out_name)
-                    out_fc = os.path.join(output_workspace, unique_out_name)
-                    
-                    # Select
-                    where_clause = f"SC_TYPE = '{sc_type}'"
-                    log_message(f"WHERE: {where_clause}", "DEBUG")
-                    
-                    try:
-                        arcpy.conversion.ExportFeatures(
-                            in_features=sc_final_with_vr,
-                            out_features=out_fc,
-                            where_clause=where_clause
-                        )
-                        
-                        log_message(f"Exportováno: {unique_out_name}", "OK")
-                        
-                        # FILTRACE POLÍ
-                        # Získáme seznam polí v nové vrstvě
-                        existing_fields = [f.name for f in arcpy.ListFields(out_fc)]
-                        fields_to_delete = []
-                        
-                        for field_name in existing_fields:
-                            # Nechceme mazat systémová pole
-                            f_info = arcpy.ListFields(out_fc, field_name)[0]
-                            if f_info.type in ["OID", "Geometry", "GlobalID", "GUID"]:
-                                continue
-                            if f_info.required:
-                                continue
-                            if field_name.lower() in ["shape_length", "shape_area"]:
-                                continue
-                                
-                            # Pokud pole není v KEEP_FIELDS, smažeme ho
-                            if field_name not in KEEP_FIELDS:
-                                fields_to_delete.append(field_name)
-                        
-                        if fields_to_delete:
-                            # log_message(f"Mazání nadbytečných polí: {len(fields_to_delete)}", "DEBUG")
-                            arcpy.management.DeleteField(out_fc, fields_to_delete)
-                        
-                        final_outputs.append(out_fc)
-                        
-                    except Exception as e:
-                        log_message(f"Chyba při exportu {sc_type}: {e}", "ERROR")
+                            # Smazat UNIQUE_ pole z výsledné vrstvy (jsou jen pro interní detekci chyb)
+                            arcpy.management.DeleteField(vr_3022_fc, unique_fields_in_vr)
 
-                # EXPORT VR_NA_BOD (pokud existuje)
-                # Musíme najít správný název vrstvy v memory nebo GDB. 
-                # V Phase 1 se importovalo. Zkusíme pohledat vrstvou končící na "302110_BL_VR_na_bod" v importovaných.
-                # Nebo prostě prohledáme 'memory'
-                
-                # EXPORT VR_NA_BOD (pokud existuje)
-                # Použijeme proměnnou vr_na_bod_layer z Phase 1
-                
+                    except Exception as e_err:
+                        log_message(f"Chyba při tvorbě vrstvy chyb Z_3022: {e_err}", "WARN")
+
+                except Exception as e:
+                    log_message(f"Chyba při tvorbě Z_3022_VyskovaRegulaceNaLinii_l: {e}", "ERROR")
+
+                # --------------------------------------------------------
+                # 9D: Export VR_NA_BOD (pokud existuje)
+                # --------------------------------------------------------
                 if vr_na_bod_layer and arcpy.Exists(vr_na_bod_layer):
-                    vr_bod_source = vr_na_bod_layer
-                    
-                    out_name_bod = "Z_302110_BL_VR_na_bod"
-                    if out_prefix: out_name_bod = f"{out_prefix}_{out_name_bod}"
-                    
-                    # Ensure unique
-                    unique_out_bod = generate_unique_name(output_gdb, out_name_bod)
-                    out_fc_bod = os.path.join(output_workspace, unique_out_bod)
-                    
                     try:
-                        log_message(f"Exportuji VR na bod: {unique_out_bod}", "STEP")
-                        arcpy.conversion.ExportFeatures(vr_bod_source, out_fc_bod)
-                        
-                        # Filtrace polí i zde
-                        existing_fields = [f.name for f in arcpy.ListFields(out_fc_bod)]
-                        fields_to_delete = []
-                        for field_name in existing_fields:
-                            f_info = arcpy.ListFields(out_fc_bod, field_name)[0]
-                            if f_info.type in ["OID", "Geometry", "GlobalID", "GUID"] or f_info.required or field_name.lower() in ["shape_length", "shape_area"]:
-                                continue
-                            if field_name not in KEEP_FIELDS:
-                                fields_to_delete.append(field_name)
-                                
-                        if fields_to_delete:
-                            arcpy.management.DeleteField(out_fc_bod, fields_to_delete)
-                            
+                        out_name_bod = f"{out_prefix}3021_VyskovaRegulaceNaBod_b" if out_prefix else "Z_3021_VyskovaRegulaceNaBod_b"
+                        out_name_bod = generate_unique_name(output_gdb, out_name_bod)
+                        out_fc_bod = os.path.join(output_workspace, out_name_bod)
+                        arcpy.conversion.ExportFeatures(vr_na_bod_layer, out_fc_bod)
+
+                        # Přidat SKNAZEV, OBTYPNAZEV
+                        arcpy.management.AddField(out_fc_bod, "SKNAZEV", "TEXT", field_length=50)
+                        arcpy.management.AddField(out_fc_bod, "OBTYPNAZEV", "TEXT", field_length=50)
+                        with arcpy.da.UpdateCursor(out_fc_bod, ["SKNAZEV", "OBTYPNAZEV"]) as cur:
+                            for row in cur:
+                                row[0] = "regulace struktury"
+                                row[1] = "výšková regulace na bod"
+                                cur.updateRow(row)
+
                         final_outputs.append(out_fc_bod)
-                        log_message("VR na bod exportováno a začištěno.", "OK")
-                        
+                        log_message(f"Z_3021_VyskovaRegulaceNaBod_b: exportováno → {out_name_bod}", "OK")
                     except Exception as e:
-                         log_message(f"Chyba při exportu VR na bod: {e}", "WARN")
+                        log_message(f"Chyba při exportu VR na bod: {e}", "WARN")
 
             except Exception as e:
                 log_message(f"Kritická chyba ve Fázi 9: {e}", "ERROR")
-                pass
 
         # ============================================================
         # FÁZE 10: CLEANUP
@@ -1599,7 +1711,9 @@ class HeightRegulationImport(object):
             r"memory\sc_cleaned",
             r"memory\vr_linii_singlepart",
             r"memory\rozhrani_body_multipart",
-            r"memory\rozhrani_lines_snap"
+            r"memory\rozhrani_lines_snap",
+            r"memory\sc_3011_dissolve",
+            r"memory\sc_3022_dissolve",
         ]
         
         deleted = 0
