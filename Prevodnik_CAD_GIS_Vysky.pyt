@@ -95,6 +95,14 @@ def get_feature_count(fc):
         return 0
 
 
+def get_model_height_attributes(fields):
+    """Vrátí pouze výškové atributy datového modelu, které jsou dostupné v daném seznamu polí."""
+    if not fields:
+        return []
+    field_set = set(fields)
+    return [attr for attr in HEIGHT_ATTRIBUTES if attr in field_set]
+
+
 def get_vr_attributes(vr_feature_class):
     """
     Získá POUZE relevantní atributy z VR bloků (výškové + dokumentační)
@@ -141,6 +149,202 @@ def get_vr_attributes(vr_feature_class):
         pass
     
     return vr_attrs
+
+
+def transfer_joined_attributes(feature_class, attrs_to_fix):
+    """Po SpatialJoin přenese hodnoty z polí typu ATTR_1/ATTR_12 do cílových ATTR polí."""
+    if not feature_class or not arcpy.Exists(feature_class) or not attrs_to_fix:
+        return
+
+    def _is_missing(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        return False
+
+    def _is_zero_like(value):
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value == 0
+        if isinstance(value, str):
+            txt = value.strip().replace(",", ".")
+            if txt == "":
+                return False
+            try:
+                return float(txt) == 0.0
+            except Exception:
+                return False
+        return False
+
+    sj_fields = [f.name for f in arcpy.ListFields(feature_class)]
+    for attr in attrs_to_fix:
+        source_fields = []
+        prefix = f"{attr}_"
+        for f_name in sj_fields:
+            if f_name.startswith(prefix):
+                suffix = f_name[len(prefix):]
+                if suffix.isdigit():
+                    source_fields.append((int(suffix), f_name))
+
+        if source_fields and attr in sj_fields:
+            source_fields.sort(key=lambda x: x[0])
+            read_fields = [attr] + [name for _, name in source_fields]
+            with arcpy.da.UpdateCursor(feature_class, read_fields) as cursor:
+                for row in cursor:
+                    current_value = row[0]
+                    if not (_is_missing(current_value) or _is_zero_like(current_value)):
+                        continue
+
+                    chosen = None
+                    # Preferuj nenull a nenulové hodnoty.
+                    for src_value in row[1:]:
+                        if _is_missing(src_value):
+                            continue
+                        if not _is_zero_like(src_value):
+                            chosen = src_value
+                            break
+                        if chosen is None:
+                            chosen = src_value
+
+                    if chosen is not None:
+                        row[0] = chosen
+                        cursor.updateRow(row)
+
+
+def ensure_npu_from_nup(feature_class):
+    """Zajistí naplnění NPU_MAX z NUP_MAX (CAD alias), pokud je NPU_MAX prázdné."""
+    if not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    fields = [f.name for f in arcpy.ListFields(feature_class)]
+    if "NUP_MAX" not in fields:
+        return
+
+    if "NPU_MAX" not in fields:
+        arcpy.management.AddField(feature_class, "NPU_MAX", "SHORT")
+
+    def _is_missing(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        return False
+
+    def _is_zero_like(value):
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value == 0
+        if isinstance(value, str):
+            txt = value.strip().replace(",", ".")
+            if txt == "":
+                return False
+            try:
+                return float(txt) == 0.0
+            except Exception:
+                return False
+        return False
+
+    with arcpy.da.UpdateCursor(feature_class, ["NPU_MAX", "NUP_MAX"]) as cursor:
+        for row in cursor:
+            if _is_missing(row[1]):
+                continue
+            if _is_missing(row[0]) or (_is_zero_like(row[0]) and not _is_zero_like(row[1])):
+                row[0] = row[1]
+                cursor.updateRow(row)
+
+
+def propagate_best_values_by_target(feature_class, attrs, target_field="TARGET_FID"):
+    """Pro každý TARGET_FID vybere nejplnější sadu atributů a doplní ji do ostatních řádků."""
+    if not feature_class or not arcpy.Exists(feature_class) or not attrs:
+        return
+
+    fields = [f.name for f in arcpy.ListFields(feature_class)]
+    if target_field not in fields:
+        return
+
+    attrs_present = [a for a in attrs if a in fields]
+    if not attrs_present:
+        return
+
+    cursor_fields = [target_field] + attrs_present
+
+    def _is_missing(value):
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        return False
+
+    def _is_zero_like(value):
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            return value == 0
+        if isinstance(value, str):
+            txt = value.strip().replace(",", ".")
+            if txt == "":
+                return False
+            try:
+                return float(txt) == 0.0
+            except Exception:
+                return False
+        return False
+
+    def _value_score(value):
+        if _is_missing(value):
+            return -1
+        if _is_zero_like(value):
+            return 0
+        return 1
+
+    # Najdi nejlepší hodnotu pro každý atribut a TARGET_FID zvlášť.
+    best_by_target = {}
+    with arcpy.da.SearchCursor(feature_class, cursor_fields) as cursor:
+        for row in cursor:
+            target_id = row[0]
+            values = list(row[1:])
+
+            if target_id not in best_by_target:
+                best_by_target[target_id] = {
+                    "scores": [-2] * len(attrs_present),
+                    "values": [None] * len(attrs_present),
+                }
+
+            for idx, val in enumerate(values):
+                score = _value_score(val)
+                if score > best_by_target[target_id]["scores"][idx]:
+                    best_by_target[target_id]["scores"][idx] = score
+                    best_by_target[target_id]["values"][idx] = val
+
+    # Doplň chybějící/placeholder hodnoty z nejlepšího záznamu stejného TARGET_FID.
+    with arcpy.da.UpdateCursor(feature_class, cursor_fields) as cursor:
+        for row in cursor:
+            target_id = row[0]
+            best = best_by_target.get(target_id)
+            if not best:
+                continue
+
+            best_vals = best["values"]
+            changed = False
+            for idx in range(len(attrs_present)):
+                current_val = row[idx + 1]
+                donor_val = best_vals[idx]
+
+                if _is_missing(donor_val):
+                    continue
+
+                if _is_missing(current_val):
+                    row[idx + 1] = donor_val
+                    changed = True
+                elif _is_zero_like(current_val) and not _is_zero_like(donor_val):
+                    row[idx + 1] = donor_val
+                    changed = True
+
+            if changed:
+                cursor.updateRow(row)
 
 
 class Toolbox(object):
@@ -275,30 +479,59 @@ class HeightRegulationImport(object):
     def updateParameters(self, parameters):
         if parameters[0].altered and parameters[0].value:
             cad_file = parameters[0].valueAsText
+            original_workspace = arcpy.env.workspace
             
             try:
-                arcpy.env.workspace = cad_file
+                # Uživatel může omylem zadat složku místo konkrétního CAD souboru.
+                resolved_cad_file = cad_file
+                if os.path.isdir(cad_file):
+                    cad_candidates = []
+                    for file_name in os.listdir(cad_file):
+                        if file_name.lower().endswith((".dwg", ".dxf", ".dgn")):
+                            cad_candidates.append(os.path.join(cad_file, file_name))
+                    if cad_candidates:
+                        resolved_cad_file = cad_candidates[0]
+                        arcpy.AddWarning(f"Input je složka, používám CAD soubor: {os.path.basename(resolved_cad_file)}")
+
+                arcpy.env.workspace = resolved_cad_file
                 available_layers = []
-                
+                all_polyline_layers = []
+
+                polyline_fc = None
                 if arcpy.Exists("Polyline"):
-                    with arcpy.da.SearchCursor("Polyline", ["Layer"]) as cursor:
-                        layers = sorted(set([row[0] for row in cursor]))
-                        for layer in layers:
-                            # SC vrstvy + VR vrstvy
-                            if layer.startswith("3011") and "_PL_SC_" in layer:
-                                available_layers.append(f"{layer} (Polyline)")
-                            elif layer in DEFAULT_LAYERS:
-                                available_layers.append(f"{layer} (Polyline)")
+                    polyline_fc = "Polyline"
+                elif arcpy.Exists(os.path.join(resolved_cad_file, "Polyline")):
+                    polyline_fc = os.path.join(resolved_cad_file, "Polyline")
+
+                if polyline_fc:
+                    with arcpy.da.SearchCursor(polyline_fc, ["Layer"]) as cursor:
+                        all_polyline_layers = sorted(set([row[0] for row in cursor if row[0]]))
+
+                    for layer in all_polyline_layers:
+                        # SC vrstvy + VR vrstvy
+                        if layer.startswith("3011") and "_PL_SC_" in layer:
+                            available_layers.append(f"{layer} (Polyline)")
+                        elif layer in DEFAULT_LAYERS:
+                            available_layers.append(f"{layer} (Polyline)")
+
+                    # Fallback: pokud žádná vrstva nesedí na očekávaný pattern, nabídneme všechny polyline vrstvy.
+                    if not available_layers and all_polyline_layers:
+                        available_layers = [f"{layer} (Polyline)" for layer in all_polyline_layers]
+                        arcpy.AddWarning("Nenalezeny očekávané názvy vrstev 3011/302xxx, zobrazuji všechny Polyline vrstvy z CAD.")
+                else:
+                    arcpy.AddWarning("V CAD souboru nebyla nalezena feature class 'Polyline'.")
                 
                 parameters[1].filter.list = available_layers
                 parameters[1].values = available_layers
-                parameters[1].enabled = True
+                parameters[1].enabled = len(available_layers) > 0
                 
                 if not parameters[6].altered:
                     parameters[6].value = arcpy.SpatialReference(5514)
                     
             except Exception as e:
                 arcpy.AddWarning(f"Chyba při načítání CAD: {e}")
+            finally:
+                arcpy.env.workspace = original_workspace
 
     def updateMessages(self, parameters):
         return
@@ -484,6 +717,8 @@ class HeightRegulationImport(object):
 
         # Zpracování VR bloků na linii - MultipartToSinglepart a filtrování kruhů
         vr_circles = None
+        vr_join_points = None
+        vr_join_features = None
         if vr_na_linii_layer and arcpy.Exists(vr_na_linii_layer):
             try:
                 log_message("Zpracovávám VR bloky na linii...", "STEP")
@@ -529,6 +764,28 @@ class HeightRegulationImport(object):
             except Exception as e:
                 log_message(f"Chyba při zpracování VR bloků: {e}", "ERROR")
 
+        # Připrav body (centroidy) pro join atributů z VR bloků na linie.
+        # Body snapujeme na hranu SC, aby join fungoval i při drobném posunu bloků.
+        if vr_circles and merged_sc_all and arcpy.Exists(vr_circles) and arcpy.Exists(merged_sc_all):
+            try:
+                arcpy.management.FeatureToPoint(
+                    in_features=vr_circles,
+                    out_feature_class=r"memory\vr_join_points",
+                    point_location="CENTROID"
+                )
+
+                snap_env = [[merged_sc_all, "EDGE", "0.3 Meters"]]
+                arcpy.edit.Snap(r"memory\vr_join_points", snap_env)
+
+                vr_join_points = r"memory\vr_join_points"
+                vr_join_features = vr_join_points
+                log_message(f"Připraveno {get_feature_count(vr_join_points)} centroidů VR bloků pro join", "DEBUG")
+            except Exception as e:
+                log_message(f"Nelze připravit centroidy VR bloků pro join, použiji kruhy: {e}", "WARN")
+                vr_join_features = vr_circles
+        else:
+            vr_join_features = vr_circles
+
         # ============================================================
         # FÁZE 2: VYTVOŘENÍ BODŮ ROZHRANÍ Z CAD
         # ============================================================
@@ -538,6 +795,8 @@ class HeightRegulationImport(object):
         
         rozhrani_body = None
         rozhrani_count_cad = 0
+        vr_block_split_points = None
+        vr_block_split_count = 0
         
         if vr_rozhrani_layer and merged_sc_all and arcpy.Exists(vr_rozhrani_layer) and arcpy.Exists(merged_sc_all):
             try:
@@ -597,6 +856,122 @@ class HeightRegulationImport(object):
         else:
             log_message("VR rozhraní vrstva nebyla nalezena - přeskakuji", "WARN")
 
+        has_cad_rozhrani = bool(
+            rozhrani_body and arcpy.Exists(rozhrani_body) and rozhrani_count_cad > 0
+        )
+
+        # Hybridní režim: v jednom CAD mohou být současně části s CAD rozhraními i bez nich.
+        sc_cad_scope = merged_sc_all
+        sc_nocad_scope = None
+        sc_cad_scope_count = get_feature_count(merged_sc_all) if merged_sc_all else 0
+        sc_nocad_scope_count = 0
+        has_cad_processing_scope = has_cad_rozhrani
+
+        if has_cad_rozhrani and merged_sc_all and arcpy.Exists(merged_sc_all):
+            try:
+                arcpy.management.MakeFeatureLayer(merged_sc_all, "sc_scope_lyr")
+
+                # 1) Seed: linie, které přímo leží na CAD rozhraních.
+                arcpy.management.SelectLayerByLocation(
+                    in_layer="sc_scope_lyr",
+                    overlap_type="INTERSECT",
+                    select_features=rozhrani_body,
+                    search_distance="0.35 Meters",
+                    selection_type="NEW_SELECTION",
+                    invert_spatial_relationship="NOT_INVERT"
+                )
+
+                seed_count = int(arcpy.GetCount_management("sc_scope_lyr")[0])
+                if seed_count > 0:
+                    arcpy.conversion.ExportFeatures("sc_scope_lyr", r"memory\sc_cad_scope_seed")
+
+                    # 2) Expanze na souvislé komponenty linií (bloky), aby CAD větev
+                    # zahrnovala celé bloky s rozhraními, ne jen linie s přímým průsečíkem.
+                    scope_expand_fc = r"memory\sc_cad_scope_seed"
+                    prev_count = -1
+                    for _ in range(50):
+                        arcpy.management.MakeFeatureLayer(merged_sc_all, "sc_scope_expand_lyr")
+                        arcpy.management.SelectLayerByLocation(
+                            in_layer="sc_scope_expand_lyr",
+                            overlap_type="INTERSECT",
+                            select_features=scope_expand_fc,
+                            search_distance="0.02 Meters",
+                            selection_type="NEW_SELECTION",
+                            invert_spatial_relationship="NOT_INVERT"
+                        )
+
+                        expanded_count = int(arcpy.GetCount_management("sc_scope_expand_lyr")[0])
+                        arcpy.conversion.ExportFeatures("sc_scope_expand_lyr", r"memory\sc_cad_scope_expand")
+                        arcpy.management.Delete("sc_scope_expand_lyr")
+
+                        scope_expand_fc = r"memory\sc_cad_scope_expand"
+                        if expanded_count == prev_count:
+                            break
+                        prev_count = expanded_count
+
+                    if arcpy.Exists(r"memory\sc_cad_scope_expand"):
+                        sc_cad_scope = r"memory\sc_cad_scope_expand"
+                        sc_cad_scope_count = get_feature_count(sc_cad_scope)
+                    else:
+                        sc_cad_scope = r"memory\sc_cad_scope_seed"
+                        sc_cad_scope_count = seed_count
+                else:
+                    sc_cad_scope = None
+                    sc_cad_scope_count = 0
+
+                # 3) NOCAD scope je doplněk k CAD scope.
+                arcpy.management.SelectLayerByLocation(
+                    in_layer="sc_scope_lyr",
+                    overlap_type="INTERSECT",
+                    select_features=sc_cad_scope if sc_cad_scope else rozhrani_body,
+                    search_distance="0.02 Meters",
+                    selection_type="NEW_SELECTION",
+                    invert_spatial_relationship="INVERT"
+                )
+
+                sc_nocad_scope_count = int(arcpy.GetCount_management("sc_scope_lyr")[0])
+                if sc_nocad_scope_count > 0:
+                    arcpy.conversion.ExportFeatures("sc_scope_lyr", r"memory\sc_nocad_scope")
+                    sc_nocad_scope = r"memory\sc_nocad_scope"
+
+                arcpy.management.Delete("sc_scope_lyr")
+
+                has_cad_processing_scope = sc_cad_scope_count > 0
+                log_message(
+                    f"Hybrid režim: CAD větev {sc_cad_scope_count} linií (seed {seed_count}), bez CAD rozhraní {sc_nocad_scope_count} linií",
+                    "INFO"
+                )
+            except Exception as scope_error:
+                log_message(f"Rozdělení CAD/NOCAD scope selhalo, použiji jednotný režim: {scope_error}", "WARN")
+                sc_cad_scope = merged_sc_all
+                sc_nocad_scope = None
+                sc_cad_scope_count = get_feature_count(merged_sc_all)
+                sc_nocad_scope_count = 0
+                has_cad_processing_scope = has_cad_rozhrani
+
+        if not has_cad_processing_scope:
+            if sc_nocad_scope and arcpy.Exists(sc_nocad_scope):
+                sc_cad_scope = sc_nocad_scope
+            elif not sc_cad_scope and merged_sc_all and arcpy.Exists(merged_sc_all):
+                sc_cad_scope = merged_sc_all
+
+        # V CAD větvi držíme minimálně 30 cm toleranci řezu (osvědčené chování původního workflow).
+        try:
+            cad_split_radius = max(float(split_radius), 0.3)
+        except Exception:
+            cad_split_radius = 0.3
+
+        if not has_cad_processing_scope:
+            log_message("CAD rozhraní nejsou k dispozici pro žádnou část SC - zachovám původní SC linie bez splitu podle dynamických VR bloků.", "INFO")
+
+        # Doplňkové split body z VR bloků jsou vypnuté.
+        # CAD větev řežeme výhradně podle rozhraní (CAD + dogenerovaná),
+        # NOCAD větev se neřeže.
+        if has_cad_processing_scope:
+            log_message("Doplňkové split body z VR bloků jsou vypnuté (CAD větev používá jen rozhraní).", "INFO")
+        else:
+            log_message("Bez CAD rozhraní negeneruji doplňkové split body z VR bloků.", "INFO")
+
         # ============================================================
         # FÁZE 3: PRVNÍ ŘEZÁNÍ SC PODLE CAD ROZHRANÍ
         # ============================================================
@@ -605,17 +980,23 @@ class HeightRegulationImport(object):
         log_message("=" * 60, "INFO")
         
         sc_split_cad = None
-        
-        if rozhrani_body and rozhrani_count_cad > 0:
+        split_points_for_phase3 = None
+        split_points_count = 0
+
+        if has_cad_processing_scope:
+            if rozhrani_body and rozhrani_count_cad > 0:
+                split_points_for_phase3 = rozhrani_body
+                split_points_count = rozhrani_count_cad
+
+        if split_points_for_phase3 and split_points_count > 0:
             try:
-                log_message(f"Řežu SC linie v {rozhrani_count_cad} místech rozhraní...", "STEP")
+                log_message(f"Řežu SC linie v {split_points_count} místech rozhraní...", "STEP")
                 
-                # Zvýšený search_radius na 30cm pro zachycení blízkých rozhraní
                 arcpy.management.SplitLineAtPoint(
-                    in_features=merged_sc_all,
-                    point_features=rozhrani_body,
+                    in_features=sc_cad_scope,
+                    point_features=split_points_for_phase3,
                     out_feature_class=r"memory\sc_split_cad",
-                    search_radius="0.3 Meters"
+                    search_radius=f"{cad_split_radius} Meters"
                 )
                 
                 sc_split_cad = r"memory\sc_split_cad"
@@ -625,10 +1006,13 @@ class HeightRegulationImport(object):
                 
             except Exception as e:
                 log_message(f"Chyba při řezání SC: {e}", "ERROR")
-                sc_split_cad = merged_sc_all  # Fallback na původní
+                sc_split_cad = sc_cad_scope  # Fallback na původní
         else:
-            log_message("Žádná CAD rozhraní - SC zůstávají nerozdělené", "WARN")
-            sc_split_cad = merged_sc_all
+            if has_cad_processing_scope:
+                log_message("Žádná CAD rozhraní - SC zůstávají nerozdělené", "WARN")
+            else:
+                log_message("Bez CAD rozhraní přeskakuji split podle VR bloků - SC zůstávají v původní geometrii", "INFO")
+            sc_split_cad = sc_cad_scope
 
         # ============================================================
         # FÁZE 4: PŘIPOJENÍ VR BLOKŮ K SEGMENTŮM
@@ -639,13 +1023,13 @@ class HeightRegulationImport(object):
         
         sc_with_vr = None
         
-        if vr_circles and sc_split_cad and arcpy.Exists(vr_circles):
+        if vr_join_features and sc_split_cad and arcpy.Exists(vr_join_features):
             try:
-                log_message("Připojuji VR bloky k SC segmentům (SpatialJoin)...", "STEP")
+                log_message("Připojuji VR bloky k SC segmentům (SpatialJoin přes centroidy)...", "STEP")
                 
                 arcpy.analysis.SpatialJoin(
                     target_features=sc_split_cad,
-                    join_features=vr_circles,
+                    join_features=vr_join_features,
                     out_feature_class=r"memory\sc_with_vr",
                     join_operation="JOIN_ONE_TO_MANY",
                     join_type="KEEP_ALL",
@@ -680,7 +1064,7 @@ class HeightRegulationImport(object):
         rozhrani_body_all = rozhrani_body  # Začneme s CAD rozhraními
         rozhrani_all = rozhrani_body  # Alias pro FÁZE 8
         
-        if sc_with_vr and vr_circles:
+        if has_cad_processing_scope and sc_with_vr and vr_circles:
             try:
                 # Dynamicky získej VŠECHNY atributy z VR bloků
                 vr_attributes = get_vr_attributes(vr_circles)
@@ -696,8 +1080,8 @@ class HeightRegulationImport(object):
                 log_message(f"Dostupné výškové atributy v SC: {', '.join(available_height_attrs)}", "DEBUG")
                 
                 if available_height_attrs:
-                    # Dissolve podle VŠECH výškových atributů
-                    log_message("Dissolve podle všech výškových atributů...", "STEP")
+                    # Dissolve podle atributů datového modelu výšek.
+                    log_message("Dissolve podle výškových atributů datového modelu...", "STEP")
                     
                     # Vytvoř statistiky UNIQUE pro každý atribut
                     stats_fields = ";".join([f"{attr} UNIQUE" for attr in available_height_attrs])
@@ -720,19 +1104,21 @@ class HeightRegulationImport(object):
                         where_parts.append(f"{attr} IS NOT NULL")
                     where_clause = " OR ".join(where_parts)
                     
+                    arcpy.management.MakeFeatureLayer(r"memory\sc_dissolve", "sc_dissolve_lyr")
+
                     arcpy.management.SelectLayerByAttribute(
-                        in_layer_or_view=r"memory\sc_dissolve",
+                        in_layer_or_view="sc_dissolve_lyr",
                         selection_type="NEW_SELECTION",
                         where_clause=where_clause
                     )
                     
-                    selected_count = get_feature_count(r"memory\sc_dissolve")
+                    selected_count = int(arcpy.GetCount_management("sc_dissolve_lyr")[0])
                     log_message(f"Segmentů s výškou: {selected_count}", "DEBUG")
                     
                     if selected_count > 0:
                         # Koncové body těchto segmentů
                         arcpy.management.FeatureVerticesToPoints(
-                            in_features=r"memory\sc_dissolve",
+                            in_features="sc_dissolve_lyr",
                             out_feature_class=r"memory\dissolve_vertices",
                             point_location="BOTH_ENDS"
                         )
@@ -765,10 +1151,10 @@ class HeightRegulationImport(object):
 
                             # Export dogenerovaných rozhraní pro kontrolu
                             # Snap dogenerovaných rozhraní ke SC liniím
-                            if merged_sc_all and arcpy.Exists(merged_sc_all):
+                            if sc_cad_scope and arcpy.Exists(sc_cad_scope):
                                 log_message("Snap dogenerovaných rozhraní ke SC liniím (30cm edge)...", "STEP")
                                 try:
-                                    snap_env = [[merged_sc_all, "EDGE", "0.3 Meters"]]
+                                    snap_env = [[sc_cad_scope, "EDGE", "0.3 Meters"]]
                                     arcpy.edit.Snap(r"memory\generated_rozhrani", snap_env)
                                     log_message("Snap dokončen", "OK")
                                 except Exception as snap_error:
@@ -801,9 +1187,10 @@ class HeightRegulationImport(object):
                     
                     # Clear selection
                     arcpy.management.SelectLayerByAttribute(
-                        in_layer_or_view=r"memory\sc_dissolve",
+                        in_layer_or_view="sc_dissolve_lyr",
                         selection_type="CLEAR_SELECTION"
                     )
+                    arcpy.management.Delete("sc_dissolve_lyr")
                     arcpy.Delete_management(r"memory\sc_dissolve")
                     
                 else:
@@ -811,6 +1198,8 @@ class HeightRegulationImport(object):
                     
             except Exception as e:
                 log_message(f"Chyba při generování rozhraní: {e}", "ERROR")
+        elif not has_cad_processing_scope:
+            log_message("FÁZE 5 přeskočena: bez CAD rozhraní negeneruji dodatečná rozhraní ani mezilehlé dissolve.", "INFO")
 
         # ============================================================
         # FÁZE 6: FINÁLNÍ ŘEZÁNÍ VŠEMI ROZHRANÍMI
@@ -820,70 +1209,81 @@ class HeightRegulationImport(object):
         log_message("=" * 60, "INFO")
         
         sc_final_split = None
-        
-        try:
-            # Dissolve původních SC (čistá geometrie) - ZACHOVAT SC_TYPE
-            log_message("Dissolve původních SC linií...", "STEP")
-            
-            arcpy.management.Dissolve(
-                in_features=merged_sc_all,
-                out_feature_class=r"memory\sc_dissolve_clean",
-                dissolve_field="SC_TYPE",  # Zachovat typ SC
-                multi_part="SINGLE_PART",
-                unsplit_lines="DISSOLVE_LINES" 
-            )
-            
-            clean_count = get_feature_count(r"memory\sc_dissolve_clean")
-            log_message(f"Čistých spojených SC: {clean_count}", "DEBUG")
-            
-            # DEBUG - kontrola SC_TYPE po dissolve
-            fields = [f.name for f in arcpy.ListFields(r"memory\sc_dissolve_clean")]
-            if "SC_TYPE" in fields:
-                sc_types_found = set()
-                with arcpy.da.SearchCursor(r"memory\sc_dissolve_clean", ["SC_TYPE"]) as cursor:
-                    for row in cursor:
-                        if row[0]:
-                            sc_types_found.add(row[0])
-                log_message(f"SC_TYPE po dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
-            else:
-                log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po dissolve!", "WARN")
-            
-            # Finální split všemi rozhraními
-            if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
-                rozhrani_total = get_feature_count(rozhrani_body_all)
-                log_message(f"Řežu SC linie v {rozhrani_total} místech rozhraní...", "STEP")
+
+        if not has_cad_processing_scope:
+            sc_final_split = sc_split_cad
+            final_count = get_feature_count(sc_final_split)
+            log_message("Bez CAD rozhraní přeskakuji finální dissolve/split a zachovávám původní segmentaci linií.", "INFO")
+            log_message(f"Finální počet segmentů bez CAD rozhraní: {final_count}", "OK")
+        else:
+            try:
+                # Dissolve původních SC (čistá geometrie) - ZACHOVAT SC_TYPE
+                log_message("Dissolve původních SC linií...", "STEP")
                 
-                # Zvýšený search_radius na 30cm pro zachycení blízkých rozhraní
-                arcpy.management.SplitLineAtPoint(
-                    in_features=r"memory\sc_dissolve_clean",
-                    point_features=rozhrani_body_all,
-                    out_feature_class=r"memory\sc_final_split",
-                    search_radius="0.3 Meters"
+                arcpy.management.Dissolve(
+                    in_features=sc_cad_scope,
+                    out_feature_class=r"memory\sc_dissolve_clean",
+                    dissolve_field="SC_TYPE",  # Zachovat typ SC
+                    multi_part="SINGLE_PART",
+                    unsplit_lines="DISSOLVE_LINES" 
                 )
                 
-                sc_final_split = r"memory\sc_final_split"
-            else:
-                log_message("Žádná rozhraní - používám dissolve výstup", "WARN")
-                sc_final_split = r"memory\sc_dissolve_clean"
-            
-            final_count = get_feature_count(sc_final_split)
-            log_message(f"Finální počet segmentů po split: {final_count}", "OK")
-            
-            # DEBUG - kontrola SC_TYPE po split
-            fields = [f.name for f in arcpy.ListFields(sc_final_split)]
-            if "SC_TYPE" in fields:
-                sc_types_found = set()
-                with arcpy.da.SearchCursor(sc_final_split, ["SC_TYPE"]) as cursor:
-                    for row in cursor:
-                        if row[0]:
-                            sc_types_found.add(row[0])
-                log_message(f"SC_TYPE po split: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
-            else:
-                log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po split!", "WARN")
-            
-        except Exception as e:
-            log_message(f"Chyba při finálním split: {e}", "ERROR")
-            sc_final_split = merged_sc_all
+                clean_count = get_feature_count(r"memory\sc_dissolve_clean")
+                log_message(f"Čistých spojených SC: {clean_count}", "DEBUG")
+                
+                # DEBUG - kontrola SC_TYPE po dissolve
+                fields = [f.name for f in arcpy.ListFields(r"memory\sc_dissolve_clean")]
+                if "SC_TYPE" in fields:
+                    sc_types_found = set()
+                    with arcpy.da.SearchCursor(r"memory\sc_dissolve_clean", ["SC_TYPE"]) as cursor:
+                        for row in cursor:
+                            if row[0]:
+                                sc_types_found.add(row[0])
+                    log_message(f"SC_TYPE po dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+                else:
+                    log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po dissolve!", "WARN")
+                
+                # Finální split všemi rozhraními
+                split_points_for_phase6 = None
+                split_points_count_phase6 = 0
+
+                if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+                    split_points_for_phase6 = rozhrani_body_all
+                    split_points_count_phase6 = get_feature_count(rozhrani_body_all)
+
+                if split_points_for_phase6 and split_points_count_phase6 > 0:
+                    log_message(f"Řežu SC linie v {split_points_count_phase6} místech rozhraní...", "STEP")
+                    
+                    arcpy.management.SplitLineAtPoint(
+                        in_features=r"memory\sc_dissolve_clean",
+                        point_features=split_points_for_phase6,
+                        out_feature_class=r"memory\sc_final_split",
+                        search_radius=f"{cad_split_radius} Meters"
+                    )
+                    
+                    sc_final_split = r"memory\sc_final_split"
+                else:
+                    log_message("Žádná rozhraní ani VR split body - používám dissolve výstup", "WARN")
+                    sc_final_split = r"memory\sc_dissolve_clean"
+                
+                final_count = get_feature_count(sc_final_split)
+                log_message(f"Finální počet segmentů po split: {final_count}", "OK")
+                
+                # DEBUG - kontrola SC_TYPE po split
+                fields = [f.name for f in arcpy.ListFields(sc_final_split)]
+                if "SC_TYPE" in fields:
+                    sc_types_found = set()
+                    with arcpy.da.SearchCursor(sc_final_split, ["SC_TYPE"]) as cursor:
+                        for row in cursor:
+                            if row[0]:
+                                sc_types_found.add(row[0])
+                    log_message(f"SC_TYPE po split: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+                else:
+                    log_message("VAROVÁNÍ: SC_TYPE pole CHYBÍ po split!", "WARN")
+                
+            except Exception as e:
+                log_message(f"Chyba při finálním split: {e}", "ERROR")
+                sc_final_split = sc_cad_scope
 
         # ============================================================
         # FÁZE 7: ČIŠTĚNÍ FALEŠNÝCH ROZHRANÍ (podle notebooku)
@@ -898,9 +1298,13 @@ class HeightRegulationImport(object):
         # 3. Spoj segmenty, které mají tyto falešné řezy
         
         sc_cleaned = sc_final_split
+        cleanup_boundary_points = None
+
+        if has_cad_processing_scope and rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+            cleanup_boundary_points = rozhrani_body_all
         
         try:
-            if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
+            if cleanup_boundary_points and arcpy.Exists(cleanup_boundary_points):
                 log_message("Detekuji falešná rozhraní (koncové body mimo skutečná rozhraní)...", "STEP")
                 
                 # 1. Extrahuj všechny koncové body SC segmentů
@@ -919,7 +1323,7 @@ class HeightRegulationImport(object):
                 arcpy.management.SelectLayerByLocation(
                     in_layer="endpoints_lyr",
                     overlap_type="INTERSECT",
-                    select_features=rozhrani_body_all,
+                    select_features=cleanup_boundary_points,
                     search_distance="0.35 Meters",  # Trochu větší než split radius
                     selection_type="NEW_SELECTION",
                     invert_spatial_relationship="INVERT"
@@ -972,8 +1376,14 @@ class HeightRegulationImport(object):
                             out_features=r"memory\segments_to_merge"
                         )
                         
-                        # Dissolve podle SC_TYPE (spojí jen segmenty stejného typu)
-                        dissolve_fields = ["SC_TYPE"] if "SC_TYPE" in [f.name for f in arcpy.ListFields(r"memory\segments_to_merge")] else []
+                        # Dissolve podle SC_TYPE a ORIG_FID, aby se nespojovaly různé
+                        # části jedné čáry přes hranice s odlišnými VR bloky.
+                        seg_fields = [f.name for f in arcpy.ListFields(r"memory\segments_to_merge")]
+                        dissolve_fields = []
+                        if "SC_TYPE" in seg_fields:
+                            dissolve_fields.append("SC_TYPE")
+                        if "ORIG_FID" in seg_fields:
+                            dissolve_fields.append("ORIG_FID")
                         
                         arcpy.management.Dissolve(
                             in_features=r"memory\segments_to_merge",
@@ -1048,54 +1458,46 @@ class HeightRegulationImport(object):
         log_message("=" * 60, "INFO")
         
         sc_final_with_vr = None
+        sc_final_with_vr_cad = None
+        sc_final_with_vr_nocad = None
         
-        if vr_circles and arcpy.Exists(vr_circles) and sc_cleaned:
+        if vr_join_features and arcpy.Exists(vr_join_features) and sc_cleaned:
             try:
                 # Finální SpatialJoin s VR bloky (podle notebooku)
                 log_message("Finální SpatialJoin s VR bloky...", "STEP")
                 
-                arcpy.analysis.SpatialJoin(
-                    target_features=sc_cleaned,
-                    join_features=vr_circles,
-                    out_feature_class=r"memory\sc_final_sj",
-                    join_operation="JOIN_ONE_TO_MANY",
-                    join_type="KEEP_ALL",
-                    match_option="INTERSECT"
-                )
-                
-                # OPRAVA: Přenést atributy z napojovaných polí (s suffixem _1) do hlavních polí
-                # Protože target features už ta pole mají (ale prázdná), ArcGIS je při joinu přejmenuje (např. RIMSA_MAX_1)
-                # Musíme je zkopírovat zpět.
-                
-                # Zjisti skutečné názvy polí v toolu
-                sj_fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                if has_cad_processing_scope:
+                    arcpy.analysis.SpatialJoin(
+                        target_features=sc_cleaned,
+                        join_features=vr_join_features,
+                        out_feature_class=r"memory\sc_final_sj",
+                        join_operation="JOIN_ONE_TO_MANY",
+                        join_type="KEEP_ALL",
+                        match_option="INTERSECT"
+                    )
+                else:
+                    # Bez CAD rozhraní bereme pro každou linii nejbližší VR centroid (deterministické 1:1).
+                    arcpy.analysis.SpatialJoin(
+                        target_features=sc_cleaned,
+                        join_features=vr_join_features,
+                        out_feature_class=r"memory\sc_final_sj",
+                        join_operation="JOIN_ONE_TO_ONE",
+                        join_type="KEEP_ALL",
+                        match_option="CLOSEST"
+                    )
                 
                 # Seznam atributů k opravě
                 attrs_to_fix = [
                     "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO",
-                    "NP_MAX", "NUP_MAX", "RIMSA_MAX", 
+                    "NP_MIN", "NP_MAX", "NPU_MAX", "NUP_MAX",
+                    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX",
                     "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
                 ]
-                
-                # log_message("Opravuji hodnoty atributů po Spatial Join...", "DEBUG")
-                
-                for attr in attrs_to_fix:
-                    # Hledáme varianty s suffixem (např. RIMSA_MAX_1)
-                    source_field = None
-                    for f in sj_fields:
-                        if f == f"{attr}_1" or f == f"{attr}_12": # _12 může vzniknout pokud už tam _1 bylo
-                            source_field = f
-                            break
-                    
-                    if source_field and attr in sj_fields:
-                        # Přenést data z source_field do attr
-                        # log_message(f"  - Přenáším {source_field} -> {attr}", "DEBUG")
-                        with arcpy.da.UpdateCursor(r"memory\sc_final_sj", [attr, source_field]) as cursor:
-                            for row in cursor:
-                                # Pokud je hlavní pole prázdné a vedlejší má hodnotu -> update
-                                if row[0] is None and row[1] is not None:
-                                    row[0] = row[1]
-                                    cursor.updateRow(row)
+
+                transfer_joined_attributes(r"memory\sc_final_sj", attrs_to_fix)
+                ensure_npu_from_nup(r"memory\sc_final_sj")
+                propagate_best_values_by_target(r"memory\sc_final_sj", attrs_to_fix)
+                ensure_npu_from_nup(r"memory\sc_final_sj")
                 
                 sj_count = get_feature_count(r"memory\sc_final_sj")
                 log_message(f"SpatialJoin výsledek: {sj_count} záznamů", "DEBUG")
@@ -1106,6 +1508,21 @@ class HeightRegulationImport(object):
                     log_message("SC_TYPE nalezeno po SpatialJoin", "DEBUG")
                 else:
                     log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po SpatialJoin!", "WARN")
+
+                # Diagnostika: které modelové výškové atributy nejsou ve zdroji VR dostupné.
+                missing_model_attrs = []
+                for attr in HEIGHT_ATTRIBUTES:
+                    if attr == "NPU_MAX":
+                        if "NPU_MAX" in fields_sj or "NUP_MAX" in fields_sj or any(f.startswith("NUP_MAX_") for f in fields_sj):
+                            continue
+                    if attr in fields_sj or any(f.startswith(f"{attr}_") for f in fields_sj):
+                        continue
+                    missing_model_attrs.append(attr)
+                if missing_model_attrs:
+                    log_message(
+                        f"VR bloky neobsahují atributy {', '.join(missing_model_attrs)} - ve výstupu zůstanou NULL.",
+                        "INFO"
+                    )
                 
                 # ============================================================
                 # PROPAGACE ATRIBUTŮ MEZI ROZHRANÍMI
@@ -1125,34 +1542,38 @@ class HeightRegulationImport(object):
                 
                 fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
                 available_height_attrs = [attr for attr in vr_attributes if attr in fields]
+                has_cad_barriers = bool(rozhrani_body and arcpy.Exists(rozhrani_body) and get_feature_count(rozhrani_body) > 0)
+                do_propagation = has_cad_barriers
                 
                 if available_height_attrs:
+                    if not do_propagation:
+                        log_message("CAD rozhraní nejsou k dispozici - propagace vypnuta, zachovávám 1:1 připojení z VR bloků.", "INFO")
+
                     # 1. Vytvoř buffer kolem rozhraní (to jsou bariéry)
                     # Používáme POUZE rozhrani_body (z CADu), nikoliv rozhrani_body_all (které obsahuje i dogenerované)
                     # Chceme, aby se atributy přelily přes dogenerovaná rozhraní (která vznikla jen proto, že tam chyběla data),
                     # ale aby se zastavily o skutečná CAD rozhraní.
                     
                     barrier_geom = None
-                    barrier_source = None
-                    
-                    if rozhrani_body and arcpy.Exists(rozhrani_body):
-                        barrier_source = rozhrani_body
-                    elif vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
-                         # Fallback na linie, kdyby body nebyly (nemělo by nastat)
-                        barrier_source = vr_rozhrani_layer
-                    
-                    if barrier_source:
-                        try:
-                            # Tolerance 2cm (trochu víc než snap 1cm)
-                            arcpy.analysis.Buffer(barrier_source, r"memory\rozhrani_buffer", "0.02 Meters")
-                            # Načti buffer jako geometrii pro rychlý test
-                            if int(arcpy.GetCount_management(r"memory\rozhrani_buffer")[0]) > 0:
-                                barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
-                        except Exception as e:
-                            log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
-                            barrier_geom = None
-                    else:
-                        log_message("Žádná CAD rozhraní - propagace poběží bez bariér", "INFO")
+                    if do_propagation:
+                        barrier_source = None
+                        
+                        if rozhrani_body and arcpy.Exists(rozhrani_body):
+                            barrier_source = rozhrani_body
+                        elif vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
+                             # Fallback na linie, kdyby body nebyly (nemělo by nastat)
+                            barrier_source = vr_rozhrani_layer
+                        
+                        if barrier_source:
+                            try:
+                                # Tolerance 2cm (trochu víc než snap 1cm)
+                                arcpy.analysis.Buffer(barrier_source, r"memory\rozhrani_buffer", "0.02 Meters")
+                                # Načti buffer jako geometrii pro rychlý test
+                                if int(arcpy.GetCount_management(r"memory\rozhrani_buffer")[0]) > 0:
+                                    barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
+                            except Exception as e:
+                                log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
+                                barrier_geom = None
 
                     # 2. Načti segmenty
                     # OID -> {geom, attrs, has_data, orig_fid, sc_type}
@@ -1213,240 +1634,276 @@ class HeightRegulationImport(object):
                             }
 
                     # 3. Iterativní propagace
-                    max_iterations = 10
-                    
-                    for i in range(max_iterations):
-                        changes = 0
-                        updates = {} # oid -> new_attrs
+                    if do_propagation:
+                        max_iterations = 10
                         
-                        # Projdi jen ty bez dat
-                        null_segments = {k: v for k, v in segments_data.items() if not v["has_data"]}
-                        filled_segments = {k: v for k, v in segments_data.items() if v["has_data"]}
-                        
-                        if not null_segments:
-                            break
+                        for i in range(max_iterations):
+                            updates = {} # oid -> new_attrs
                             
-                        log_message(f"Iterace {i+1}: Segmentů bez dat: {len(null_segments)}, s daty: {len(filled_segments)}", "DEBUG")
-
-                        # Pro každý prázdný segment
-                        for null_oid, null_info in null_segments.items():
-                            null_geom = null_info["geom"]
-                            null_fid = null_info["orig_fid"]
-                            null_type = null_info["sc_type"]
+                            # Projdi jen ty bez dat
+                            null_segments = {k: v for k, v in segments_data.items() if not v["has_data"]}
+                            filled_segments = {k: v for k, v in segments_data.items() if v["has_data"]}
                             
-                            # Najdi souseda s daty
-                            candidate_attrs = None
-                            
-                            for fill_oid, fill_info in filled_segments.items():
-                                fill_geom = fill_info["geom"]
-                                fill_fid = fill_info["orig_fid"]
-                                fill_type = fill_info["sc_type"]
+                            if not null_segments:
+                                break
                                 
-                                # Rychlý check disjoint (bounding box) - jen pro orientaci, distanceTo řeší vše
-                                if null_geom.disjoint(fill_geom):
-                                    pass 
+                            log_message(f"Iterace {i+1}: Segmentů bez dat: {len(null_segments)}, s daty: {len(filled_segments)}", "DEBUG")
 
-                                # Check distance (tolerance 5cm pro napojení)
-                                dist = null_geom.distanceTo(fill_geom)
+                            # Pro každý prázdný segment
+                            for null_oid, null_info in null_segments.items():
+                                null_geom = null_info["geom"]
+                                null_fid = null_info["orig_fid"]
+                                null_type = null_info["sc_type"]
                                 
-                                if dist < 0.05: 
-                                    # Jsou propojené (nebo skoro)
-                                    # log_message(f"  > OID {null_oid} (Type '{null_type}', FID {null_fid}) blízko OID {fill_oid} (Type '{fill_type}', FID {fill_fid}) (dist={dist:.4f}m)", "DEBUG")
+                                # Najdi souseda s daty
+                                candidate_attrs = None
+                                
+                                for fill_oid, fill_info in filled_segments.items():
+                                    fill_geom = fill_info["geom"]
+                                    fill_fid = fill_info["orig_fid"]
+                                    fill_type = fill_info["sc_type"]
                                     
-                                    # Kde se dotýkají? 
-                                    connection_point = None
-                                    start_pt = null_geom.firstPoint
-                                    if fill_geom.distanceTo(start_pt) < 0.05:
-                                        connection_point = start_pt
-                                    else:
-                                        end_pt = null_geom.lastPoint
-                                        if fill_geom.distanceTo(end_pt) < 0.05:
-                                            connection_point = end_pt
+                                    # Rychlý check disjoint (bounding box) - jen pro orientaci, distanceTo řeší vše
+                                    if null_geom.disjoint(fill_geom):
+                                        pass 
+
+                                    # Check distance (tolerance 5cm pro napojení)
+                                    dist = null_geom.distanceTo(fill_geom)
                                     
-                                    if not connection_point:
-                                        connection_point = null_geom.firstPoint
-                                    
-                                    # Je tento bod chráněn bariérou?
-                                    is_blocked = False
-                                    if barrier_geom and connection_point:
-                                        if not barrier_geom.disjoint(connection_point):
-                                            # Bariéra nalezena.
-                                            
-                                            # LOGIKA ODBLOKOVÁNÍ:
-                                            # 1. Pokud jsou to RŮZNÉ TYPY čar (např. roh bloku), bariéru ignorujeme.
-                                            type_match = False
-                                            if null_type is not None and fill_type is not None:
-                                                 if null_type == fill_type:
-                                                     type_match = True
-                                            elif null_type is None and fill_type is None:
-                                                type_match = True # Oba None považujeme za stejné (nedefinované)
-                                            
-                                            if not type_match:
-                                                is_blocked = False
-                                                # log_message(f"    - Bariéra ignorována (Různé SC_TYPE: '{null_type}' vs '{fill_type}')", "DEBUG")
-                                            
-                                            # 2. Fallback na ORIG_FID 
-                                            elif null_fid != -1 and fill_fid != -1 and null_fid != fill_fid:
-                                                is_blocked = False
-                                                # log_message(f"    - Bariéra ignorována (Různé ORIG_FID: {null_fid} vs {fill_fid})", "DEBUG")
-                                            
-                                            else:
-                                                is_blocked = True
-                                                # log_message(f"    - Spojení blokováno bariérou (Stejný typ '{null_type}' i FID {null_fid})", "DEBUG")
-                                    
-                                    if not is_blocked:
-                                        # log_message(f"    - Spojení OK -> Přebírám atributy", "DEBUG")
-                                        candidate_attrs = fill_info["attrs"]
-                                        break # Našli jsme dárce
-                            
-                            if candidate_attrs:
-                                updates[null_oid] = candidate_attrs
-                                changes += 1
-                        
-                        # Aplikuj změny do paměti a DB
-                        if updates:
-                            log_message(f"Iterace {i+1}: Propagováno {len(updates)} segmentů", "DEBUG")
-                            
-                            # Update DB
-                            with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
-                                for row in cursor:
-                                    oid = row[0]
-                                    if oid in updates:
-                                        new_attrs = updates[oid]
-                                        for k, val in enumerate(new_attrs):
-                                            row[k+1] = val
-                                        cursor.updateRow(row)
+                                    if dist < 0.05: 
+                                        # Kde se dotýkají?
+                                        connection_point = None
+                                        start_pt = null_geom.firstPoint
+                                        if fill_geom.distanceTo(start_pt) < 0.05:
+                                            connection_point = start_pt
+                                        else:
+                                            end_pt = null_geom.lastPoint
+                                            if fill_geom.distanceTo(end_pt) < 0.05:
+                                                connection_point = end_pt
                                         
-                            # Update local cache
-                            for oid, new_attrs in updates.items():
-                                segments_data[oid]["attrs"] = new_attrs
-                                segments_data[oid]["has_data"] = True
-                        else:
-                            log_message(f"Propagace dokončena po {i} iteracích", "OK")
-                            break
+                                        if not connection_point:
+                                            connection_point = null_geom.firstPoint
+                                        
+                                        # Je tento bod chráněn bariérou?
+                                        is_blocked = False
+                                        if barrier_geom and connection_point:
+                                            if not barrier_geom.disjoint(connection_point):
+                                                # Bariéra nalezena.
+                                                type_match = False
+                                                if null_type is not None and fill_type is not None:
+                                                    if null_type == fill_type:
+                                                        type_match = True
+                                                elif null_type is None and fill_type is None:
+                                                    type_match = True
+                                                
+                                                if not type_match:
+                                                    is_blocked = False
+                                                elif null_fid != -1 and fill_fid != -1 and null_fid != fill_fid:
+                                                    is_blocked = False
+                                                else:
+                                                    is_blocked = True
+                                        
+                                        if not is_blocked:
+                                            candidate_attrs = fill_info["attrs"]
+                                            break
+                                
+                                if candidate_attrs:
+                                    updates[null_oid] = candidate_attrs
+                            
+                            # Aplikuj změny do paměti a DB
+                            if updates:
+                                log_message(f"Iterace {i+1}: Propagováno {len(updates)} segmentů", "DEBUG")
+                                
+                                # Update DB
+                                with arcpy.da.UpdateCursor(r"memory\sc_final_sj", ["OBJECTID"] + available_height_attrs) as cursor:
+                                    for row in cursor:
+                                        oid = row[0]
+                                        if oid in updates:
+                                            new_attrs = updates[oid]
+                                            for k, val in enumerate(new_attrs):
+                                                row[k+1] = val
+                                            cursor.updateRow(row)
+                                            
+                                # Update local cache
+                                for oid, new_attrs in updates.items():
+                                    segments_data[oid]["attrs"] = new_attrs
+                                    segments_data[oid]["has_data"] = True
+                            else:
+                                log_message(f"Propagace dokončena po {i} iteracích", "OK")
+                                break
                             
                     # Cleanup barriers
                     if arcpy.Exists(r"memory\rozhrani_buffer"):
                         arcpy.Delete_management(r"memory\rozhrani_buffer")
 
-                
-                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
-
-
-                
-                # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
-                log_message("Dissolve pro detekci chyb...", "STEP")
-                
-                # Dynamicky získej VR atributy z bloků
-                if vr_circles and arcpy.Exists(vr_circles):
-                    vr_attributes = get_vr_attributes(vr_circles)
-                    log_message(f"VR atributy z bloků pro dissolve: {', '.join(vr_attributes) if vr_attributes else 'žádné'}", "DEBUG")
+                if not has_cad_processing_scope:
+                    sc_final_with_vr_cad = r"memory\sc_final_sj"
+                    final_count = get_feature_count(sc_final_with_vr_cad)
+                    log_message("Bez CAD rozhraní přeskakuji finální dissolve - zachovávám původní linie s napojenými atributy.", "INFO")
+                    log_message(f"Finální vrstva bez dissolve: {final_count} segmentů", "OK")
                 else:
-                    vr_attributes = []
-                
-                # Zjisti dostupné výškové atributy v sc_final_sj
-                fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
-                available_height_attrs = []
-                for attr in vr_attributes:
-                    if attr in fields:
-                        available_height_attrs.append(attr)
-                
-                log_message(f"Dostupné výškové atributy v finální vrstvě: {', '.join(available_height_attrs)}", "DEBUG")
-                
-                # Statistiky pro VŠECHNY výškové atributy
-                # Dissolve pouze podle TARGET_FID + SC_TYPE → výšky jsou STATS (FIRST + UNIQUE)
-                # Tím vzniknou UNIQUE_ pole pro detekci chyb (více VR bloků na jednom segmentu)
-                stats_fields = []
-                sj_field_names = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
-                for attr in available_height_attrs:
-                    stats_fields.append(f"{attr} FIRST")
-                    stats_fields.append(f"{attr} UNIQUE")
-                if "ID_LOKAL" in sj_field_names:
-                    stats_fields.append("ID_LOKAL FIRST")
-                if "DRUH_SC" in sj_field_names:
-                    stats_fields.append("DRUH_SC FIRST")
-                if "DRUH_INFO" in sj_field_names:
-                    stats_fields.append("DRUH_INFO FIRST")
+                    # Dissolve podle TARGET_FID + SC_TYPE + VŠECHNY VÝŠKOVÉ ATRIBUTY
+                    log_message("Dissolve pro detekci chyb...", "STEP")
+                    
+                    # Pro finální dissolve používáme pouze atributy datového modelu výšek.
+                    if vr_circles and arcpy.Exists(vr_circles):
+                        vr_fields = [f.name for f in arcpy.ListFields(vr_circles)]
+                        vr_attributes = [attr for attr in HEIGHT_ATTRIBUTES if attr in vr_fields]
+                        # CAD alias: NUP_MAX používáme jako zdroj, pokud NPU_MAX chybí.
+                        if "NPU_MAX" not in vr_attributes and "NUP_MAX" in vr_fields:
+                            vr_attributes.append("NUP_MAX")
+                        log_message(f"VR atributy z bloků pro dissolve: {', '.join(vr_attributes) if vr_attributes else 'žádné'}", "DEBUG")
+                    else:
+                        vr_attributes = []
+                    
+                    # Zjisti dostupné výškové atributy v sc_final_sj
+                    fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                    available_height_attrs = [attr for attr in vr_attributes if attr in fields]
+                    
+                    log_message(f"Dostupné výškové atributy v finální vrstvě: {', '.join(available_height_attrs)}", "DEBUG")
+                    
+                    # Statistiky pro VŠECHNY výškové atributy
+                    # Dissolve pouze podle TARGET_FID + SC_TYPE → výšky jsou STATS (FIRST + UNIQUE)
+                    # Tím vzniknou UNIQUE_ pole pro detekci chyb (více VR bloků na jednom segmentu)
+                    stats_fields = []
+                    sj_field_names = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
+                    for attr in available_height_attrs:
+                        stats_fields.append(f"{attr} FIRST")
+                        stats_fields.append(f"{attr} UNIQUE")
+                    if "ID_LOKAL" in sj_field_names:
+                        stats_fields.append("ID_LOKAL FIRST")
+                    if "DRUH_SC" in sj_field_names:
+                        stats_fields.append("DRUH_SC FIRST")
+                    if "DRUH_INFO" in sj_field_names:
+                        stats_fields.append("DRUH_INFO FIRST")
 
-                stats = ";".join(stats_fields) if stats_fields else ""
+                    stats = ";".join(stats_fields) if stats_fields else ""
 
-                # Dissolve pouze podle TARGET_FID + SC_TYPE (BEZ výškových atributů)
-                dissolve_fields = ["TARGET_FID", "SC_TYPE"]
+                    # Dissolve pouze podle TARGET_FID + SC_TYPE (BEZ výškových atributů)
+                    dissolve_fields = ["TARGET_FID", "SC_TYPE"]
 
-                log_message(f"Dissolve fields: {', '.join(dissolve_fields)}", "DEBUG")
+                    log_message(f"Dissolve fields: {', '.join(dissolve_fields)}", "DEBUG")
 
-                arcpy.management.Dissolve(
-                    in_features=r"memory\sc_final_sj",
-                    out_feature_class=r"memory\sc_final_dissolved",
-                    dissolve_field=dissolve_fields,
-                    statistics_fields=stats,
-                    multi_part="SINGLE_PART",
-                    unsplit_lines="DISSOLVE_LINES"
-                )
+                    arcpy.management.Dissolve(
+                        in_features=r"memory\sc_final_sj",
+                        out_feature_class=r"memory\sc_final_dissolved",
+                        dissolve_field=dissolve_fields,
+                        statistics_fields=stats,
+                        multi_part="SINGLE_PART",
+                        unsplit_lines="DISSOLVE_LINES"
+                    )
 
-                # Přejmenuj FIRST_ATTR → ATTR pro přehlednost dalšího zpracování
-                # (AlterField nepodporuje memory workspace → AddField + CalculateField + DeleteField)
-                _type_map = {"String": "TEXT", "Double": "DOUBLE", "Single": "FLOAT",
-                             "Short": "SHORT", "Long": "LONG", "Integer": "LONG", "Date": "DATE"}
-                dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
-                _attrs_to_rename = list(dict.fromkeys(available_height_attrs + ["ID_LOKAL", "DRUH_SC", "DRUH_INFO"]))
-                for attr in _attrs_to_rename:
-                    first_name = f"FIRST_{attr}"
-                    if first_name in dissolved_fields_dict and attr not in dissolved_fields_dict:
-                        try:
-                            first_field = dissolved_fields_dict[first_name]
-                            fld_type = _type_map.get(first_field.type, "TEXT")
-                            if first_field.type == "String":
-                                arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type,
-                                                          field_length=first_field.length)
-                            else:
-                                arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type)
-                            arcpy.management.CalculateField(r"memory\sc_final_dissolved", attr,
-                                                            f"!{first_name}!", "PYTHON3")
-                            arcpy.management.DeleteField(r"memory\sc_final_dissolved", [first_name])
-                            dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
-                        except Exception as e_ren:
-                            log_message(f"Přejmenování {first_name} selhalo: {e_ren}", "WARN")
-
-                # Rename known CAD field name aliases to canonical data model names
-                # NUP_MAX (CAD typo) → NPU_MAX (data model), plus UNIQUE_NUP_MAX → UNIQUE_NPU_MAX
-                dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
-                for cad_name, model_name in [("NUP_MAX", "NPU_MAX")]:
-                    for _rsrc, _rdst in [(cad_name, model_name),
-                                        (f"UNIQUE_{cad_name}", f"UNIQUE_{model_name}")]:
-                        if _rsrc in dissolved_fields_dict and _rdst not in dissolved_fields_dict:
+                    # Přejmenuj FIRST_ATTR → ATTR pro přehlednost dalšího zpracování
+                    # (AlterField nepodporuje memory workspace → AddField + CalculateField + DeleteField)
+                    _type_map = {"String": "TEXT", "Double": "DOUBLE", "Single": "FLOAT",
+                                 "Short": "SHORT", "Long": "LONG", "Integer": "LONG", "Date": "DATE"}
+                    dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                    _attrs_to_rename = list(dict.fromkeys(available_height_attrs + ["ID_LOKAL", "DRUH_SC", "DRUH_INFO"]))
+                    for attr in _attrs_to_rename:
+                        first_name = f"FIRST_{attr}"
+                        if first_name in dissolved_fields_dict and attr not in dissolved_fields_dict:
                             try:
-                                _rf = dissolved_fields_dict[_rsrc]
-                                _rftype = _type_map.get(_rf.type, "TEXT")
-                                if _rf.type == "String":
-                                    arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype,
-                                                              field_length=_rf.length)
+                                first_field = dissolved_fields_dict[first_name]
+                                fld_type = _type_map.get(first_field.type, "TEXT")
+                                if first_field.type == "String":
+                                    arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type,
+                                                              field_length=first_field.length)
                                 else:
-                                    arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype)
-                                arcpy.management.CalculateField(r"memory\sc_final_dissolved", _rdst,
-                                                                f"!{_rsrc}!", "PYTHON3")
-                                arcpy.management.DeleteField(r"memory\sc_final_dissolved", [_rsrc])
+                                    arcpy.management.AddField(r"memory\sc_final_dissolved", attr, fld_type)
+                                arcpy.management.CalculateField(r"memory\sc_final_dissolved", attr,
+                                                                f"!{first_name}!", "PYTHON3")
+                                arcpy.management.DeleteField(r"memory\sc_final_dissolved", [first_name])
                                 dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
-                            except Exception as e_cad:
-                                log_message(f"Přejmenování CAD aliasu {_rsrc}→{_rdst} selhalo: {e_cad}", "WARN")
+                            except Exception as e_ren:
+                                log_message(f"Přejmenování {first_name} selhalo: {e_ren}", "WARN")
 
-                sc_final_with_vr = r"memory\sc_final_dissolved"
-                final_count = get_feature_count(sc_final_with_vr)
-                log_message(f"Finální vrstva po dissolve: {final_count} segmentů", "OK")
-                
-                # DEBUG - kontrola SC_TYPE po finálním dissolve
-                fields_final = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
-                if "SC_TYPE" in fields_final:
-                    sc_types_found = set()
-                    with arcpy.da.SearchCursor(sc_final_with_vr, ["SC_TYPE"]) as cursor:
-                        for row in cursor:
-                            if row[0]:
-                                sc_types_found.add(row[0])
-                    log_message(f"SC_TYPE po finálním dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+                    # Rename known CAD field name aliases to canonical data model names
+                    # NUP_MAX (CAD typo) → NPU_MAX (data model), plus UNIQUE_NUP_MAX → UNIQUE_NPU_MAX
+                    dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                    for cad_name, model_name in [("NUP_MAX", "NPU_MAX")]:
+                        for _rsrc, _rdst in [(cad_name, model_name),
+                                            (f"UNIQUE_{cad_name}", f"UNIQUE_{model_name}")]:
+                            if _rsrc in dissolved_fields_dict and _rdst not in dissolved_fields_dict:
+                                try:
+                                    _rf = dissolved_fields_dict[_rsrc]
+                                    _rftype = _type_map.get(_rf.type, "TEXT")
+                                    if _rf.type == "String":
+                                        arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype,
+                                                                  field_length=_rf.length)
+                                    else:
+                                        arcpy.management.AddField(r"memory\sc_final_dissolved", _rdst, _rftype)
+                                    arcpy.management.CalculateField(r"memory\sc_final_dissolved", _rdst,
+                                                                    f"!{_rsrc}!", "PYTHON3")
+                                    arcpy.management.DeleteField(r"memory\sc_final_dissolved", [_rsrc])
+                                    dissolved_fields_dict = {f.name: f for f in arcpy.ListFields(r"memory\sc_final_dissolved")}
+                                except Exception as e_cad:
+                                    log_message(f"Přejmenování CAD aliasu {_rsrc}→{_rdst} selhalo: {e_cad}", "WARN")
+
+                    sc_final_with_vr_cad = r"memory\sc_final_dissolved"
+                    final_count = get_feature_count(sc_final_with_vr_cad)
+                    log_message(f"Finální vrstva po dissolve: {final_count} segmentů", "OK")
+                    
+                    # DEBUG - kontrola SC_TYPE po finálním dissolve
+                    fields_final = [f.name for f in arcpy.ListFields(sc_final_with_vr_cad)]
+                    if "SC_TYPE" in fields_final:
+                        sc_types_found = set()
+                        with arcpy.da.SearchCursor(sc_final_with_vr_cad, ["SC_TYPE"]) as cursor:
+                            for row in cursor:
+                                if row[0]:
+                                    sc_types_found.add(row[0])
+                        log_message(f"SC_TYPE po finálním dissolve: {len(sc_types_found)} typů - {sorted(sc_types_found)}", "DEBUG")
+                    else:
+                        log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po finálním dissolve!", "WARN")
+                    
+                    arcpy.Delete_management(r"memory\sc_final_sj")
+
+                # Paralelní NOCAD větev: bez dissolve, jen napojení atributů na původní linie.
+                if has_cad_processing_scope and sc_nocad_scope and arcpy.Exists(sc_nocad_scope) and sc_nocad_scope_count > 0:
+                    try:
+                        log_message(f"Zpracovávám NOCAD větev ({sc_nocad_scope_count} linií) bez dissolve...", "STEP")
+                        arcpy.analysis.SpatialJoin(
+                            target_features=sc_nocad_scope,
+                            join_features=vr_join_features,
+                            out_feature_class=r"memory\sc_nocad_sj",
+                            join_operation="JOIN_ONE_TO_ONE",
+                            join_type="KEEP_ALL",
+                            match_option="CLOSEST"
+                        )
+                        transfer_joined_attributes(r"memory\sc_nocad_sj", attrs_to_fix)
+                        ensure_npu_from_nup(r"memory\sc_nocad_sj")
+                        propagate_best_values_by_target(r"memory\sc_nocad_sj", attrs_to_fix)
+                        ensure_npu_from_nup(r"memory\sc_nocad_sj")
+                        sc_final_with_vr_nocad = r"memory\sc_nocad_sj"
+                        log_message(f"NOCAD větev připravena: {get_feature_count(sc_final_with_vr_nocad)} segmentů", "OK")
+                    except Exception as nocad_error:
+                        log_message(f"Chyba při zpracování NOCAD větve: {nocad_error}", "WARN")
+
+                # Sloučení větví do jedné finální vrstvy pro export.
+                if sc_final_with_vr_cad and arcpy.Exists(sc_final_with_vr_cad) and sc_final_with_vr_nocad and arcpy.Exists(sc_final_with_vr_nocad):
+                    for _fc, _mode in [(sc_final_with_vr_cad, "CAD"), (sc_final_with_vr_nocad, "NOCAD")]:
+                        _fields = [f.name for f in arcpy.ListFields(_fc)]
+                        if "_CAD_MODE" not in _fields:
+                            arcpy.management.AddField(_fc, "_CAD_MODE", "TEXT", field_length=10)
+                        with arcpy.da.UpdateCursor(_fc, ["_CAD_MODE"]) as _cur:
+                            for _row in _cur:
+                                _row[0] = _mode
+                                _cur.updateRow(_row)
+
+                    arcpy.management.Merge(
+                        inputs=[sc_final_with_vr_cad, sc_final_with_vr_nocad],
+                        output=r"memory\sc_final_combined"
+                    )
+                    sc_final_with_vr = r"memory\sc_final_combined"
+                    log_message(
+                        f"Finální hybrid vrstva: CAD {get_feature_count(sc_final_with_vr_cad)} + NOCAD {get_feature_count(sc_final_with_vr_nocad)} = {get_feature_count(sc_final_with_vr)}",
+                        "OK"
+                    )
+                elif sc_final_with_vr_cad and arcpy.Exists(sc_final_with_vr_cad):
+                    sc_final_with_vr = sc_final_with_vr_cad
+                elif sc_final_with_vr_nocad and arcpy.Exists(sc_final_with_vr_nocad):
+                    sc_final_with_vr = sc_final_with_vr_nocad
                 else:
-                    log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po finálním dissolve!", "WARN")
-                
-                arcpy.Delete_management(r"memory\sc_final_sj")
+                    sc_final_with_vr = sc_cleaned
                 
             except Exception as e:
                 log_message(f"Chyba při finálním připojení atributů: {e}", "ERROR")
@@ -1471,8 +1928,20 @@ class HeightRegulationImport(object):
                 fields_in_final = [f.name for f in arcpy.ListFields(sc_final_with_vr)]
 
                 # Zjisti, které výškové atributy jsou dostupné ve výsledné vrstvě
-                available_height_attrs_final = [a for a in HEIGHT_ATTRIBUTES if a in fields_in_final]
+                available_height_attrs_final = get_model_height_attributes(fields_in_final)
                 log_message(f"Dostupné výškové atributy ve finální vrstvě: {', '.join(available_height_attrs_final)}", "DEBUG")
+
+                # Kontrolní informace: segmenty bez přiřazeného výškového bloku.
+                if available_height_attrs_final:
+                    without_block_count = 0
+                    with arcpy.da.SearchCursor(sc_final_with_vr, available_height_attrs_final) as cursor:
+                        for row in cursor:
+                            if all(v is None for v in row):
+                                without_block_count += 1
+                    if without_block_count > 0:
+                        log_message(f"Segmentů bez výškového bloku: {without_block_count} (informace, ne chyba)", "WARN")
+                    else:
+                        log_message("Všechny segmenty mají přiřazený výškový blok", "OK")
 
                 # --------------------------------------------------------
                 # 9A: Z_3011_StavebniCara_l
@@ -1560,35 +2029,78 @@ class HeightRegulationImport(object):
                 log_message("Tvořím Z_3022_VyskovaRegulaceNaLinii_l...", "STEP")
 
                 try:
-                    # Dissolve POUZE podle výškových atributů (BEZ SC_TYPE, BEZ TARGET_FID)
-                    # → segmenty od rozhraní k rozhraní se stejnou výškou se sloučí,
-                    #   nezáleží na tom, zda jsou z různých SC typů
-                    dissolve_fields_3022 = available_height_attrs_final if available_height_attrs_final else []
-
-                    # Statistiky: ID_LOKAL + UNIQUE_ pole pro detekci chyb
-                    stats_3022 = []
-                    if "ID_LOKAL" in fields_in_final:
-                        stats_3022.append("ID_LOKAL FIRST")
-                    for attr in available_height_attrs_final:
-                        unique_fname = f"UNIQUE_{attr}"
-                        if unique_fname in fields_in_final:
-                            stats_3022.append(f"{unique_fname} MAX")
-
-                    arcpy.management.Dissolve(
-                        in_features=sc_final_with_vr,
-                        out_feature_class=r"memory\sc_3022_dissolve",
-                        dissolve_field=dissolve_fields_3022,
-                        statistics_fields=";".join(stats_3022) if stats_3022 else "",
-                        multi_part="SINGLE_PART",
-                        unsplit_lines="DISSOLVE_LINES"
-                    )
-
                     vr_3022_name = f"{out_prefix}3022_VyskovaRegulaceNaLinii_l" if out_prefix else "Z_3022_VyskovaRegulaceNaLinii_l"
                     vr_3022_name = generate_unique_name(output_gdb, vr_3022_name)
                     vr_3022_fc = os.path.join(output_workspace, vr_3022_name)
 
-                    arcpy.conversion.ExportFeatures(r"memory\sc_3022_dissolve", vr_3022_fc)
-                    arcpy.Delete_management(r"memory\sc_3022_dissolve")
+                    if has_cad_processing_scope:
+                        # Dissolve aplikujeme pouze na CAD část. NOCAD část jde ven bez dissolve.
+                        dissolve_fields_3022 = available_height_attrs_final if available_height_attrs_final else []
+
+                        stats_3022 = []
+                        if "ID_LOKAL" in fields_in_final:
+                            stats_3022.append("ID_LOKAL FIRST")
+                        for attr in available_height_attrs_final:
+                            unique_fname = f"UNIQUE_{attr}"
+                            if unique_fname in fields_in_final:
+                                stats_3022.append(f"{unique_fname} MAX")
+
+                        parts_to_merge = []
+                        has_mode_field = "_CAD_MODE" in [f.name for f in arcpy.ListFields(sc_final_with_vr)]
+
+                        if has_mode_field:
+                            arcpy.management.MakeFeatureLayer(sc_final_with_vr, "sc_3022_src_lyr")
+                            try:
+                                arcpy.management.SelectLayerByAttribute(
+                                    in_layer_or_view="sc_3022_src_lyr",
+                                    selection_type="NEW_SELECTION",
+                                    where_clause="_CAD_MODE = 'CAD'"
+                                )
+                                cad_count = int(arcpy.GetCount_management("sc_3022_src_lyr")[0])
+                                if cad_count > 0:
+                                    arcpy.conversion.ExportFeatures("sc_3022_src_lyr", r"memory\sc_3022_cad_input")
+                                    arcpy.management.Dissolve(
+                                        in_features=r"memory\sc_3022_cad_input",
+                                        out_feature_class=r"memory\sc_3022_cad_dissolve",
+                                        dissolve_field=dissolve_fields_3022,
+                                        statistics_fields=";".join(stats_3022) if stats_3022 else "",
+                                        multi_part="SINGLE_PART",
+                                        unsplit_lines="DISSOLVE_LINES"
+                                    )
+                                    parts_to_merge.append(r"memory\sc_3022_cad_dissolve")
+
+                                arcpy.management.SelectLayerByAttribute(
+                                    in_layer_or_view="sc_3022_src_lyr",
+                                    selection_type="NEW_SELECTION",
+                                    where_clause="_CAD_MODE = 'NOCAD'"
+                                )
+                                nocad_count = int(arcpy.GetCount_management("sc_3022_src_lyr")[0])
+                                if nocad_count > 0:
+                                    arcpy.conversion.ExportFeatures("sc_3022_src_lyr", r"memory\sc_3022_nocad_input")
+                                    parts_to_merge.append(r"memory\sc_3022_nocad_input")
+                            finally:
+                                arcpy.management.Delete("sc_3022_src_lyr")
+                        else:
+                            arcpy.management.Dissolve(
+                                in_features=sc_final_with_vr,
+                                out_feature_class=r"memory\sc_3022_cad_dissolve",
+                                dissolve_field=dissolve_fields_3022,
+                                statistics_fields=";".join(stats_3022) if stats_3022 else "",
+                                multi_part="SINGLE_PART",
+                                unsplit_lines="DISSOLVE_LINES"
+                            )
+                            parts_to_merge.append(r"memory\sc_3022_cad_dissolve")
+
+                        if len(parts_to_merge) > 1:
+                            arcpy.management.Merge(parts_to_merge, r"memory\sc_3022_dissolve")
+                            arcpy.conversion.ExportFeatures(r"memory\sc_3022_dissolve", vr_3022_fc)
+                        elif len(parts_to_merge) == 1:
+                            arcpy.conversion.ExportFeatures(parts_to_merge[0], vr_3022_fc)
+                        else:
+                            arcpy.conversion.ExportFeatures(sc_final_with_vr, vr_3022_fc)
+                    else:
+                        log_message("Bez CAD rozhraní exportuji Z_3022 bez dissolve (původní linie + napojené atributy).", "INFO")
+                        arcpy.conversion.ExportFeatures(sc_final_with_vr, vr_3022_fc)
 
                     # Přejmenuj FIRST_ pole zpět na čistá jména a přidej atributy datového modelu
                     vr_3022_fields = [f.name for f in arcpy.ListFields(vr_3022_fc)]
@@ -1611,11 +2123,40 @@ class HeightRegulationImport(object):
                     if "ID_LOKAL" not in vr_3022_fields:
                         arcpy.management.AddField(vr_3022_fc, "ID_LOKAL", "SHORT")
 
+                    # Zajisti úplné schéma výškových atributů dle datového modelu.
+                    model_field_specs = {
+                        "VYSKA_VB": ("TEXT", 10),
+                        "VYSKA_VB_I": ("TEXT", 255),
+                        "NP_MIN": ("SHORT", None),
+                        "NP_MAX": ("SHORT", None),
+                        "NPU_MAX": ("SHORT", None),
+                        "RIMSA_MIN": ("FLOAT", None),
+                        "RIMSA_MAX": ("FLOAT", None),
+                        "VYSKA_MAX": ("FLOAT", None),
+                    }
+
+                    # Alias NUP_MAX -> NPU_MAX (vždy doplň prázdné hodnoty do datového modelu).
+                    ensure_npu_from_nup(vr_3022_fc)
+
+                    vr_3022_fields = [f.name for f in arcpy.ListFields(vr_3022_fc)]
+                    for fname, (ftype, flen) in model_field_specs.items():
+                        if fname not in vr_3022_fields:
+                            if flen:
+                                arcpy.management.AddField(vr_3022_fc, fname, ftype, field_length=flen)
+                            else:
+                                arcpy.management.AddField(vr_3022_fc, fname, ftype)
+
                     with arcpy.da.UpdateCursor(vr_3022_fc, ["SKNAZEV", "OBTYPNAZEV"]) as cursor:
                         for row in cursor:
                             row[0] = "regulace struktury"
                             row[1] = "výšková regulace na linii"
                             cursor.updateRow(row)
+
+                    with arcpy.da.UpdateCursor(vr_3022_fc, ["ID_LOKAL"]) as cursor:
+                        for row in cursor:
+                            if row[0] is None:
+                                row[0] = 0
+                                cursor.updateRow(row)
 
                     # Smazat nadbytečná pole - zachovat jen pole datového modelu
                     # + MAX_UNIQUE_* pole (potřebná pro error detection níže, smažou se po detekci)
@@ -1643,6 +2184,18 @@ class HeightRegulationImport(object):
                     vr_3022_count = get_feature_count(vr_3022_fc)
                     log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
                     final_outputs.append(vr_3022_fc)
+
+                    # Dočasná kontrolní vrstva centroidů VR bloků (pro QA kontroly uživatele).
+                    if vr_join_points and arcpy.Exists(vr_join_points):
+                        try:
+                            centroid_control_name = f"{out_prefix}3022_VRBlokyCentroidy_kontrola" if out_prefix else "Z_3022_VRBlokyCentroidy_kontrola"
+                            centroid_control_name = generate_unique_name(output_gdb, centroid_control_name)
+                            centroid_control_fc = os.path.join(output_workspace, centroid_control_name)
+                            arcpy.conversion.ExportFeatures(vr_join_points, centroid_control_fc)
+                            final_outputs.append(centroid_control_fc)
+                            log_message(f"Kontrolní vrstva centroidů VR bloků: {get_feature_count(centroid_control_fc)} prvků → {centroid_control_name}", "OK")
+                        except Exception as e_centroids:
+                            log_message(f"Chyba při exportu centroidů VR bloků: {e_centroids}", "WARN")
 
                     # --------------------------------------------------------
                     # 9C: Z_3022_VyskovaRegulaceNaLinii_l_Errors
@@ -1702,11 +2255,61 @@ class HeightRegulationImport(object):
                         # Přidat SKNAZEV, OBTYPNAZEV
                         arcpy.management.AddField(out_fc_bod, "SKNAZEV", "TEXT", field_length=50)
                         arcpy.management.AddField(out_fc_bod, "OBTYPNAZEV", "TEXT", field_length=50)
+                        if "ID_LOKAL" not in [f.name for f in arcpy.ListFields(out_fc_bod)]:
+                            arcpy.management.AddField(out_fc_bod, "ID_LOKAL", "SHORT")
+
+                        # Alias NUP_MAX -> NPU_MAX (vždy doplň prázdné hodnoty do datového modelu).
+                        ensure_npu_from_nup(out_fc_bod)
+
+                        # Zajisti úplné schéma výškové regulace na bod.
+                        model_bod_specs = {
+                            "VYSKA_VB": ("TEXT", 10),
+                            "VYSKA_VB_I": ("TEXT", 255),
+                            "NP_MIN": ("SHORT", None),
+                            "NP_MAX": ("SHORT", None),
+                            "NPU_MAX": ("SHORT", None),
+                            "RIMSA_MIN": ("FLOAT", None),
+                            "RIMSA_MAX": ("FLOAT", None),
+                            "VYSKA_MAX": ("FLOAT", None),
+                        }
+                        out_bod_fields = [f.name for f in arcpy.ListFields(out_fc_bod)]
+                        for fname, (ftype, flen) in model_bod_specs.items():
+                            if fname not in out_bod_fields:
+                                if flen:
+                                    arcpy.management.AddField(out_fc_bod, fname, ftype, field_length=flen)
+                                else:
+                                    arcpy.management.AddField(out_fc_bod, fname, ftype)
+
                         with arcpy.da.UpdateCursor(out_fc_bod, ["SKNAZEV", "OBTYPNAZEV"]) as cur:
                             for row in cur:
                                 row[0] = "regulace struktury"
                                 row[1] = "výšková regulace na bod"
                                 cur.updateRow(row)
+
+                        with arcpy.da.UpdateCursor(out_fc_bod, ["ID_LOKAL"]) as cur:
+                            for row in cur:
+                                if row[0] is None:
+                                    row[0] = 0
+                                    cur.updateRow(row)
+
+                        # Odstranit pole mimo datový model.
+                        keep_bod = {
+                            "SKNAZEV", "OBTYPNAZEV", "ID_LOKAL",
+                            "VYSKA_VB", "VYSKA_VB_I",
+                            "NP_MIN", "NP_MAX", "NPU_MAX",
+                            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
+                        }
+                        fields_to_delete_bod = []
+                        for field in arcpy.ListFields(out_fc_bod):
+                            if field.name in keep_bod:
+                                continue
+                            if field.required or field.type in ("OID", "Geometry"):
+                                continue
+                            if field.name.lower() in ("shape_length", "shape_area"):
+                                continue
+                            fields_to_delete_bod.append(field.name)
+                        if fields_to_delete_bod:
+                            arcpy.management.DeleteField(out_fc_bod, fields_to_delete_bod)
 
                         final_outputs.append(out_fc_bod)
                         log_message(f"Z_3021_VyskovaRegulaceNaBod_b: exportováno → {out_name_bod}", "OK")
@@ -1760,11 +2363,21 @@ class HeightRegulationImport(object):
         # Seznam memory vrstev k smazání
         memory_layers = [
             r"memory\sc_all_merged",
+            r"memory\sc_cad_scope",
+            r"memory\sc_nocad_scope",
             r"memory\rozhrani_body_cad",
             r"memory\rozhrani_all",
+            r"memory\vr_block_split_points",
+            r"memory\vr_join_points",
+            r"memory\split_points_phase3",
+            r"memory\split_points_phase6",
             r"memory\sc_split_cad",
             r"memory\sc_with_vr",
             r"memory\sc_with_vr_temp",
+            r"memory\sc_nocad_sj",
+            r"memory\sc_final_sj",
+            r"memory\sc_final_dissolved",
+            r"memory\sc_final_combined",
             r"memory\sc_dissolve_clean",
             r"memory\sc_final_split",
             r"memory\sc_cleaned",
@@ -1773,6 +2386,10 @@ class HeightRegulationImport(object):
             r"memory\rozhrani_lines_snap",
             r"memory\sc_3011_dissolve",
             r"memory\sc_3022_dissolve",
+            r"memory\sc_3022_cad_input",
+            r"memory\sc_3022_cad_dissolve",
+            r"memory\sc_3022_nocad_input",
+            r"memory\cleanup_boundary_points",
         ]
         
         deleted = 0
