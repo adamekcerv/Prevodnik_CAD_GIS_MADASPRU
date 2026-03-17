@@ -2185,18 +2185,6 @@ class HeightRegulationImport(object):
                     log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
                     final_outputs.append(vr_3022_fc)
 
-                    # Dočasná kontrolní vrstva centroidů VR bloků (pro QA kontroly uživatele).
-                    if vr_join_points and arcpy.Exists(vr_join_points):
-                        try:
-                            centroid_control_name = f"{out_prefix}3022_VRBlokyCentroidy_kontrola" if out_prefix else "Z_3022_VRBlokyCentroidy_kontrola"
-                            centroid_control_name = generate_unique_name(output_gdb, centroid_control_name)
-                            centroid_control_fc = os.path.join(output_workspace, centroid_control_name)
-                            arcpy.conversion.ExportFeatures(vr_join_points, centroid_control_fc)
-                            final_outputs.append(centroid_control_fc)
-                            log_message(f"Kontrolní vrstva centroidů VR bloků: {get_feature_count(centroid_control_fc)} prvků → {centroid_control_name}", "OK")
-                        except Exception as e_centroids:
-                            log_message(f"Chyba při exportu centroidů VR bloků: {e_centroids}", "WARN")
-
                     # --------------------------------------------------------
                     # 9C: Z_3022_VyskovaRegulaceNaLinii_l_Errors
                     # Segmenty s více než jedním přiřazeným VR blokem
@@ -2250,7 +2238,24 @@ class HeightRegulationImport(object):
                         out_name_bod = f"{out_prefix}3021_VyskovaRegulaceNaBod_b" if out_prefix else "Z_3021_VyskovaRegulaceNaBod_b"
                         out_name_bod = generate_unique_name(output_gdb, out_name_bod)
                         out_fc_bod = os.path.join(output_workspace, out_name_bod)
-                        arcpy.conversion.ExportFeatures(vr_na_bod_layer, out_fc_bod)
+
+                        # VR na bod exportujeme jako centroidní body místo linií.
+                        vr_na_bod_centroid = "in_memory\\tmp_vr_na_bod_centroid"
+                        if arcpy.Exists(vr_na_bod_centroid):
+                            arcpy.management.Delete(vr_na_bod_centroid)
+                        arcpy.management.FeatureToPoint(
+                            in_features=vr_na_bod_layer,
+                            out_feature_class=vr_na_bod_centroid,
+                            point_location="CENTROID"
+                        )
+
+                        # U soustředných kružnic může vzniknout stejný centroid vícekrát.
+                        try:
+                            arcpy.management.DeleteIdentical(vr_na_bod_centroid, ["Shape"])
+                        except Exception as e_del_ident:
+                            log_message(f"Nelze odstranit duplicitní centroidy VR na bod: {e_del_ident}", "DEBUG")
+
+                        arcpy.conversion.ExportFeatures(vr_na_bod_centroid, out_fc_bod)
 
                         # Přidat SKNAZEV, OBTYPNAZEV
                         arcpy.management.AddField(out_fc_bod, "SKNAZEV", "TEXT", field_length=50)
@@ -2313,6 +2318,9 @@ class HeightRegulationImport(object):
 
                         final_outputs.append(out_fc_bod)
                         log_message(f"Z_3021_VyskovaRegulaceNaBod_b: exportováno → {out_name_bod}", "OK")
+
+                        if arcpy.Exists(vr_na_bod_centroid):
+                            arcpy.management.Delete(vr_na_bod_centroid)
                     except Exception as e:
                         log_message(f"Chyba při exportu VR na bod: {e}", "WARN")
 
