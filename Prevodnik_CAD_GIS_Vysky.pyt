@@ -17,6 +17,54 @@ HEIGHT_ATTRIBUTES = [
     "VYSKA_MAX"
 ]
 
+FIELD_SCHEMA = {
+    "SKNAZEV": ("TEXT", 50),
+    "OBTYPNAZEV": ("TEXT", 50),
+    "ID_LOKAL": ("SHORT", None),
+    "DRUH_SC": ("TEXT", 10),
+    "DRUH_INFO": ("TEXT", 255),
+    "VYSKA_VB": ("TEXT", 10),
+    "VYSKA_VB_I": ("TEXT", 255),
+    "NP_MIN": ("SHORT", None),
+    "NP_MAX": ("SHORT", None),
+    "NPU_MAX": ("SHORT", None),
+    "RIMSA_MIN": ("FLOAT", None),
+    "RIMSA_MAX": ("FLOAT", None),
+    "VYSKA_MAX": ("FLOAT", None),
+}
+
+LAYER_MODEL_RULES = {
+    "Z_3011_StavebniCara_l": {
+        "constants": {
+            "SKNAZEV": "regulace struktury",
+            "OBTYPNAZEV": "stavební čára",
+        },
+        "required": ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "ID_LOKAL"],
+        "allowed": ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
+    },
+    "Z_3021_VyskovaRegulaceNaBod_b": {
+        "constants": {
+            "SKNAZEV": "regulace struktury",
+            "OBTYPNAZEV": "výšková regulace na bod",
+        },
+        "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
+        "allowed": ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
+    },
+    "Z_3022_VyskovaRegulaceNaLinii_l": {
+        "constants": {
+            "SKNAZEV": "regulace struktury",
+            "OBTYPNAZEV": "výšková regulace na linii",
+        },
+        "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
+        "allowed": ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
+    },
+}
+
+DOMAIN_ALLOWED_VALUES = {
+    "DRUH_SC": {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
+    "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
+}
+
 # Mapování čísla CAD vrstvy na kód domény DRUH_STAVEBNI_CARY
 SC_DRUH_MAPPING = {
     "301110": "SCU",   # stavební čára uzavřená
@@ -93,6 +141,283 @@ def get_feature_count(fc):
         return int(arcpy.GetCount_management(fc)[0])
     except:
         return 0
+
+
+def _is_missing_value(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def _generalize_field_type(field):
+    if field.type in ["Integer", "SmallInteger"]:
+        return "SHORT"
+    if field.type in ["Double", "Single"]:
+        return "FLOAT"
+    if field.type == "String":
+        return "TEXT"
+    return field.type.upper()
+
+
+def _convert_value_to_type(value, expected_type):
+    if _is_missing_value(value):
+        return None
+
+    if expected_type == "TEXT":
+        return str(value)
+
+    if isinstance(value, str):
+        clean = value.lower().replace("m", "").replace(" ", "").replace(",", ".")
+    else:
+        clean = value
+
+    if expected_type == "SHORT":
+        return int(float(clean))
+    if expected_type == "FLOAT":
+        return float(clean)
+
+    return value
+
+
+def _ensure_field_type(feature_class, field_name, expected_type, expected_length=None):
+    fields = {f.name: f for f in arcpy.ListFields(feature_class)}
+
+    if field_name not in fields:
+        if expected_length:
+            arcpy.management.AddField(feature_class, field_name, expected_type, field_length=expected_length)
+        else:
+            arcpy.management.AddField(feature_class, field_name, expected_type)
+        return
+
+    field = fields[field_name]
+    current_type = _generalize_field_type(field)
+    if current_type == expected_type:
+        return
+
+    temp_field = f"{field_name}_TMP"
+    if temp_field in fields:
+        arcpy.management.DeleteField(feature_class, [temp_field])
+
+    if expected_length:
+        arcpy.management.AddField(feature_class, temp_field, expected_type, field_length=expected_length)
+    else:
+        arcpy.management.AddField(feature_class, temp_field, expected_type)
+
+    errors = []
+    with arcpy.da.UpdateCursor(feature_class, ["OID@", field_name, temp_field]) as cursor:
+        for row in cursor:
+            oid = row[0]
+            original_val = row[1]
+            converted = None
+            if not _is_missing_value(original_val):
+                try:
+                    converted = _convert_value_to_type(original_val, expected_type)
+                except Exception:
+                    if len(errors) < 3:
+                        errors.append(f"OID {oid}: '{original_val}'")
+            row[2] = converted
+            cursor.updateRow(row)
+
+    try:
+        arcpy.management.DeleteField(feature_class, [field_name])
+        arcpy.management.AlterField(feature_class, temp_field, field_name, field_name)
+    except Exception as e:
+        log_message(f"Selhalo přejmenování pole {field_name}: {e}", "WARN")
+
+    if errors:
+        log_message(
+            f"Konverze pole {field_name} na {expected_type}: některé hodnoty nešly převést. Příklady: {', '.join(errors)}",
+            "WARN"
+        )
+
+
+def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefixes=None):
+    """Validace/finalizace atributů podle datového modelu pro výstupy Výšek."""
+    if not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    model = LAYER_MODEL_RULES.get(layer_model_key)
+    if not model:
+        log_message(f"Neznámý model vrstvy pro validaci: {layer_model_key}", "WARN")
+        return
+
+    keep_prefixes = keep_prefixes or []
+    allowed_fields = list(model["allowed"])
+    required_fields = set(model["required"])
+    constants = model.get("constants", {})
+
+    # 1) Alias NUP_MAX -> NPU_MAX
+    if "NPU_MAX" in allowed_fields:
+        ensure_npu_from_nup(feature_class)
+
+    # 2) Schéma polí a případná konverze typů.
+    for field_name in allowed_fields:
+        schema = FIELD_SCHEMA.get(field_name)
+        if not schema:
+            continue
+        expected_type, expected_length = schema
+        _ensure_field_type(feature_class, field_name, expected_type, expected_length)
+
+    # 3) Naplnění konstant a defaultů.
+    edit_fields = []
+    for k in constants:
+        if k in [f.name for f in arcpy.ListFields(feature_class)]:
+            edit_fields.append(k)
+    if "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)] and "ID_LOKAL" not in edit_fields:
+        edit_fields.append("ID_LOKAL")
+
+    if edit_fields:
+        with arcpy.da.UpdateCursor(feature_class, edit_fields) as cursor:
+            for row in cursor:
+                changed = False
+                for idx, fname in enumerate(edit_fields):
+                    if fname in constants:
+                        const_value = constants[fname]
+                        if _is_missing_value(row[idx]) or str(row[idx]) != str(const_value):
+                            row[idx] = const_value
+                            changed = True
+                    elif fname == "ID_LOKAL":
+                        if row[idx] is None:
+                            row[idx] = 0
+                            changed = True
+                if changed:
+                    cursor.updateRow(row)
+
+    # 3b) Normalizace ID_LOKAL do rozsahu 1-999 (unikátně v rámci vrstvy).
+    if "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)]:
+        used_ids = set()
+        invalid_oids = set()
+
+        with arcpy.da.SearchCursor(feature_class, ["OID@", "ID_LOKAL"]) as cursor:
+            for oid, id_val in cursor:
+                try:
+                    id_int = int(id_val)
+                except Exception:
+                    invalid_oids.add(oid)
+                    continue
+
+                if 1 <= id_int <= 999 and id_int not in used_ids:
+                    used_ids.add(id_int)
+                else:
+                    invalid_oids.add(oid)
+
+        if invalid_oids:
+            available_ids = [i for i in range(1, 1000) if i not in used_ids]
+            next_idx = 0
+            overflow_count = 0
+
+            with arcpy.da.UpdateCursor(feature_class, ["OID@", "ID_LOKAL"]) as cursor:
+                for row in cursor:
+                    oid = row[0]
+                    if oid not in invalid_oids:
+                        continue
+
+                    if next_idx < len(available_ids):
+                        row[1] = available_ids[next_idx]
+                        next_idx += 1
+                        cursor.updateRow(row)
+                    else:
+                        overflow_count += 1
+
+            fixed_count = len(invalid_oids) - overflow_count
+            if fixed_count > 0:
+                log_message(
+                    f"Validace {layer_model_key}: doplněno {fixed_count} hodnot ID_LOKAL do rozsahu 1-999",
+                    "OK"
+                )
+            if overflow_count > 0:
+                log_message(
+                    f"Validace {layer_model_key}: nelze doplnit ID_LOKAL pro {overflow_count} prvků (vyčerpán rozsah 1-999)",
+                    "WARN"
+                )
+
+    # 4) Kontrola required polí (non-nullable).
+    for req in required_fields:
+        if req not in [f.name for f in arcpy.ListFields(feature_class)]:
+            log_message(f"Validace {layer_model_key}: chybí povinné pole {req}", "WARN")
+            continue
+
+        missing_count = 0
+        with arcpy.da.SearchCursor(feature_class, [req]) as cursor:
+            for row in cursor:
+                if _is_missing_value(row[0]):
+                    missing_count += 1
+        if missing_count > 0:
+            log_message(f"Validace {layer_model_key}: pole {req} má {missing_count} prázdných hodnot", "WARN")
+
+    # 5) Kontrola doménových hodnot.
+    for domain_field, allowed_values in DOMAIN_ALLOWED_VALUES.items():
+        if domain_field not in allowed_fields:
+            continue
+        if domain_field not in [f.name for f in arcpy.ListFields(feature_class)]:
+            continue
+
+        bad_count = 0
+        bad_examples = []
+        with arcpy.da.SearchCursor(feature_class, ["OID@", domain_field]) as cursor:
+            for row in cursor:
+                val = row[1]
+                if _is_missing_value(val):
+                    continue
+                sval = str(val).strip().upper()
+                if sval not in allowed_values:
+                    bad_count += 1
+                    if len(bad_examples) < 3:
+                        bad_examples.append(f"OID {row[0]}: '{val}'")
+
+        if bad_count > 0:
+            log_message(
+                f"Validace {layer_model_key}: pole {domain_field} má {bad_count} hodnot mimo doménu. Příklady: {', '.join(bad_examples)}",
+                "WARN"
+            )
+
+    # 5b) Rozsah ID_LOKAL dle modelu (1-999).
+    if "ID_LOKAL" in allowed_fields and "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)]:
+        out_of_range = 0
+        out_examples = []
+        with arcpy.da.SearchCursor(feature_class, ["OID@", "ID_LOKAL"]) as cursor:
+            for row in cursor:
+                val = row[1]
+                if val is None:
+                    continue
+                try:
+                    ival = int(val)
+                except Exception:
+                    out_of_range += 1
+                    if len(out_examples) < 3:
+                        out_examples.append(f"OID {row[0]}: '{val}'")
+                    continue
+
+                if ival < 1 or ival > 999:
+                    out_of_range += 1
+                    if len(out_examples) < 3:
+                        out_examples.append(f"OID {row[0]}: '{val}'")
+
+        if out_of_range > 0:
+            log_message(
+                f"Validace {layer_model_key}: ID_LOKAL mimo rozsah 1-999 u {out_of_range} prvků. Příklady: {', '.join(out_examples)}",
+                "WARN"
+            )
+
+    # 6) Ořez nepovolených polí.
+    allowed_set = set(allowed_fields)
+    fields_to_delete = []
+    for field in arcpy.ListFields(feature_class):
+        name = field.name
+        if name in allowed_set:
+            continue
+        if any(name.startswith(prefix) for prefix in keep_prefixes):
+            continue
+        if field.required or field.type in ("OID", "Geometry"):
+            continue
+        if name.lower() in ("shape_length", "shape_area"):
+            continue
+        fields_to_delete.append(name)
+
+    if fields_to_delete:
+        arcpy.management.DeleteField(feature_class, fields_to_delete)
 
 
 def get_model_height_attributes(fields):
@@ -2002,16 +2327,7 @@ class HeightRegulationImport(object):
                             except Exception as e_di:
                                 log_message(f"Přenos DRUH_INFO selhal: {e_di}", "WARN")
 
-                    # Smazat pomocné pole SC_TYPE z výstupní vrstvy
-                    sc_3011_existing = [f.name for f in arcpy.ListFields(sc_3011_fc)]
-                    fields_to_remove_3011 = [f for f in sc_3011_existing
-                                              if f not in ("OBJECTID", "Shape", "Shape_Length",
-                                                           "SKNAZEV", "OBTYPNAZEV", "DRUH_SC",
-                                                           "DRUH_INFO", "ID_LOKAL")
-                                              and not arcpy.ListFields(sc_3011_fc, f)[0].required
-                                              and arcpy.ListFields(sc_3011_fc, f)[0].type not in ("OID", "Geometry")]
-                    if fields_to_remove_3011:
-                        arcpy.management.DeleteField(sc_3011_fc, fields_to_remove_3011)
+                    finalize_vyska_output_attributes(sc_3011_fc, "Z_3011_StavebniCara_l")
 
                     sc_3011_count = get_feature_count(sc_3011_fc)
                     log_message(f"Z_3011_StavebniCara_l: {sc_3011_count} prvků → {sc_3011_name}", "OK")
@@ -2181,10 +2497,6 @@ class HeightRegulationImport(object):
                     if del_3022:
                         arcpy.management.DeleteField(vr_3022_fc, del_3022)
 
-                    vr_3022_count = get_feature_count(vr_3022_fc)
-                    log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
-                    final_outputs.append(vr_3022_fc)
-
                     # --------------------------------------------------------
                     # 9C: Z_3022_VyskovaRegulaceNaLinii_l_Errors
                     # Segmenty s více než jedním přiřazeným VR blokem
@@ -2226,6 +2538,11 @@ class HeightRegulationImport(object):
 
                     except Exception as e_err:
                         log_message(f"Chyba při tvorbě vrstvy chyb Z_3022: {e_err}", "WARN")
+
+                    finalize_vyska_output_attributes(vr_3022_fc, "Z_3022_VyskovaRegulaceNaLinii_l")
+                    vr_3022_count = get_feature_count(vr_3022_fc)
+                    log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
+                    final_outputs.append(vr_3022_fc)
 
                 except Exception as e:
                     log_message(f"Chyba při tvorbě Z_3022_VyskovaRegulaceNaLinii_l: {e}", "ERROR")
@@ -2315,6 +2632,8 @@ class HeightRegulationImport(object):
                             fields_to_delete_bod.append(field.name)
                         if fields_to_delete_bod:
                             arcpy.management.DeleteField(out_fc_bod, fields_to_delete_bod)
+
+                        finalize_vyska_output_attributes(out_fc_bod, "Z_3021_VyskovaRegulaceNaBod_b")
 
                         final_outputs.append(out_fc_bod)
                         log_message(f"Z_3021_VyskovaRegulaceNaBod_b: exportováno → {out_name_bod}", "OK")
