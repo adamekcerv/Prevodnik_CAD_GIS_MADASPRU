@@ -764,6 +764,11 @@ class CadFile(object):
                                 base_final_name = f"{out_prefix}{target_name}"
                             else:
                                 base_final_name = target_name
+
+                            # Geodatabase název nesmí začínat číslem a musí projít validací jména.
+                            if base_final_name and base_final_name[0].isdigit():
+                                base_final_name = f"Z_{base_final_name}"
+                            base_final_name = arcpy.ValidateTableName(base_final_name, output_workspace)
                                 
                             # Přejmenování pouze pokud se název liší
                             if fc_basename != base_final_name:
