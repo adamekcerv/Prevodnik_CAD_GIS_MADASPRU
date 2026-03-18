@@ -485,6 +485,7 @@ class CadFile(object):
                 )
                 if analysis_results:
                     main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
+                    updated_main_polygon_fc = None
                     
                     # NOVÁ STRATEGIE: Místo snappování používáme už vytvořený hlavní polygon
                     if main_polygon_fc:
