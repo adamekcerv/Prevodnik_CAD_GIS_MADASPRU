@@ -800,12 +800,97 @@ class CadFile(object):
                                         arcpy.AddWarning(f"  - Nelze přejmenovat {fc_basename} na {final_name}: {e}")
                     
                     arcpy.AddMessage(f"[export_layers] ✓ Přejmenováno {renamed_count} vrstev.")
+
+                    # Převod řešeného území 1011 z linie na polygon (pokud je v GDB stále jako Polyline)
+                    self.convert_resene_uzemi_line_to_polygon(output_workspace, out_prefix, exported_layers)
+
                     arcpy.AddMessage("[export_layers] ✓ Finální cleanup dokončen")
                     
             except Exception as e:
                 arcpy.AddError(f"[export_layers] Chyba při spatial join analýze: {e}")
         
         return exported_layers
+
+    def convert_resene_uzemi_line_to_polygon(self, output_workspace, out_prefix, exported_layers):
+        """
+        Převede finální vrstvu 1011 řešeného území z Polyline na Polygon.
+        Pokud je vrstva už polygonová nebo neexistuje, krok se přeskočí.
+        """
+        original_workspace = arcpy.env.workspace
+        try:
+            target_name = self.LAYER_DEFINITIONS_REF.get("Z_1011_ReseneUzemi", {}).get("TARGET_NAME", "1011_ReseneUzemi_p")
+            if out_prefix and not target_name.startswith(out_prefix):
+                expected_base_name = f"{out_prefix}{target_name}"
+            else:
+                expected_base_name = target_name
+
+            if expected_base_name and expected_base_name[0].isdigit():
+                expected_base_name = f"Z_{expected_base_name}"
+            expected_base_name = arcpy.ValidateTableName(expected_base_name, output_workspace)
+
+            arcpy.env.workspace = output_workspace
+            all_fcs = arcpy.ListFeatureClasses() or []
+            if not all_fcs:
+                return
+
+            # Kandidáti: 1) přesný název 2) názvy se stejným prefixem (např. _1)
+            ordered_candidates = []
+            ordered_candidates.extend([fc for fc in all_fcs if fc == expected_base_name])
+            ordered_candidates.extend([fc for fc in all_fcs if fc not in ordered_candidates and fc.startswith(expected_base_name)])
+
+            # Fallback: cokoliv s kódem 1011 v názvu
+            if not ordered_candidates:
+                ordered_candidates.extend([fc for fc in all_fcs if "1011" in "".join(filter(str.isdigit, fc))])
+
+            resene_line_fc_name = None
+            for fc_name in ordered_candidates:
+                try:
+                    fc_path = os.path.join(output_workspace, fc_name)
+                    shape_type = arcpy.Describe(fc_path).shapeType
+                    if shape_type and shape_type.lower() == "polyline":
+                        resene_line_fc_name = fc_name
+                        break
+                except Exception:
+                    continue
+
+            if not resene_line_fc_name:
+                arcpy.AddMessage("[convert_resene_uzemi_line_to_polygon] Vrstva 1011 není polyline nebo nebyla nalezena - krok přeskočen.")
+                return
+
+            line_fc = os.path.join(output_workspace, resene_line_fc_name)
+            temp_polygon_name = generate_unique_fc_name(f"{resene_line_fc_name}_poly_temp", output_workspace)
+            temp_polygon_fc = os.path.join(output_workspace, temp_polygon_name)
+
+            arcpy.AddMessage(f"[convert_resene_uzemi_line_to_polygon] Převádím {resene_line_fc_name} na polygon.")
+            arcpy.management.FeatureToPolygon(
+                in_features=line_fc,
+                out_feature_class=temp_polygon_fc,
+                attributes="ATTRIBUTES"
+            )
+
+            polygon_count = int(arcpy.GetCount_management(temp_polygon_fc)[0])
+            if polygon_count == 0:
+                arcpy.AddWarning("[convert_resene_uzemi_line_to_polygon] FeatureToPolygon nevytvořil žádný polygon. Ponechávám původní linii.")
+                arcpy.Delete_management(temp_polygon_fc)
+                return
+
+            arcpy.Delete_management(line_fc)
+            arcpy.management.Rename(temp_polygon_fc, resene_line_fc_name)
+            new_fc_path = os.path.join(output_workspace, resene_line_fc_name)
+
+            # Doplnění finálních atributů po změně geometrie.
+            self.finalize_layer_attributes(new_fc_path, "1011")
+
+            for idx, layer in enumerate(exported_layers):
+                if os.path.basename(layer) == resene_line_fc_name:
+                    exported_layers[idx] = new_fc_path
+
+            arcpy.AddMessage(f"[convert_resene_uzemi_line_to_polygon] ✓ Vrstva {resene_line_fc_name} převedena na polygon ({polygon_count} prvků).")
+
+        except Exception as e:
+            arcpy.AddWarning(f"[convert_resene_uzemi_line_to_polygon] Chyba při převodu 1011 na polygon: {e}")
+        finally:
+            arcpy.env.workspace = original_workspace
 
     def split_polygons_by_vyska_rozhrani(self, polygon_fc, rozhrani_fc, output_workspace, out_prefix):
         """
