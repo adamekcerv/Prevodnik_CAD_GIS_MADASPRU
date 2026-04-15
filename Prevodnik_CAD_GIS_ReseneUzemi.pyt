@@ -1848,8 +1848,8 @@ class CadFile(object):
             }
 
         # --- 3. Přidání a validace atributů ---
-        
-        target_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]
+        # Z_1011_ReseneUzemi nemá ID_LOKAL dle datového modelu
+        target_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV"] + ([] if found_key == "Z_1011_ReseneUzemi" else ["ID_LOKAL"])
         existing_fields = {f.name: f for f in arcpy.ListFields(feature_class)}
         
         for attr_name in target_attrs:
@@ -1936,12 +1936,96 @@ class CadFile(object):
                     arcpy.AddWarning(f"Selhalo přejmenování pole {attr_name}: {e}")
 
         # --- 4. Naplnění konstant ---
-        with arcpy.da.UpdateCursor(feature_class, ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]) as cursor:
+        has_id_lokal = found_key != "Z_1011_ReseneUzemi" and "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)]
+        cursor_fields_4 = ["SKNAZEV", "OBTYPNAZEV"] + (["ID_LOKAL"] if has_id_lokal else [])
+        with arcpy.da.UpdateCursor(feature_class, cursor_fields_4) as cursor:
             for row in cursor:
                 if not row[0]: row[0] = current_def["SKNAZEV"]
                 if not row[1]: row[1] = current_def["OBTYPNAZEV"]
-                if row[2] is None: row[2] = 0
+                if has_id_lokal and row[2] is None: row[2] = 0
                 cursor.updateRow(row)
+
+        # --- 4a. Normalizace ID_LOKAL do rozsahu 1-999 ---
+        if has_id_lokal:
+            used_ids = set()
+            invalid_oids = set()
+            with arcpy.da.SearchCursor(feature_class, ["OID@", "ID_LOKAL"]) as cursor:
+                for oid, id_val in cursor:
+                    try:
+                        id_int = int(id_val)
+                    except Exception:
+                        invalid_oids.add(oid)
+                        continue
+                    if 1 <= id_int <= 999 and id_int not in used_ids:
+                        used_ids.add(id_int)
+                    else:
+                        invalid_oids.add(oid)
+            if invalid_oids:
+                available_ids = [i for i in range(1, 1000) if i not in used_ids]
+                next_idx = 0
+                overflow_count = 0
+                with arcpy.da.UpdateCursor(feature_class, ["OID@", "ID_LOKAL"]) as cursor:
+                    for row in cursor:
+                        if row[0] not in invalid_oids:
+                            continue
+                        if next_idx < len(available_ids):
+                            row[1] = available_ids[next_idx]
+                            next_idx += 1
+                            cursor.updateRow(row)
+                        else:
+                            overflow_count += 1
+                fixed = len(invalid_oids) - overflow_count
+                if fixed > 0:
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Doplňeno {fixed} hodnot ID_LOKAL do rozsahu 1-999")
+                if overflow_count > 0:
+                    arcpy.AddWarning(f"[finalize_layer_attributes] Nelze doplnit ID_LOKAL pro {overflow_count} prvků (vyčerpán rozsah 1-999)")
+
+        # --- 4b. Validace domén ---
+        domain_checks = {
+            "DRUH_UP":  {"UL", "NM", "UP", "UPX"},
+            "DRUH_SC":  {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
+            "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
+        }
+        existing_field_names_4b = [f.name for f in arcpy.ListFields(feature_class)]
+        for domain_field, allowed_values in domain_checks.items():
+            if domain_field not in target_attrs or domain_field not in existing_field_names_4b:
+                continue
+            bad_count = 0
+            bad_examples = []
+            with arcpy.da.SearchCursor(feature_class, ["OID@", domain_field]) as cursor:
+                for row in cursor:
+                    val = row[1]
+                    if val is None or (isinstance(val, str) and val.strip() == ""):
+                        continue
+                    if str(val).strip().upper() not in allowed_values:
+                        bad_count += 1
+                        if len(bad_examples) < 3:
+                            bad_examples.append(f"OID {row[0]}: '{val}'")
+            if bad_count > 0:
+                arcpy.AddWarning(
+                    f"[finalize_layer_attributes] Pole {domain_field} má {bad_count} hodnot mimo doménu. "
+                    f"Příklady: {', '.join(bad_examples)}"
+                )
+
+        # --- 4c. Kontrola povinných polí (non-nullable) ---
+        required_by_layer = {
+            "Z_1011_ReseneUzemi":       ["DOK_NAZEV"],
+            "Z_2021_UlicniProstranstvi": ["DRUH_UP", "OZNACENI"],
+            "Z_2031_StavebniBlok":       ["OZNACENI"],
+            "Z_2041_NestavebniBlok":     ["OZNACENI"],
+            "Z_2051_JinaCastUzemi":      ["OZNACENI"],
+        }
+        if found_key in required_by_layer:
+            for req_field in required_by_layer[found_key]:
+                if req_field not in existing_field_names_4b:
+                    continue
+                missing = 0
+                with arcpy.da.SearchCursor(feature_class, [req_field]) as cursor:
+                    for row in cursor:
+                        if row[0] is None or (isinstance(row[0], str) and row[0].strip() == ""):
+                            missing += 1
+                if missing > 0:
+                    arcpy.AddWarning(f"[finalize_layer_attributes] Povinné pole {req_field} má {missing} prázdných hodnot")
 
         # --- 5. Clean up ---
         system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE", "Shape.STArea()", "Shape.STLength()"]
