@@ -1847,9 +1847,39 @@ class CadFile(object):
                 "ATTRS": COMMON_ATTRS + extra_attrs
             }
 
+        # --- 2b. Konverze geometrie pro Z_1011_ReseneUzemi ---
+        # Z_1011_ReseneUzemi musí být Polygon; CAD vrstva 101110_PL_Resene_uzemi je exportována jako Polyline.
+        if found_key == "Z_1011_ReseneUzemi":
+            desc_geom = arcpy.Describe(feature_class)
+            if desc_geom.shapeType == "Polyline":
+                arcpy.AddMessage(f"[finalize_layer_attributes] Z_1011 je Polyline — konvertuji na Polygon (FeatureToPolygon)")
+                try:
+                    fc_dir = os.path.dirname(feature_class)
+                    fc_name = os.path.basename(feature_class)
+                    temp_poly_name = f"_ftp_{fc_name}"
+                    temp_poly_fc = os.path.join(fc_dir, temp_poly_name)
+                    arcpy.management.FeatureToPolygon(
+                        in_features=feature_class,
+                        out_feature_class=temp_poly_fc,
+                        attributes="ATTRIBUTES"
+                    )
+                    arcpy.Delete_management(feature_class)
+                    arcpy.management.Rename(temp_poly_fc, fc_name)
+                    feature_class = os.path.join(fc_dir, fc_name)
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Konverze na Polygon dokončena: {fc_name}")
+                except Exception as e:
+                    arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při konverzi Polyline → Polygon pro Z_1011: {e}")
+
         # --- 3. Přidání a validace atributů ---
         # Z_1011_ReseneUzemi nemá ID_LOKAL dle datového modelu
-        target_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV"] + ([] if found_key == "Z_1011_ReseneUzemi" else ["ID_LOKAL"])
+        _raw_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV"] + ([] if found_key == "Z_1011_ReseneUzemi" else ["ID_LOKAL"])
+        # Deduplikace při zachování pořadí (např. ID_LOKAL může být i v ATTRS)
+        seen_attrs = set()
+        target_attrs = []
+        for _a in _raw_attrs:
+            if _a not in seen_attrs:
+                seen_attrs.add(_a)
+                target_attrs.append(_a)
         existing_fields = {f.name: f for f in arcpy.ListFields(feature_class)}
         
         for attr_name in target_attrs:
@@ -2025,7 +2055,7 @@ class CadFile(object):
                         if row[0] is None or (isinstance(row[0], str) and row[0].strip() == ""):
                             missing += 1
                 if missing > 0:
-                    arcpy.AddWarning(f"[finalize_layer_attributes] Povinné pole {req_field} má {missing} prázdných hodnot")
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Povinné pole {req_field} má {missing} prázdných hodnot (vyplňte ručně)")
 
         # --- 5. Clean up ---
         system_fields = ["OBJECTID", "FID", "Shape", "Shape_Length", "Shape_Area", "SHAPE", "Shape.STArea()", "Shape.STLength()"]
