@@ -1149,7 +1149,7 @@ class HeightRegulationImport(object):
                     in_features=[rozhrani_for_intersect, merged_sc_all],
                     out_feature_class=r"memory\rozhrani_body_multipart",
                     join_attributes="NO_FID",
-                    cluster_tolerance=None,
+                    cluster_tolerance="0.05 Meters",
                     output_type="POINT"
                 )
                 
@@ -1158,7 +1158,46 @@ class HeightRegulationImport(object):
                     in_features=r"memory\rozhrani_body_multipart",
                     out_feature_class=r"memory\rozhrani_body_cad"
                 )
-                
+
+                # Doplňkový zdroj bodů: konce rozhraní linií snapnuté na SC.
+                # PairwiseIntersect může minout T-junction nebo kollineární kontakt.
+                # Konce rozhraní linií jsou přesně tam, kde kreslíř zamýšlel řez.
+                try:
+                    arcpy.management.FeatureVerticesToPoints(
+                        in_features=rozhrani_for_intersect,
+                        out_feature_class=r"memory\rozhrani_endpoints",
+                        point_location="BOTH_ENDS"
+                    )
+                    # Snap na SC edge (max 0.5m)
+                    arcpy.edit.Snap(r"memory\rozhrani_endpoints", [[merged_sc_all, "EDGE", "0.5 Meters"]])
+                    # Zachovat jen ty, které leží na SC (do 0.05m)
+                    arcpy.management.MakeFeatureLayer(r"memory\rozhrani_endpoints", "rozhrani_ep_lyr")
+                    arcpy.management.SelectLayerByLocation(
+                        in_layer="rozhrani_ep_lyr",
+                        overlap_type="INTERSECT",
+                        select_features=merged_sc_all,
+                        search_distance="0.05 Meters",
+                        selection_type="NEW_SELECTION"
+                    )
+                    ep_on_sc = int(arcpy.GetCount_management("rozhrani_ep_lyr")[0])
+                    if ep_on_sc > 0:
+                        arcpy.management.Append(
+                            inputs="rozhrani_ep_lyr",
+                            target=r"memory\rozhrani_body_cad",
+                            schema_type="NO_TEST"
+                        )
+                        log_message(f"Doplněno {ep_on_sc} split bodů z konců rozhraní linií", "DEBUG")
+                    arcpy.management.Delete("rozhrani_ep_lyr")
+                    arcpy.management.Delete(r"memory\rozhrani_endpoints")
+                except Exception as ep_err:
+                    log_message(f"Doplňkové endpoint body selhaly (nevadí): {ep_err}", "DEBUG")
+
+                # Deduplikace bodů (sjetí na stejné místo po merge)
+                try:
+                    arcpy.management.DeleteIdentical(r"memory\rozhrani_body_cad", ["Shape"], "0.02 Meters")
+                except Exception:
+                    pass
+
                 rozhrani_body = r"memory\rozhrani_body_cad"
                 rozhrani_count_cad = get_feature_count(rozhrani_body)
                 
@@ -1893,9 +1932,9 @@ class HeightRegulationImport(object):
                             try:
                                 # Tolerance 2cm (trochu víc než snap 1cm)
                                 arcpy.analysis.Buffer(barrier_source, r"memory\rozhrani_buffer", "0.02 Meters")
-                                # Načti buffer jako geometrii pro rychlý test
+                                # Načti VŠECHNY buffery jako seznam geometrií pro správnou detekci bariér
                                 if int(arcpy.GetCount_management(r"memory\rozhrani_buffer")[0]) > 0:
-                                    barrier_geom = arcpy.CopyFeatures_management(r"memory\rozhrani_buffer", arcpy.Geometry())[0]
+                                    barrier_geom = [row[0] for row in arcpy.da.SearchCursor(r"memory\rozhrani_buffer", ["SHAPE@"])]
                             except Exception as e:
                                 log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
                                 barrier_geom = None
@@ -2012,7 +2051,8 @@ class HeightRegulationImport(object):
                                         # Je tento bod chráněn bariérou?
                                         is_blocked = False
                                         if barrier_geom and connection_point:
-                                            if not barrier_geom.disjoint(connection_point):
+                                            cp_geom = arcpy.PointGeometry(connection_point, null_geom.spatialReference)
+                                            if any(not bg.disjoint(cp_geom) for bg in barrier_geom):
                                                 # Bariéra nalezena.
                                                 type_match = False
                                                 if null_type is not None and fill_type is not None:
@@ -2557,7 +2597,7 @@ class HeightRegulationImport(object):
                         out_fc_bod = os.path.join(output_workspace, out_name_bod)
 
                         # VR na bod exportujeme jako centroidní body místo linií.
-                        vr_na_bod_centroid = "in_memory\\tmp_vr_na_bod_centroid"
+                        vr_na_bod_centroid = r"memory\tmp_vr_na_bod_centroid"
                         if arcpy.Exists(vr_na_bod_centroid):
                             arcpy.management.Delete(vr_na_bod_centroid)
                         arcpy.management.FeatureToPoint(
@@ -2653,22 +2693,8 @@ class HeightRegulationImport(object):
         log_message("FÁZE 10: CLEANUP DOČASNÝCH VRSTEV", "STEP")
         log_message("=" * 60, "INFO")
         
-        # Export rozhraní pro kontrolu (před cleanup) - DISABLED FOR FINAL CLEANUP
-        # if rozhrani_body_all and arcpy.Exists(rozhrani_body_all):
-        #     try:
-        #         if out_prefix:
-        #             rozhrani_name = f"{out_prefix}Rozhrani_body_kontrola"
-        #         else:
-        #             rozhrani_name = "Z_Rozhrani_body_kontrola"
-        #         
-        #         rozhrani_name = generate_unique_name(output_gdb, rozhrani_name)
-        #         rozhrani_output = os.path.join(output_workspace, rozhrani_name)
-        #         
-        #         arcpy.CopyFeatures_management(rozhrani_body_all, rozhrani_output)
-        #         rozhrani_count = get_feature_count(rozhrani_output)
-        #         log_message(f"Export bodů rozhraní: {rozhrani_name} ({rozhrani_count} bodů)", "DEBUG")
-        #     except Exception as e:
-        #         log_message(f"Nepodařilo se exportovat body rozhraní: {e}", "WARN")
+        # Export rozhraní pro kontrolu - DISABLED
+        # if rozhrani_body_all and arcpy.Exists(rozhrani_body_all): ...
         
         # Export CAD linie rozhraní pro kontrolu - DISABLED FOR FINAL CLEANUP
         # if vr_rozhrani_layer and arcpy.Exists(vr_rozhrani_layer):
@@ -2717,6 +2743,10 @@ class HeightRegulationImport(object):
             r"memory\sc_3022_cad_dissolve",
             r"memory\sc_3022_nocad_input",
             r"memory\cleanup_boundary_points",
+            r"memory\sc_cad_scope_seed",
+            r"memory\sc_cad_scope_expand",
+            r"memory\tmp_vr_na_bod_centroid",
+            r"memory\rozhrani_endpoints",
         ]
         
         deleted = 0
@@ -2733,7 +2763,7 @@ class HeightRegulationImport(object):
         # Smazání pomocných vrstev z output workspace (importované vrstvy a dočasné mezivýsledky)
         deleted_gdb = 0
         try:
-            # Smazání původní vrstvy rozhraní a VR bloků
+            # Smazání pomocných vrstev VR bloků a rozhraní
             layers_to_delete = [vr_rozhrani_layer, vr_na_bod_layer, vr_na_linii_layer, vr_circles]
             
             for layer in layers_to_delete:
