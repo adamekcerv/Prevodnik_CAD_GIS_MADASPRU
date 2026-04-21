@@ -105,6 +105,118 @@ GEOMETRY_SUFFIX = {
     "MultiPatch": "MP"
 }
 
+DOMAIN_ALLOWED_VALUES = {
+    "DRUH_UP": {"UL", "NM", "UP", "UPX"},
+    "DRUH_SC": {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
+    "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
+}
+
+DOMAIN_MODEL_DEFINITIONS = {
+    "DRUH_UP": {
+        "domain_name": "DRUH_ULICNIHO_PROSTRANSTVI",
+        "description": "Druh uličního prostranství dle GIS modelu",
+        "field_type": "TEXT",
+        "coded_values": {
+            "UL": "ulice",
+            "NM": "náměstí",
+            "UP": "uliční prostranství bez rozlišení",
+            "UPX": "uliční prostranství jiné",
+        },
+    },
+    "DRUH_SC": {
+        "domain_name": "DRUH_STAVEBNI_CARY",
+        "description": "Druh stavební čáry dle GIS modelu",
+        "field_type": "TEXT",
+        "coded_values": {
+            "SCU": "stavební čára uzavřená",
+            "SCPU": "stavební čára polouzavřená",
+            "SCO": "stavební čára otevřená",
+            "SCV": "stavební čára volná",
+            "SC": "stavební čára bez rozlišení",
+            "SCX": "stavební čára jiná",
+        },
+    },
+    "VYSKA_VB": {
+        "domain_name": "DRUH_VZTAZNEHO_BODU",
+        "description": "Druh vztažného bodu dle GIS modelu",
+        "field_type": "TEXT",
+        "coded_values": {
+            "ST": "nejnižší bod přilehlého stávajícího terénu",
+            "CH": "nejnižší bod přilehlého chodníku",
+            "BPV": "nula stupnice vodočtu Baltu po vyrovnání (Bpv)",
+            "VBX": "vztažný bod jiný",
+        },
+    },
+}
+
+
+def _get_root_gdb_path(feature_class):
+    try:
+        workspace = arcpy.Describe(feature_class).path
+    except Exception:
+        return None
+
+    if not workspace:
+        return None
+
+    if workspace.lower().endswith(".gdb"):
+        return workspace
+
+    parent = os.path.dirname(workspace)
+    if parent and parent.lower().endswith(".gdb"):
+        return parent
+
+    return None
+
+
+def _sync_coded_value_domain(root_gdb, domain_name, domain_def, existing_domain=None):
+    existing_coded_values = {}
+    if existing_domain is None:
+        arcpy.management.CreateDomain(
+            root_gdb,
+            domain_name,
+            domain_def["description"],
+            domain_def["field_type"],
+            "CODED"
+        )
+    else:
+        existing_coded_values = dict(getattr(existing_domain, "codedValues", {}) or {})
+
+    expected_coded_values = domain_def["coded_values"]
+
+    for code, current_description in existing_coded_values.items():
+        if expected_coded_values.get(code) != current_description:
+            arcpy.management.DeleteCodedValueFromDomain(root_gdb, domain_name, code)
+
+    for code, description in expected_coded_values.items():
+        if existing_coded_values.get(code) != description:
+            arcpy.management.AddCodedValueToDomain(root_gdb, domain_name, code, description)
+
+
+def ensure_field_domain(feature_class, field_name):
+    domain_def = DOMAIN_MODEL_DEFINITIONS.get(field_name)
+    if not domain_def or not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    root_gdb = _get_root_gdb_path(feature_class)
+    if not root_gdb or not arcpy.Exists(root_gdb):
+        return
+
+    try:
+        existing_domains = {domain.name: domain for domain in arcpy.da.ListDomains(root_gdb)}
+        domain_name = domain_def["domain_name"]
+
+        _sync_coded_value_domain(
+            root_gdb,
+            domain_name,
+            domain_def,
+            existing_domains.get(domain_name)
+        )
+
+        arcpy.management.AssignDomainToField(feature_class, field_name, domain_name)
+    except Exception as e:
+        arcpy.AddWarning(f"[ensure_field_domain] Nelze přiřadit doménu {field_name}: {e}")
+
 class CadLayer(object):
     """
     Reprezentuje jednu vrstvu z CADu a související geometrii.
@@ -1900,10 +2012,14 @@ class CadFile(object):
             if field_exists:
                 current_field = existing_fields[attr_name]
                 current_type_generalized = "TEXT"
-                if current_field.type in ["Integer", "SmallInteger"]:
+                if current_field.type == "SmallInteger":
                     current_type_generalized = "SHORT"
-                elif current_field.type in ["Double", "Single"]:
+                elif current_field.type in ["Integer", "Long"]:
+                    current_type_generalized = "LONG"
+                elif current_field.type == "Single":
                     current_type_generalized = "FLOAT"
+                elif current_field.type == "Double":
+                    current_type_generalized = "DOUBLE"
                 elif current_field.type == "String":
                     current_type_generalized = "TEXT"
                 
@@ -1917,17 +2033,24 @@ class CadFile(object):
                     arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
                     validation_report.append(msg)
                 
-                # Pokud cíl je FLOAT a zdroj je Integer/SmallInteger -> konverze (vynucení desetinných míst)
-                elif expected_type == "FLOAT" and current_field.type in ["Integer", "SmallInteger"]:
+                # Pokud cíl je FLOAT a zdroj není přesně FLOAT -> konverze na modelový typ.
+                elif expected_type == "FLOAT" and current_type_generalized != "FLOAT":
                     needs_conversion = True
                     msg = f"Konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Float)"
                     arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
                     validation_report.append(msg)
                 
-                # Pokud cíl je SHORT a zdroj je Float/Double nebo Integer (Long) -> konverze (zaokrouhlení nebo zmenšení)
-                elif expected_type == "SHORT" and current_field.type in ["Single", "Double", "Integer"]:
+                # Pokud cíl je SHORT a zdroj není přesně SHORT -> konverze na modelový typ.
+                elif expected_type == "SHORT" and current_type_generalized != "SHORT":
                     needs_conversion = True
                     msg = f"Konverze '{attr_name}': {current_field.type} -> {expected_type} (Vynucení Short)"
+                    arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
+                    validation_report.append(msg)
+
+                # Pokud cíl je TEXT, ale délka neodpovídá modelu, znovu vytvoříme pole s přesnou délkou.
+                elif expected_type == "TEXT" and expected_length and current_type_generalized == "TEXT" and current_field.length != expected_length:
+                    needs_conversion = True
+                    msg = f"Konverze '{attr_name}': délka TEXT {current_field.length} -> {expected_length}"
                     arcpy.AddMessage(f"[finalize_layer_attributes] {msg}")
                     validation_report.append(msg)
                 
@@ -1943,21 +2066,31 @@ class CadFile(object):
             elif needs_conversion:
                 # Konverze: Vytvoříme TEMP field -> update hodnot -> smazat starý -> přejmenovat TEMP
                 temp_field = f"{attr_name}_TMP"
-                arcpy.management.AddField(feature_class, temp_field, expected_type, field_alias=expected_alias)
+                if expected_length:
+                    arcpy.management.AddField(feature_class, temp_field, expected_type, field_length=expected_length, field_alias=expected_alias)
+                else:
+                    arcpy.management.AddField(feature_class, temp_field, expected_type, field_alias=expected_alias)
                 
                 errors = []
+                truncated_count = 0
                 with arcpy.da.UpdateCursor(feature_class, ["OID@", attr_name, temp_field]) as cursor:
                     for row in cursor:
                         oid, val = row[0], row[1]
                         new_val = None
-                        if val:
+                        if val is not None and val != "":
                             try:
-                                # Strip "m", space, replace comma with dot
-                                s_val = str(val).lower().replace("m", "").replace(" ", "").replace(",", ".")
-                                if expected_type == "SHORT":
-                                    new_val = int(float(s_val))
+                                if expected_type == "TEXT":
+                                    new_val = str(val)
+                                    if expected_length and len(new_val) > expected_length:
+                                        new_val = new_val[:expected_length]
+                                        truncated_count += 1
                                 else:
-                                    new_val = float(s_val)
+                                    # Strip "m", space, replace comma with dot
+                                    s_val = str(val).lower().replace("m", "").replace(" ", "").replace(",", ".")
+                                    if expected_type == "SHORT":
+                                        new_val = int(float(s_val))
+                                    else:
+                                        new_val = float(s_val)
                             except:
                                 errors.append(f"OID {oid}: '{val}'")
                         
@@ -1966,10 +2099,22 @@ class CadFile(object):
                 
                 if errors:
                     arcpy.AddWarning(f"[finalize_layer_attributes] VAROVÁNÍ: Chyby konverze '{attr_name}' ({len(errors)}x). Příklady: {', '.join(errors[:3])}")
+                if truncated_count > 0:
+                    arcpy.AddMessage(f"[finalize_layer_attributes] Zkráceno {truncated_count} hodnot pole '{attr_name}' na délku {expected_length}")
                 
                 try:
                     arcpy.DeleteField_management(feature_class, attr_name)
-                    arcpy.management.AlterField(feature_class, temp_field, new_field_name=attr_name, new_field_alias=expected_alias)
+                    if expected_length:
+                        arcpy.management.AddField(feature_class, attr_name, expected_type, field_length=expected_length, field_alias=expected_alias)
+                    else:
+                        arcpy.management.AddField(feature_class, attr_name, expected_type, field_alias=expected_alias)
+
+                    with arcpy.da.UpdateCursor(feature_class, [temp_field, attr_name]) as cursor:
+                        for row in cursor:
+                            row[1] = row[0]
+                            cursor.updateRow(row)
+
+                    arcpy.DeleteField_management(feature_class, temp_field)
                 except Exception as e:
                     arcpy.AddWarning(f"Selhalo přejmenování pole {attr_name}: {e}")
 
@@ -2019,15 +2164,11 @@ class CadFile(object):
                     arcpy.AddWarning(f"[finalize_layer_attributes] Nelze doplnit ID_LOKAL pro {overflow_count} prvků (vyčerpán rozsah 1-999)")
 
         # --- 4b. Validace domén ---
-        domain_checks = {
-            "DRUH_UP":  {"UL", "NM", "UP", "UPX"},
-            "DRUH_SC":  {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
-            "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
-        }
         existing_field_names_4b = [f.name for f in arcpy.ListFields(feature_class)]
-        for domain_field, allowed_values in domain_checks.items():
+        for domain_field, allowed_values in DOMAIN_ALLOWED_VALUES.items():
             if domain_field not in target_attrs or domain_field not in existing_field_names_4b:
                 continue
+            ensure_field_domain(feature_class, domain_field)
             bad_count = 0
             bad_examples = []
             with arcpy.da.SearchCursor(feature_class, ["OID@", domain_field]) as cursor:
@@ -2100,19 +2241,52 @@ class CadFile(object):
 
     def _fill_dok_nazev_from_cad(self, feature_class, existing_field_names):
         """Pomocná metoda pro naplnění DOK_NAZEV z CAD atributů dokumentace."""
-        source_col = None
-        if "DocName" in existing_field_names:
-            source_col = "DocName"
-        elif "DocName_1" in existing_field_names:
-            source_col = "DocName_1"
-        elif "DOK_NAZEV" in existing_field_names:
-            source_col = "DOK_NAZEV"
+        available_fields = set(existing_field_names or [])
+        try:
+            available_fields.update(f.name for f in arcpy.ListFields(feature_class))
+        except Exception:
+            pass
 
-        if source_col:
-            try:
-                arcpy.management.CalculateField(feature_class, "DOK_NAZEV", f"!{source_col}!", "PYTHON3")
-            except:
-                pass
+        if "DOK_NAZEV" not in available_fields:
+            return
+
+        source_fields = [
+            field_name for field_name in ["DocName", "DocName_1", "DocPath", "DocPath_1"]
+            if field_name in available_fields
+        ]
+
+        if not source_fields:
+            return
+
+        try:
+            with arcpy.da.UpdateCursor(feature_class, ["DOK_NAZEV"] + source_fields) as cursor:
+                for row in cursor:
+                    if row[0] is not None and str(row[0]).strip() != "":
+                        continue
+
+                    chosen_value = None
+                    for idx, field_name in enumerate(source_fields, start=1):
+                        raw_value = row[idx]
+                        if raw_value is None:
+                            continue
+
+                        text_value = str(raw_value).strip()
+                        if not text_value:
+                            continue
+
+                        if field_name.startswith("DocPath"):
+                            normalized = text_value.replace("/", os.sep).replace("\\", os.sep)
+                            basename = os.path.basename(normalized)
+                            text_value = basename or text_value
+
+                        chosen_value = text_value
+                        break
+
+                    if chosen_value:
+                        row[0] = chosen_value[:255]
+                        cursor.updateRow(row)
+        except Exception:
+            pass
 
     def create_error_polygon_bod(self, analysis_fc, output_workspace, out_prefix):
         """

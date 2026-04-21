@@ -77,6 +77,35 @@ DOMAIN_ALLOWED_VALUES = {
     "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
 }
 
+DOMAIN_MODEL_DEFINITIONS = {
+    "DRUH_SC": {
+        "domain_name": "DRUH_STAVEBNI_CARY",
+        "description": "Druh stavební čáry dle GIS modelu",
+        "field_type": "TEXT",
+        "coded_values": {
+            "SCU": "stavební čára uzavřená",
+            "SCPU": "stavební čára polouzavřená",
+            "SCO": "stavební čára otevřená",
+            "SCV": "stavební čára volná",
+            "SC": "stavební čára bez rozlišení",
+            "SCX": "stavební čára jiná",
+        },
+    },
+    "VYSKA_VB": {
+        "domain_name": "DRUH_VZTAZNEHO_BODU",
+        "description": "Druh vztažného bodu dle GIS modelu",
+        "field_type": "TEXT",
+        "coded_values": {
+            "ST": "nejnižší bod přilehlého stávajícího terénu",
+            "CH": "nejnižší bod přilehlého chodníku",
+            "BPV": "nula stupnice vodočtu Baltu po vyrovnání (Bpv)",
+            "VBX": "vztažný bod jiný",
+        },
+    },
+}
+
+NOCAD_VR_ASSIGN_TOLERANCE_METERS = 0.30
+
 # Mapování čísla CAD vrstvy na kód domény DRUH_STAVEBNI_CARY
 SC_DRUH_MAPPING = {
     "301110": "SCU",   # stavební čára uzavřená
@@ -133,7 +162,8 @@ def log_message(message, level="INFO"):
         "WARN": "⚠️",
         "ERROR": "❌",
         "DEBUG": "🔍",
-        "STEP": "▶️"
+        "STEP": "▶️",
+        "CHECK": "📝"
     }.get(level, "")
     
     arcpy.AddMessage(f"{prefix} {message}")
@@ -164,13 +194,99 @@ def _is_missing_value(value):
 
 
 def _generalize_field_type(field):
-    if field.type in ["Integer", "SmallInteger"]:
+    if field.type == "SmallInteger":
         return "SHORT"
-    if field.type in ["Double", "Single"]:
+    if field.type in ["Integer", "Long"]:
+        return "LONG"
+    if field.type == "Single":
         return "FLOAT"
+    if field.type == "Double":
+        return "DOUBLE"
     if field.type == "String":
         return "TEXT"
     return field.type.upper()
+
+
+def _field_requires_schema_fix(field, expected_type, expected_length=None):
+    current_type = _generalize_field_type(field)
+    if current_type != expected_type:
+        return True
+
+    if expected_type == "TEXT" and expected_length is not None:
+        current_length = getattr(field, "length", None)
+        if current_length != expected_length:
+            return True
+
+    return False
+
+
+def _get_root_gdb_path(feature_class):
+    try:
+        workspace = arcpy.Describe(feature_class).path
+    except Exception:
+        return None
+
+    if not workspace:
+        return None
+
+    if workspace.lower().endswith(".gdb"):
+        return workspace
+
+    parent = os.path.dirname(workspace)
+    if parent and parent.lower().endswith(".gdb"):
+        return parent
+
+    return None
+
+
+def _sync_coded_value_domain(root_gdb, domain_name, domain_def, existing_domain=None):
+    existing_coded_values = {}
+    if existing_domain is None:
+        arcpy.management.CreateDomain(
+            root_gdb,
+            domain_name,
+            domain_def["description"],
+            domain_def["field_type"],
+            "CODED"
+        )
+    else:
+        existing_coded_values = dict(getattr(existing_domain, "codedValues", {}) or {})
+
+    expected_coded_values = domain_def["coded_values"]
+
+    for code, current_description in existing_coded_values.items():
+        if expected_coded_values.get(code) != current_description:
+            arcpy.management.DeleteCodedValueFromDomain(root_gdb, domain_name, code)
+
+    for code, description in expected_coded_values.items():
+        if existing_coded_values.get(code) != description:
+            arcpy.management.AddCodedValueToDomain(root_gdb, domain_name, code, description)
+
+
+def ensure_field_domain(feature_class, field_name):
+    """Vytvoří a přiřadí coded-value doménu dle GIS modelu, pokud je definovaná."""
+    domain_def = DOMAIN_MODEL_DEFINITIONS.get(field_name)
+    if not domain_def or not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    root_gdb = _get_root_gdb_path(feature_class)
+    if not root_gdb or not arcpy.Exists(root_gdb):
+        return
+
+    try:
+        existing_domains = {domain.name: domain for domain in arcpy.da.ListDomains(root_gdb)}
+        domain_name = domain_def["domain_name"]
+
+        _sync_coded_value_domain(
+            root_gdb,
+            domain_name,
+            domain_def,
+            existing_domains.get(domain_name)
+        )
+
+        arcpy.management.AssignDomainToField(feature_class, field_name, domain_name)
+    except Exception as e:
+        log_message(f"Nelze přiřadit doménu {field_name}: {e}", "WARN")
 
 
 def _convert_value_to_type(value, expected_type):
@@ -276,8 +392,7 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
         return
 
     field = fields[field_name]
-    current_type = _generalize_field_type(field)
-    if current_type == expected_type:
+    if not _field_requires_schema_fix(field, expected_type, expected_length):
         return
 
     temp_field = f"{field_name}_TMP"
@@ -290,6 +405,8 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
         arcpy.management.AddField(feature_class, temp_field, expected_type)
 
     errors = []
+    truncated_count = 0
+    truncated_examples = []
     with arcpy.da.UpdateCursor(feature_class, ["OID@", field_name, temp_field]) as cursor:
         for row in cursor:
             oid = row[0]
@@ -298,6 +415,11 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
             if not _is_missing_value(original_val):
                 try:
                     converted = _convert_value_to_type(original_val, expected_type)
+                    if expected_type == "TEXT" and expected_length is not None and converted is not None and len(converted) > expected_length:
+                        if len(truncated_examples) < 3:
+                            truncated_examples.append(f"OID {oid}: '{converted[:40]}'")
+                        converted = converted[:expected_length]
+                        truncated_count += 1
                 except Exception:
                     if len(errors) < 3:
                         errors.append(f"OID {oid}: '{original_val}'")
@@ -323,7 +445,13 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
     if errors:
         log_message(
             f"Konverze pole {field_name} na {expected_type}: některé hodnoty nešly převést. Příklady: {', '.join(errors)}",
-            "WARN"
+            "CHECK"
+        )
+
+    if truncated_count > 0:
+        log_message(
+            f"Model {field_name}: zkraceno {truncated_count} textových hodnot na délku {expected_length}. Příklady: {', '.join(truncated_examples)}",
+            "CHECK"
         )
 
 
@@ -408,6 +536,7 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
             continue
         expected_type, expected_length = schema
         _ensure_field_type(feature_class, field_name, expected_type, expected_length)
+        ensure_field_domain(feature_class, field_name)
 
     # 3) Naplnění konstant a defaultů.
     edit_fields = []
@@ -479,7 +608,7 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
             if overflow_count > 0:
                 log_message(
                     f"Validace {layer_model_key}: nelze doplnit ID_LOKAL pro {overflow_count} prvků (vyčerpán rozsah 1-999)",
-                    "WARN"
+                    "CHECK"
                 )
 
     # 4) Kontrola required polí (non-nullable).
@@ -494,7 +623,7 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
                 if _is_missing_value(row[0]):
                     missing_count += 1
         if missing_count > 0:
-            log_message(f"Validace {layer_model_key}: pole {req} má {missing_count} prázdných hodnot", "WARN")
+            log_message(f"Validace {layer_model_key}: pole {req} má {missing_count} prázdných hodnot", "CHECK")
 
     # 5) Kontrola doménových hodnot.
     for domain_field, allowed_values in DOMAIN_ALLOWED_VALUES.items():
@@ -519,7 +648,7 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
         if bad_count > 0:
             log_message(
                 f"Validace {layer_model_key}: pole {domain_field} má {bad_count} hodnot mimo doménu. Příklady: {', '.join(bad_examples)}",
-                "WARN"
+                "CHECK"
             )
 
     # 5b) Rozsah ID_LOKAL dle modelu (1-999).
@@ -547,7 +676,7 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
         if out_of_range > 0:
             log_message(
                 f"Validace {layer_model_key}: ID_LOKAL mimo rozsah 1-999 u {out_of_range} prvků. Příklady: {', '.join(out_examples)}",
-                "WARN"
+                "CHECK"
             )
 
     # 6) Ořez nepovolených polí.
@@ -821,6 +950,199 @@ def propagate_best_values_by_target(feature_class, attrs, target_field="TARGET_F
 
             if changed:
                 cursor.updateRow(row)
+
+
+def _ensure_field_from_template(feature_class, field_name, template_field):
+    existing_fields = [f.name for f in arcpy.ListFields(feature_class)]
+    if field_name in existing_fields:
+        return
+
+    if field_name in FIELD_SCHEMA:
+        expected_type, expected_length = FIELD_SCHEMA[field_name]
+        _ensure_field_type(feature_class, field_name, expected_type, expected_length)
+        return
+
+    field_type_map = {
+        "String": "TEXT",
+        "SmallInteger": "SHORT",
+        "Integer": "LONG",
+        "Long": "LONG",
+        "Single": "FLOAT",
+        "Double": "DOUBLE",
+        "Date": "DATE",
+    }
+    resolved_type = field_type_map.get(template_field.type, "TEXT")
+
+    if resolved_type == "TEXT":
+        field_length = getattr(template_field, "length", None) or 255
+        arcpy.management.AddField(feature_class, field_name, resolved_type, field_length=field_length)
+    else:
+        arcpy.management.AddField(feature_class, field_name, resolved_type)
+
+
+def _has_meaningful_assignment(values):
+    for value in values:
+        if _is_missing_value(value):
+            continue
+        if _is_zero_like_value(value):
+            continue
+        return True
+    return False
+
+
+def _has_usable_geometry(geometry):
+    if geometry is None:
+        return False
+    try:
+        if getattr(geometry, "isEmpty", False):
+            return False
+    except Exception:
+        pass
+
+    try:
+        return geometry.firstPoint is not None or geometry.lastPoint is not None
+    except Exception:
+        return False
+
+
+def build_unique_line_block_assignment(target_lines_fc, join_features_fc, out_feature_class, attrs_to_fix,
+                                       tolerance_meters=NOCAD_VR_ASSIGN_TOLERANCE_METERS,
+                                       log_label="NOCAD"):
+    """Přiřadí atributy jen tam, kde existuje skutečně unikátní vazba linie ↔ VR blok v toleranci."""
+    if not target_lines_fc or not arcpy.Exists(target_lines_fc):
+        return None
+
+    if arcpy.Exists(out_feature_class):
+        arcpy.management.Delete(out_feature_class)
+    arcpy.conversion.ExportFeatures(target_lines_fc, out_feature_class)
+
+    total_lines = get_feature_count(out_feature_class)
+    if not join_features_fc or not arcpy.Exists(join_features_fc):
+        log_message(f"{log_label}: VR bloky nejsou k dispozici, ponechávám {total_lines} linií bez výškových atributů.", "INFO")
+        return out_feature_class
+
+    candidate_fc = r"memory\vr_unique_candidates"
+    if arcpy.Exists(candidate_fc):
+        arcpy.management.Delete(candidate_fc)
+
+    arcpy.analysis.SpatialJoin(
+        target_features=out_feature_class,
+        join_features=join_features_fc,
+        out_feature_class=candidate_fc,
+        join_operation="JOIN_ONE_TO_MANY",
+        join_type="KEEP_ALL",
+        match_option="WITHIN_A_DISTANCE",
+        search_radius=f"{tolerance_meters} Meters"
+    )
+
+    transfer_joined_attributes(candidate_fc, attrs_to_fix)
+    ensure_npu_from_nup(candidate_fc)
+    propagate_best_values_by_target(candidate_fc, attrs_to_fix)
+    ensure_npu_from_nup(candidate_fc)
+
+    candidate_fields = {f.name: f for f in arcpy.ListFields(candidate_fc)}
+    if "TARGET_FID" not in candidate_fields or "JOIN_FID" not in candidate_fields:
+        log_message(f"{log_label}: chybí TARGET_FID/JOIN_FID po SpatialJoin, ponechávám linie bez přiřazení.", "WARN")
+        return out_feature_class
+
+    attrs_present = [attr for attr in attrs_to_fix if attr in candidate_fields]
+    for attr in attrs_present:
+        _ensure_field_from_template(out_feature_class, attr, candidate_fields[attr])
+
+    pair_values = {}
+    target_to_join = {}
+    join_to_target = {}
+
+    with arcpy.da.SearchCursor(candidate_fc, ["TARGET_FID", "JOIN_FID"] + attrs_present) as cursor:
+        for row in cursor:
+            target_fid = row[0]
+            join_fid = row[1]
+
+            try:
+                join_fid = int(join_fid)
+            except Exception:
+                continue
+
+            if join_fid < 0:
+                continue
+
+            values = list(row[2:])
+            if not _has_meaningful_assignment(values):
+                continue
+
+            target_to_join.setdefault(target_fid, set()).add(join_fid)
+            join_to_target.setdefault(join_fid, set()).add(target_fid)
+
+            pair_key = (target_fid, join_fid)
+            if pair_key not in pair_values:
+                pair_values[pair_key] = values
+            else:
+                merged = list(pair_values[pair_key])
+                for idx, value in enumerate(values):
+                    current_value = merged[idx]
+                    if _is_missing_value(current_value):
+                        merged[idx] = value
+                    elif _is_zero_like_value(current_value) and not _is_zero_like_value(value):
+                        merged[idx] = value
+                pair_values[pair_key] = merged
+
+    shared_join_ids = {
+        join_fid for join_fid, target_ids in join_to_target.items()
+        if len(target_ids) != 1
+    }
+
+    unique_assignment = {}
+    ambiguous_target_ids = set()
+    shared_target_ids = set()
+
+    for target_fid, join_ids in target_to_join.items():
+        if len(join_ids) != 1:
+            ambiguous_target_ids.add(target_fid)
+            continue
+
+        join_fid = next(iter(join_ids))
+        if join_fid in shared_join_ids:
+            shared_target_ids.add(target_fid)
+            continue
+
+        unique_assignment[target_fid] = pair_values.get((target_fid, join_fid), [])
+
+    if attrs_present and unique_assignment:
+        with arcpy.da.UpdateCursor(out_feature_class, ["OID@"] + attrs_present) as cursor:
+            for row in cursor:
+                target_oid = row[0]
+                assigned_values = unique_assignment.get(target_oid)
+                if not assigned_values:
+                    continue
+
+                changed = False
+                for idx, value in enumerate(assigned_values):
+                    if _is_missing_value(value):
+                        continue
+
+                    current_value = row[idx + 1]
+                    if _is_missing_value(current_value):
+                        row[idx + 1] = value
+                        changed = True
+                    elif _is_zero_like_value(current_value) and not _is_zero_like_value(value):
+                        row[idx + 1] = value
+                        changed = True
+
+                if changed:
+                    cursor.updateRow(row)
+
+    matched_target_ids = set(target_to_join.keys())
+    without_candidate_count = max(total_lines - len(matched_target_ids), 0)
+    ambiguous_line_count = len(ambiguous_target_ids | shared_target_ids)
+    assigned_count = len(unique_assignment)
+
+    log_message(
+        f"{log_label}: unikátně přiřazeno {assigned_count} liniím, bez kandidáta {without_candidate_count}, "
+        f"nejednoznačných linií {ambiguous_line_count} (tolerance {tolerance_meters:.2f} m).",
+        "INFO"
+    )
+
+    return out_feature_class
 
 
 class Toolbox(object):
@@ -1992,6 +2314,13 @@ class HeightRegulationImport(object):
                 # Finální SpatialJoin s VR bloky (podle notebooku)
                 log_message("Finální SpatialJoin s VR bloky...", "STEP")
 
+                attrs_to_fix = [
+                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO",
+                    "NP_MIN", "NP_MAX", "NPU_MAX", "NUP_MAX",
+                    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX",
+                    "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
+                ]
+
                 # Centroidy VR bloků byly snapnuty na merged_sc_all před Phase 6 Dissolve.
                 # Dissolve může souřadnice vrcholů zaokrouhlit na grid (XY resolution),
                 # takže centroidy po dissolve neleží přesně na liniích sc_cleaned.
@@ -2009,37 +2338,56 @@ class HeightRegulationImport(object):
                     vr_join_for_sj = vr_join_features
 
                 if has_cad_processing_scope:
+                    vr_join_for_cad = vr_join_for_sj
+                    try:
+                        arcpy.management.MakeFeatureLayer(vr_join_for_sj, "vr_phase8_cad_lyr")
+                        arcpy.management.SelectLayerByLocation(
+                            in_layer="vr_phase8_cad_lyr",
+                            overlap_type="WITHIN_A_DISTANCE",
+                            select_features=sc_cleaned,
+                            search_distance=f"{cad_split_radius} Meters",
+                            selection_type="NEW_SELECTION",
+                            invert_spatial_relationship="NOT_INVERT"
+                        )
+                        cad_seed_count = int(arcpy.GetCount_management("vr_phase8_cad_lyr")[0])
+                        log_message(f"VR bloků relevantních pro CAD větev: {cad_seed_count}", "DEBUG")
+                        if cad_seed_count > 0:
+                            arcpy.conversion.ExportFeatures("vr_phase8_cad_lyr", r"memory\vr_join_phase8_cad")
+                            vr_join_for_cad = r"memory\vr_join_phase8_cad"
+                    except Exception as _cad_scope_err:
+                        log_message(f"Filtrace VR bloků pro CAD větev selhala, použiji všechny: {_cad_scope_err}", "WARN")
+                        vr_join_for_cad = vr_join_for_sj
+                    finally:
+                        if arcpy.Exists("vr_phase8_cad_lyr"):
+                            arcpy.management.Delete("vr_phase8_cad_lyr")
+
                     arcpy.analysis.SpatialJoin(
                         target_features=sc_cleaned,
-                        join_features=vr_join_for_sj,
+                        join_features=vr_join_for_cad,
                         out_feature_class=r"memory\sc_final_sj",
                         join_operation="JOIN_ONE_TO_MANY",
                         join_type="KEEP_ALL",
-                        match_option="INTERSECT"
+                        match_option="WITHIN_A_DISTANCE",
+                        search_radius=f"{cad_split_radius} Meters"
                     )
-                else:
-                    # Bez CAD rozhraní bereme pro každou linii nejbližší VR centroid (deterministické 1:1).
-                    arcpy.analysis.SpatialJoin(
-                        target_features=sc_cleaned,
-                        join_features=vr_join_for_sj,
-                        out_feature_class=r"memory\sc_final_sj",
-                        join_operation="JOIN_ONE_TO_ONE",
-                        join_type="KEEP_ALL",
-                        match_option="CLOSEST"
-                    )
-                
-                # Seznam atributů k opravě
-                attrs_to_fix = [
-                    "OZNACENI", "NAZEV_BLOK", "DRUH_UP", "DRUH_INFO",
-                    "NP_MIN", "NP_MAX", "NPU_MAX", "NUP_MAX",
-                    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX",
-                    "VYSKA_VB", "VYSKA_VB_I", "DOK_NAZEV"
-                ]
 
-                transfer_joined_attributes(r"memory\sc_final_sj", attrs_to_fix)
-                ensure_npu_from_nup(r"memory\sc_final_sj")
-                propagate_best_values_by_target(r"memory\sc_final_sj", attrs_to_fix)
-                ensure_npu_from_nup(r"memory\sc_final_sj")
+                    transfer_joined_attributes(r"memory\sc_final_sj", attrs_to_fix)
+                    ensure_npu_from_nup(r"memory\sc_final_sj")
+                    propagate_best_values_by_target(r"memory\sc_final_sj", attrs_to_fix)
+                    ensure_npu_from_nup(r"memory\sc_final_sj")
+                else:
+                    log_message(
+                        f"Bez CAD rozhraní páruji linie jen s unikátním VR blokem do {NOCAD_VR_ASSIGN_TOLERANCE_METERS:.2f} m.",
+                        "INFO"
+                    )
+                    build_unique_line_block_assignment(
+                        sc_cleaned,
+                        vr_join_features,
+                        r"memory\sc_final_sj",
+                        attrs_to_fix,
+                        tolerance_meters=NOCAD_VR_ASSIGN_TOLERANCE_METERS,
+                        log_label="NOCAD hlavní větev"
+                    )
                 
                 sj_count = get_feature_count(r"memory\sc_final_sj")
                 log_message(f"SpatialJoin výsledek: {sj_count} záznamů", "DEBUG")
@@ -2050,6 +2398,11 @@ class HeightRegulationImport(object):
                     log_message("SC_TYPE nalezeno po SpatialJoin", "DEBUG")
                 else:
                     log_message("VAROVÁNÍ: SC_TYPE CHYBÍ po SpatialJoin!", "WARN")
+
+                if has_cad_processing_scope and "Join_Count" in fields_sj:
+                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["Join_Count"]) as cursor:
+                        seeded_count = sum(1 for row in cursor if row[0] and row[0] > 0)
+                    log_message(f"Segmentů se seed atributy po finálním CAD joinu: {seeded_count}", "DEBUG")
 
                 # Diagnostika: které modelové výškové atributy nejsou ve zdroji VR dostupné.
                 missing_model_attrs = []
@@ -2112,7 +2465,11 @@ class HeightRegulationImport(object):
                                 arcpy.analysis.Buffer(barrier_source, r"memory\rozhrani_buffer", "0.02 Meters")
                                 # Načti VŠECHNY buffery jako seznam geometrií pro správnou detekci bariér
                                 if int(arcpy.GetCount_management(r"memory\rozhrani_buffer")[0]) > 0:
-                                    barrier_geom = [row[0] for row in arcpy.da.SearchCursor(r"memory\rozhrani_buffer", ["SHAPE@"])]
+                                    barrier_geom = [
+                                        row[0]
+                                        for row in arcpy.da.SearchCursor(r"memory\rozhrani_buffer", ["SHAPE@"])
+                                        if _has_usable_geometry(row[0])
+                                    ]
                             except Exception as e:
                                 log_message(f"Nepodařilo se vytvořit bariéry pro propagaci: {e}", "WARN")
                                 barrier_geom = None
@@ -2157,15 +2514,14 @@ class HeightRegulationImport(object):
                             
                             # Determine has_data, strictly excluding ORIG_FID or generic fields
                             # attrs list corresponds to available_height_attrs
-                            has_real_data = False
+                            meaningful_attrs = []
                             for idx, attr_val in enumerate(attrs):
                                 field_name = available_height_attrs[idx]
                                 # Ignorujeme technická pole pro určení, zda má segment "data" k propagaci
                                 if "ORIG_FID" in field_name or "SC_TYPE" in field_name or "TARGET_FID" in field_name:
                                     continue
-                                if attr_val is not None:
-                                    has_real_data = True
-                                    break
+                                meaningful_attrs.append(attr_val)
+                            has_real_data = _has_meaningful_assignment(meaningful_attrs)
                             
                             segments_data[oid] = {
                                 "geom": geom, 
@@ -2196,6 +2552,9 @@ class HeightRegulationImport(object):
                                 null_geom = null_info["geom"]
                                 null_fid = null_info["orig_fid"]
                                 null_type = null_info["sc_type"]
+
+                                if not _has_usable_geometry(null_geom):
+                                    continue
                                 
                                 # Najdi souseda s daty
                                 candidate_attrs = None
@@ -2204,6 +2563,9 @@ class HeightRegulationImport(object):
                                     fill_geom = fill_info["geom"]
                                     fill_fid = fill_info["orig_fid"]
                                     fill_type = fill_info["sc_type"]
+
+                                    if not _has_usable_geometry(fill_geom):
+                                        continue
                                     
                                     # Rychlý check disjoint (bounding box) - jen pro orientaci, distanceTo řeší vše
                                     if null_geom.disjoint(fill_geom):
@@ -2216,11 +2578,11 @@ class HeightRegulationImport(object):
                                         # Kde se dotýkají?
                                         connection_point = None
                                         start_pt = null_geom.firstPoint
-                                        if fill_geom.distanceTo(start_pt) < 0.05:
+                                        if start_pt and fill_geom.distanceTo(start_pt) < 0.05:
                                             connection_point = start_pt
                                         else:
                                             end_pt = null_geom.lastPoint
-                                            if fill_geom.distanceTo(end_pt) < 0.05:
+                                            if end_pt and fill_geom.distanceTo(end_pt) < 0.05:
                                                 connection_point = end_pt
                                         
                                         if not connection_point:
@@ -2230,7 +2592,7 @@ class HeightRegulationImport(object):
                                         is_blocked = False
                                         if barrier_geom and connection_point:
                                             cp_geom = arcpy.PointGeometry(connection_point, null_geom.spatialReference)
-                                            if any(not bg.disjoint(cp_geom) for bg in barrier_geom):
+                                            if any(bg and not bg.disjoint(cp_geom) for bg in barrier_geom):
                                                 # Bariéra nalezena.
                                                 type_match = False
                                                 if null_type is not None and fill_type is not None:
@@ -2403,19 +2765,18 @@ class HeightRegulationImport(object):
                 # Paralelní NOCAD větev: bez dissolve, jen napojení atributů na původní linie.
                 if has_cad_processing_scope and sc_nocad_scope and arcpy.Exists(sc_nocad_scope) and sc_nocad_scope_count > 0:
                     try:
-                        log_message(f"Zpracovávám NOCAD větev ({sc_nocad_scope_count} linií) bez dissolve...", "STEP")
-                        arcpy.analysis.SpatialJoin(
-                            target_features=sc_nocad_scope,
-                            join_features=vr_join_features,
-                            out_feature_class=r"memory\sc_nocad_sj",
-                            join_operation="JOIN_ONE_TO_ONE",
-                            join_type="KEEP_ALL",
-                            match_option="CLOSEST"
+                        log_message(
+                            f"Zpracovávám NOCAD větev ({sc_nocad_scope_count} linií) s unikátním párováním VR bloků do {NOCAD_VR_ASSIGN_TOLERANCE_METERS:.2f} m...",
+                            "STEP"
                         )
-                        transfer_joined_attributes(r"memory\sc_nocad_sj", attrs_to_fix)
-                        ensure_npu_from_nup(r"memory\sc_nocad_sj")
-                        propagate_best_values_by_target(r"memory\sc_nocad_sj", attrs_to_fix)
-                        ensure_npu_from_nup(r"memory\sc_nocad_sj")
+                        build_unique_line_block_assignment(
+                            sc_nocad_scope,
+                            vr_join_features,
+                            r"memory\sc_nocad_sj",
+                            attrs_to_fix,
+                            tolerance_meters=NOCAD_VR_ASSIGN_TOLERANCE_METERS,
+                            log_label="NOCAD větev"
+                        )
                         sc_final_with_vr_nocad = r"memory\sc_nocad_sj"
                         log_message(f"NOCAD větev připravena: {get_feature_count(sc_final_with_vr_nocad)} segmentů", "OK")
                     except Exception as nocad_error:
@@ -2479,10 +2840,10 @@ class HeightRegulationImport(object):
                     without_block_count = 0
                     with arcpy.da.SearchCursor(sc_final_with_vr, available_height_attrs_final) as cursor:
                         for row in cursor:
-                            if all(v is None for v in row):
+                            if all(_is_missing_value(v) or _is_zero_like_value(v) for v in row):
                                 without_block_count += 1
                     if without_block_count > 0:
-                        log_message(f"Segmentů bez výškového bloku: {without_block_count} (informace, ne chyba)", "WARN")
+                        log_message(f"Segmentů bez výškového bloku: {without_block_count} (informace, ne chyba)", "CHECK")
                     else:
                         log_message("Všechny segmenty mají přiřazený výškový blok", "OK")
 
@@ -2744,7 +3105,7 @@ class HeightRegulationImport(object):
                                     vr_err_name = generate_unique_name(output_gdb, vr_err_name)
                                     vr_err_fc = os.path.join(output_workspace, vr_err_name)
                                     arcpy.conversion.ExportFeatures(_err_lyr, vr_err_fc)
-                                    log_message(f"Z_3022_Errors: {err_count} chybných segmentů → {vr_err_name}", "WARN")
+                                    log_message(f"Z_3022_Errors: {err_count} chybných segmentů → {vr_err_name}", "CHECK")
                                     errors_outputs.append(vr_err_fc)
                                 else:
                                     log_message("Z_3022: Žádné chyby (všechny segmenty mají max. 1 VR blok)", "OK")
@@ -2975,9 +3336,9 @@ class HeightRegulationImport(object):
                 log_message(f"  • {os.path.basename(output_path)}", "OK")
         
         if errors_outputs:
-            log_message(f"Vrstvy s chybami ({len(errors_outputs)}):", "WARN")
+            log_message(f"Vrstvy s chybami ({len(errors_outputs)}):", "CHECK")
             for error_path in errors_outputs:
-                log_message(f"  • {os.path.basename(error_path)}", "WARN")
+                log_message(f"  • {os.path.basename(error_path)}", "CHECK")
         
         log_message(f"Output GDB: {output_gdb}", "INFO")
 
