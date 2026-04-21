@@ -486,6 +486,7 @@ class CadFile(object):
                 if analysis_results:
                     main_analysis_fc = analysis_results[0]  # Resene_uzemi_with_Points
                     updated_main_polygon_fc = None
+                    vyska_polygon_source_fc = None
                     
                     # NOVÁ STRATEGIE: Místo snappování používáme už vytvořený hlavní polygon
                     if main_polygon_fc:
@@ -529,16 +530,23 @@ class CadFile(object):
                     except Exception as e:
                         arcpy.AddWarning(f"[export_layers] Nelze smazat původní polygon: {e}")
                     
-                    # SPLIT POLYGONŮ podle rozhraní výškových kruhů (pokud existuje)
-                    # Musí být PŘED split_analysis_by_layer a PŘED připojením výškových atributů
-                    if vyska_rozhrani_fc:
+                    # Pro 3023 potřebujeme polygony rozdělené výškovými rozhraními,
+                    # ale datové vrstvy 2021-2051 se tímto řezem nesmí fyzicky rozdělit.
+                    vyska_polygon_source_fc = main_analysis_fc
+                    if vyska_rozhrani_fc and vyska_centroids_fc:
                         try:
-                            main_analysis_fc = self.split_polygons_by_vyska_rozhrani(
-                                main_analysis_fc, vyska_rozhrani_fc, output_workspace, out_prefix
+                            vyska_split_input = "in_memory\\main_analysis_for_vyska_split"
+                            if arcpy.Exists(vyska_split_input):
+                                arcpy.Delete_management(vyska_split_input)
+
+                            arcpy.management.CopyFeatures(main_analysis_fc, vyska_split_input)
+                            vyska_polygon_source_fc = self.split_polygons_by_vyska_rozhrani(
+                                vyska_split_input, vyska_rozhrani_fc, output_workspace, out_prefix
                             )
-                            arcpy.AddMessage("[export_layers] ✓ Polygony rozděleny podle rozhraní výškových kruhů")
+                            arcpy.AddMessage("[export_layers] ✓ Pomocné polygony pro 3023 rozděleny podle rozhraní výškových kruhů")
                         except Exception as e:
-                            arcpy.AddWarning(f"[export_layers] Chyba při split polygonů podle rozhraní: {e}")
+                            vyska_polygon_source_fc = main_analysis_fc
+                            arcpy.AddWarning(f"[export_layers] Chyba při přípravě split polygonů pro 3023: {e}")
                     
                     # Split Resene_uzemi_with_Points podle pole Layer
                     split_results = self.split_analysis_by_layer(
@@ -557,34 +565,32 @@ class CadFile(object):
                         # SAMOSTATNÝ SPATIAL JOIN VÝŠKOVÝCH BODŮ - NOVÁ LOGIKA
                         if vyska_centroids_fc:
                             try:
-                                vyska_polygons_list = []
                                 arcpy.AddMessage("[export_layers] Vytvářím samostatné polygony výškové regulace na plochu...")
-                                for split_fc in split_results:
-                                    # Vytvoří novou vrstvu (fragment), pokud se v polygonu nachází výškový bod
-                                    # Fragmenty se pojmenují dočasně, pak se sloučí
-                                    vyska_fragment = self.create_vyska_polygon_layer(split_fc, vyska_centroids_fc, output_workspace, out_prefix)
-                                    if vyska_fragment:
-                                        vyska_polygons_list.append(vyska_fragment)
-                                
-                                # Sloučení všech fragmentů do jedné vrstvy Z_3023_VyskovaRegulaceNaPlochu_p
-                                if vyska_polygons_list:
-                                    # out_prefix již obsahuje "_" na konci (zpracováno v execute)
-                                    # Takže pokud je prefix "Z_", výsledné jméno bude "Z_3023_..." (správně)
+                                vyska_fragment = None
+                                if vyska_polygon_source_fc and arcpy.Exists(vyska_polygon_source_fc):
+                                    vyska_fragment = self.create_vyska_polygon_layer(
+                                        vyska_polygon_source_fc,
+                                        vyska_centroids_fc,
+                                        output_workspace,
+                                        out_prefix
+                                    )
+
+                                if vyska_fragment and arcpy.Exists(vyska_fragment):
                                     final_vyska_name = f"{out_prefix}3023_VyskovaRegulaceNaPlochu_p"
-                                    # Kontrola, zda jméno už existuje (teoreticky nemělo být vytvořeno v split_results, protože tam jsou jiné Layery)
                                     final_vyska_fc = os.path.join(output_workspace, generate_unique_fc_name(final_vyska_name, output_workspace))
-                                    
-                                    arcpy.AddMessage(f"[export_layers] Slučuji {len(vyska_polygons_list)} fragmentů do finální vrstvy: {os.path.basename(final_vyska_fc)}")
-                                    arcpy.management.Merge(vyska_polygons_list, final_vyska_fc)
-                                    
+
+                                    arcpy.AddMessage(f"[export_layers] Ukládám finální vrstvu výškové regulace na plochu: {os.path.basename(final_vyska_fc)}")
+                                    arcpy.management.CopyFeatures(vyska_fragment, final_vyska_fc)
+
                                     # Finalizace atributů nové vrstvy
                                     self.finalize_layer_attributes(final_vyska_fc, "Z_3023_VyskovaRegulaceNaPlochu_p")
                                     exported_layers.append(final_vyska_fc)
-                                    
-                                    # Smazání fragmentů
-                                    for fragment in vyska_polygons_list:
-                                        arcpy.Delete_management(fragment)
-                                        
+
+                                    arcpy.Delete_management(vyska_fragment)
+
+                                if vyska_polygon_source_fc and vyska_polygon_source_fc != main_analysis_fc and arcpy.Exists(vyska_polygon_source_fc):
+                                    arcpy.Delete_management(vyska_polygon_source_fc)
+
                                 arcpy.AddMessage("[export_layers] ✓ Vytváření polygonů výškové regulace dokončeno")
                             except Exception as e:
                                 arcpy.AddWarning(f"[export_layers] Chyba při vytváření polygonů výškové regulace: {e}")
@@ -811,7 +817,7 @@ class CadFile(object):
         2. Polygon to Line (hrany polygonů)
         3. Merge hran + rozhraní
         4. Feature to Polygon (rozdělení)
-        5. Spatial join zpět k původním polygonům (přenos atributů)
+        5. Spatial join zpět k původním polygonům (přenos atributů dle největšího překryvu)
         """
         try:
             arcpy.AddMessage("[split_polygons_vyska] Začínám rozdělování polygonů podle rozhraní výškových kruhů")
@@ -870,7 +876,7 @@ class CadFile(object):
                 out_feature_class=final_split_fc,
                 join_operation="JOIN_ONE_TO_ONE",
                 join_type="KEEP_ALL",
-                match_option="HAVE_THEIR_CENTER_IN"
+                match_option="LARGEST_OVERLAP"
             )
             
             final_count = int(arcpy.GetCount_management(final_split_fc)[0])
@@ -1931,6 +1937,8 @@ class CadFile(object):
                 validation_report.append(f"Vytvořeno nové pole '{attr_name}' ({expected_type})")
                 if attr_name == "OZNACENI":
                     self._fill_oznaceni_from_cad(feature_class, existing_fields.keys())
+                elif attr_name == "DOK_NAZEV":
+                    self._fill_dok_nazev_from_cad(feature_class, existing_fields.keys())
                     
             elif needs_conversion:
                 # Konverze: Vytvoříme TEMP field -> update hodnot -> smazat starý -> přejmenovat TEMP
@@ -2087,6 +2095,22 @@ class CadFile(object):
         if source_col:
             try:
                 arcpy.management.CalculateField(feature_class, "OZNACENI", f"!{source_col}!", "PYTHON3")
+            except:
+                pass
+
+    def _fill_dok_nazev_from_cad(self, feature_class, existing_field_names):
+        """Pomocná metoda pro naplnění DOK_NAZEV z CAD atributů dokumentace."""
+        source_col = None
+        if "DocName" in existing_field_names:
+            source_col = "DocName"
+        elif "DocName_1" in existing_field_names:
+            source_col = "DocName_1"
+        elif "DOK_NAZEV" in existing_field_names:
+            source_col = "DOK_NAZEV"
+
+        if source_col:
+            try:
+                arcpy.management.CalculateField(feature_class, "DOK_NAZEV", f"!{source_col}!", "PYTHON3")
             except:
                 pass
 

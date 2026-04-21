@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import arcpy
 import os
+import re
 
 # Defaultní vrstvy pro MADASPRU project
 DEFAULT_LAYERS = [
@@ -16,6 +17,17 @@ HEIGHT_ATTRIBUTES = [
     "RIMSA_MIN", "RIMSA_MAX",
     "VYSKA_MAX"
 ]
+
+VR_ATTRIBUTE_SOURCE_ALIASES = {
+    "VYSKA_VB": ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB"],
+    "VYSKA_VB_I": ["VYSKA_VBI", "VYSKAVBI", "VR_VYSKA_VB_I", "VR_VYSKA_VBI", "VYSKA VB I"],
+    "NP_MIN": ["MIN_NP", "NPMIN", "VR_NP_MIN", "VR_NPMIN", "NP MIN"],
+    "NP_MAX": ["MAX_NP", "NPMAX", "VR_NP_MAX", "VR_NPMAX", "NP MAX"],
+    "NPU_MAX": ["NUP_MAX", "NPUMAX", "NUPMAX", "VR_NPU_MAX", "VR_NUP_MAX", "MAX_NPU", "MAX_NUP", "NPU MAX", "NUP MAX"],
+    "RIMSA_MIN": ["MIN_RIMSA", "RIMSAMIN", "VR_RIMSA_MIN", "VR_RIMSAMIN", "RIMSA MIN", "RIMSA"],
+    "RIMSA_MAX": ["MAX_RIMSA", "RIMSAMAX", "VR_RIMSA_MAX", "VR_RIMSAMAX", "RIMSA MAX"],
+    "VYSKA_MAX": ["MAX_VYSKA", "VYSKAMAX", "VR_VYSKA_MAX", "VR_VYSKAMAX", "VYSKA MAX", "VYSKA", "VYSKA_TOTAL", "VYSKA_CELKEM"],
+}
 
 FIELD_SCHEMA = {
     "SKNAZEV": ("TEXT", 50),
@@ -181,6 +193,78 @@ def _convert_value_to_type(value, expected_type):
     return value
 
 
+def _normalize_field_key(value):
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value).upper() if ch.isalnum())
+
+
+def _is_zero_like_value(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value == 0
+    if isinstance(value, str):
+        txt = value.strip().replace(",", ".")
+        if txt == "":
+            return False
+        try:
+            return float(txt) == 0.0
+        except Exception:
+            return False
+    return False
+
+
+def _iter_vr_attribute_aliases(target_attr):
+    aliases = [target_attr] + VR_ATTRIBUTE_SOURCE_ALIASES.get(target_attr, [])
+    expanded = []
+    seen = set()
+
+    for alias in aliases:
+        variants = [alias, alias.replace("_", " "), alias.replace("_", "")]
+        if not str(alias).upper().startswith("VR_"):
+            variants.append(f"VR_{alias}")
+
+        for variant in variants:
+            key = str(variant).upper()
+            if key not in seen:
+                seen.add(key)
+                expanded.append(variant)
+
+    return expanded
+
+
+def _find_matching_source_fields(field_names, target_attr):
+    matches = []
+    seen = set()
+    normalized_aliases = [
+        (idx, _normalize_field_key(alias))
+        for idx, alias in enumerate(_iter_vr_attribute_aliases(target_attr))
+        if _normalize_field_key(alias)
+    ]
+
+    for field_name in field_names:
+        base_name = re.sub(r"_\d+$", "", field_name)
+        normalized_base = _normalize_field_key(base_name)
+        best_rank = None
+
+        for alias_idx, normalized_alias in normalized_aliases:
+            if normalized_base == normalized_alias:
+                best_rank = (0, alias_idx, len(base_name))
+                break
+            if normalized_base.endswith(normalized_alias):
+                candidate_rank = (1, alias_idx, len(base_name))
+                if best_rank is None or candidate_rank < best_rank:
+                    best_rank = candidate_rank
+
+        if best_rank is not None and field_name not in seen:
+            seen.add(field_name)
+            matches.append((best_rank, field_name))
+
+    matches.sort(key=lambda item: item[0])
+    return [field_name for _, field_name in matches]
+
+
 def _ensure_field_type(feature_class, field_name, expected_type, expected_length=None):
     fields = {f.name: f for f in arcpy.ListFields(feature_class)}
 
@@ -222,7 +306,17 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
 
     try:
         arcpy.management.DeleteField(feature_class, [field_name])
-        arcpy.management.AlterField(feature_class, temp_field, field_name, field_name)
+        if expected_length:
+            arcpy.management.AddField(feature_class, field_name, expected_type, field_length=expected_length)
+        else:
+            arcpy.management.AddField(feature_class, field_name, expected_type)
+
+        with arcpy.da.UpdateCursor(feature_class, [temp_field, field_name]) as cursor:
+            for row in cursor:
+                row[1] = row[0]
+                cursor.updateRow(row)
+
+        arcpy.management.DeleteField(feature_class, [temp_field])
     except Exception as e:
         log_message(f"Selhalo přejmenování pole {field_name}: {e}", "WARN")
 
@@ -231,6 +325,61 @@ def _ensure_field_type(feature_class, field_name, expected_type, expected_length
             f"Konverze pole {field_name} na {expected_type}: některé hodnoty nešly převést. Příklady: {', '.join(errors)}",
             "WARN"
         )
+
+
+def ensure_canonical_vr_fields(feature_class, target_attrs=None):
+    """Naplní kanonická pole datového modelu GIS z CAD aliasů VR atributů."""
+    if not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    target_attrs = target_attrs or HEIGHT_ATTRIBUTES
+    original_fields = [f.name for f in arcpy.ListFields(feature_class)]
+
+    for target_attr in target_attrs:
+        schema = FIELD_SCHEMA.get(target_attr)
+        if not schema:
+            continue
+
+        expected_type, expected_length = schema
+        source_fields = [
+            field_name
+            for field_name in _find_matching_source_fields(original_fields, target_attr)
+            if field_name != target_attr
+        ]
+
+        _ensure_field_type(feature_class, target_attr, expected_type, expected_length)
+
+        if not source_fields:
+            continue
+
+        with arcpy.da.UpdateCursor(feature_class, [target_attr] + source_fields) as cursor:
+            for row in cursor:
+                current_value = row[0]
+                if not (_is_missing_value(current_value) or _is_zero_like_value(current_value)):
+                    continue
+
+                chosen_value = None
+                for source_value in row[1:]:
+                    if _is_missing_value(source_value):
+                        continue
+                    try:
+                        converted_value = _convert_value_to_type(source_value, expected_type)
+                    except Exception:
+                        continue
+
+                    if converted_value is None:
+                        continue
+                    if not _is_zero_like_value(converted_value):
+                        chosen_value = converted_value
+                        break
+                    if chosen_value is None:
+                        chosen_value = converted_value
+
+                if chosen_value is not None:
+                    row[0] = chosen_value
+                    cursor.updateRow(row)
+
+    ensure_npu_from_nup(feature_class)
 
 
 def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefixes=None):
@@ -450,6 +599,11 @@ def get_vr_attributes(vr_feature_class):
     
     vr_attrs = []
     try:
+        all_field_names = [field.name for field in arcpy.ListFields(vr_feature_class)]
+        matched_height_fields = set()
+        for attr in HEIGHT_ATTRIBUTES:
+            matched_height_fields.update(_find_matching_source_fields(all_field_names, attr))
+
         for field in arcpy.ListFields(vr_feature_class):
             field_upper = field.name.upper()
             
@@ -459,6 +613,10 @@ def get_vr_attributes(vr_feature_class):
             if field_upper.startswith("SHAPE"):
                 continue
             if field.type in ["Geometry", "OID"]:
+                continue
+
+            if field.name in matched_height_fields:
+                vr_attrs.append(field.name)
                 continue
             
             # Skip CAD metadata
@@ -481,53 +639,46 @@ def transfer_joined_attributes(feature_class, attrs_to_fix):
     if not feature_class or not arcpy.Exists(feature_class) or not attrs_to_fix:
         return
 
-    def _is_missing(value):
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return value.strip() == ""
-        return False
-
-    def _is_zero_like(value):
-        if isinstance(value, bool):
-            return False
-        if isinstance(value, (int, float)):
-            return value == 0
-        if isinstance(value, str):
-            txt = value.strip().replace(",", ".")
-            if txt == "":
-                return False
-            try:
-                return float(txt) == 0.0
-            except Exception:
-                return False
-        return False
-
     sj_fields = [f.name for f in arcpy.ListFields(feature_class)]
     for attr in attrs_to_fix:
-        source_fields = []
-        prefix = f"{attr}_"
-        for f_name in sj_fields:
-            if f_name.startswith(prefix):
-                suffix = f_name[len(prefix):]
-                if suffix.isdigit():
-                    source_fields.append((int(suffix), f_name))
+        source_fields = [field_name for field_name in _find_matching_source_fields(sj_fields, attr) if field_name != attr]
+        if not source_fields:
+            continue
 
-        if source_fields and attr in sj_fields:
-            source_fields.sort(key=lambda x: x[0])
-            read_fields = [attr] + [name for _, name in source_fields]
+        if attr not in sj_fields:
+            schema = FIELD_SCHEMA.get(attr)
+            if not schema:
+                continue
+            expected_type, expected_length = schema
+            _ensure_field_type(feature_class, attr, expected_type, expected_length)
+            sj_fields = [f.name for f in arcpy.ListFields(feature_class)]
+        elif attr in FIELD_SCHEMA:
+            expected_type, expected_length = FIELD_SCHEMA[attr]
+            _ensure_field_type(feature_class, attr, expected_type, expected_length)
+
+        if attr in sj_fields:
+            read_fields = [attr] + source_fields
             with arcpy.da.UpdateCursor(feature_class, read_fields) as cursor:
                 for row in cursor:
                     current_value = row[0]
-                    if not (_is_missing(current_value) or _is_zero_like(current_value)):
+                    if not (_is_missing_value(current_value) or _is_zero_like_value(current_value)):
                         continue
 
                     chosen = None
                     # Preferuj nenull a nenulové hodnoty.
                     for src_value in row[1:]:
-                        if _is_missing(src_value):
+                        if _is_missing_value(src_value):
                             continue
-                        if not _is_zero_like(src_value):
+                        if attr in FIELD_SCHEMA:
+                            expected_type, _ = FIELD_SCHEMA[attr]
+                            try:
+                                src_value = _convert_value_to_type(src_value, expected_type)
+                            except Exception:
+                                continue
+
+                        if src_value is None:
+                            continue
+                        if not _is_zero_like_value(src_value):
                             chosen = src_value
                             break
                         if chosen is None:
@@ -1081,6 +1232,8 @@ class HeightRegulationImport(object):
                                 insert_cursor.insertRow(row)
                                 circles_count += 1
                 
+                ensure_canonical_vr_fields(vr_circles)
+
                 log_message(f"Nalezeno {circles_count} VR bloků (uzavřených linií/kruhů)", "OK")
                 
                 arcpy.Delete_management(singlepart_temp)
@@ -1813,7 +1966,16 @@ class HeightRegulationImport(object):
                     if row[0]:
                         sc_types_found.add(row[0])
             log_message(f"SC_TYPE zachováno: {len(sc_types_found)} typů", "DEBUG")
-        
+
+        # Překopírování sc_cleaned do čerstvého memory feature class.
+        # Po operacích DeleteRows + Append v Phase 7 může být prostorový index
+        # in-memory feature class neplatný, což způsobuje 0 shod v Phase 8 SpatialJoin.
+        try:
+            arcpy.conversion.ExportFeatures(sc_cleaned, r"memory\sc_cleaned_fresh")
+            sc_cleaned = r"memory\sc_cleaned_fresh"
+        except Exception as _refresh_err:
+            log_message(f"Nepodařilo se obnovit sc_cleaned (pokračuji s původním): {_refresh_err}", "WARN")
+
         # ============================================================
         # FÁZE 8: FINÁLNÍ PŘIPOJENÍ ATRIBUTŮ (podle notebooku)
         # ============================================================
@@ -1829,11 +1991,27 @@ class HeightRegulationImport(object):
             try:
                 # Finální SpatialJoin s VR bloky (podle notebooku)
                 log_message("Finální SpatialJoin s VR bloky...", "STEP")
-                
+
+                # Centroidy VR bloků byly snapnuty na merged_sc_all před Phase 6 Dissolve.
+                # Dissolve může souřadnice vrcholů zaokrouhlit na grid (XY resolution),
+                # takže centroidy po dissolve neleží přesně na liniích sc_cleaned.
+                # Přesnapujeme kopii centroidů na sc_cleaned (0.1m tolerance = 100× větší
+                # než typická grid odchylka; bezpečné pokud jsou SC linie > 20 cm od sebe).
+                vr_join_for_sj = vr_join_features
+                try:
+                    arcpy.conversion.ExportFeatures(vr_join_features, r"memory\vr_join_phase8")
+                    arcpy.edit.Snap(r"memory\vr_join_phase8", [[sc_cleaned, "EDGE", "0.1 Meters"]])
+                    vr_join_for_sj = r"memory\vr_join_phase8"
+                    snapped_count = int(arcpy.GetCount_management(vr_join_for_sj)[0])
+                    log_message(f"Centroidy přesnapovány na sc_cleaned: {snapped_count} bodů", "DEBUG")
+                except Exception as _snap_err:
+                    log_message(f"Přesnap centroidů selhal, použiji originál: {_snap_err}", "WARN")
+                    vr_join_for_sj = vr_join_features
+
                 if has_cad_processing_scope:
                     arcpy.analysis.SpatialJoin(
                         target_features=sc_cleaned,
-                        join_features=vr_join_features,
+                        join_features=vr_join_for_sj,
                         out_feature_class=r"memory\sc_final_sj",
                         join_operation="JOIN_ONE_TO_MANY",
                         join_type="KEEP_ALL",
@@ -1843,7 +2021,7 @@ class HeightRegulationImport(object):
                     # Bez CAD rozhraní bereme pro každou linii nejbližší VR centroid (deterministické 1:1).
                     arcpy.analysis.SpatialJoin(
                         target_features=sc_cleaned,
-                        join_features=vr_join_features,
+                        join_features=vr_join_for_sj,
                         out_feature_class=r"memory\sc_final_sj",
                         join_operation="JOIN_ONE_TO_ONE",
                         join_type="KEEP_ALL",
@@ -2613,6 +2791,7 @@ class HeightRegulationImport(object):
                             log_message(f"Nelze odstranit duplicitní centroidy VR na bod: {e_del_ident}", "DEBUG")
 
                         arcpy.conversion.ExportFeatures(vr_na_bod_centroid, out_fc_bod)
+                        ensure_canonical_vr_fields(out_fc_bod)
 
                         # Přidat SKNAZEV, OBTYPNAZEV
                         arcpy.management.AddField(out_fc_bod, "SKNAZEV", "TEXT", field_length=50)
@@ -2747,6 +2926,8 @@ class HeightRegulationImport(object):
             r"memory\sc_cad_scope_expand",
             r"memory\tmp_vr_na_bod_centroid",
             r"memory\rozhrani_endpoints",
+            r"memory\sc_cleaned_fresh",
+            r"memory\vr_join_phase8",
         ]
         
         deleted = 0
