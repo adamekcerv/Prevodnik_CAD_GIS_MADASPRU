@@ -611,6 +611,9 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
                     "CHECK"
                 )
 
+    # 3c) Pokud ve výškových polích není žádná smysluplná hodnota, vyčisti placeholderové nuly na NULL.
+    _normalize_empty_height_placeholder_rows(feature_class)
+
     # 4) Kontrola required polí (non-nullable).
     for req in required_fields:
         if req not in [f.name for f in arcpy.ListFields(feature_class)]:
@@ -990,6 +993,33 @@ def _has_meaningful_assignment(values):
     return False
 
 
+def _normalize_empty_height_placeholder_rows(feature_class, height_fields=None):
+    """Vyčistí placeholderové nuly v řádcích, kde ve skutečnosti chybí výšková regulace."""
+    if not feature_class or not arcpy.Exists(feature_class):
+        return
+
+    fields = [f.name for f in arcpy.ListFields(feature_class)]
+    height_fields = [field_name for field_name in (height_fields or HEIGHT_ATTRIBUTES) if field_name in fields]
+    if not height_fields:
+        return
+
+    with arcpy.da.UpdateCursor(feature_class, height_fields) as cursor:
+        for row in cursor:
+            values = list(row)
+            if _has_meaningful_assignment(values):
+                continue
+
+            changed = False
+            for idx, value in enumerate(values):
+                if _is_missing_value(value):
+                    continue
+                row[idx] = None
+                changed = True
+
+            if changed:
+                cursor.updateRow(row)
+
+
 def _has_usable_geometry(geometry):
     if geometry is None:
         return False
@@ -1046,6 +1076,7 @@ def build_unique_line_block_assignment(target_lines_fc, join_features_fc, out_fe
         return out_feature_class
 
     attrs_present = [attr for attr in attrs_to_fix if attr in candidate_fields]
+    assignment_attrs = [attr for attr in HEIGHT_ATTRIBUTES if attr in attrs_present] or attrs_present
     for attr in attrs_present:
         _ensure_field_from_template(out_feature_class, attr, candidate_fields[attr])
 
@@ -1067,7 +1098,8 @@ def build_unique_line_block_assignment(target_lines_fc, join_features_fc, out_fe
                 continue
 
             values = list(row[2:])
-            if not _has_meaningful_assignment(values):
+            assignment_values = [values[attrs_present.index(attr)] for attr in assignment_attrs]
+            if not _has_meaningful_assignment(assignment_values):
                 continue
 
             target_to_join.setdefault(target_fid, set()).add(join_fid)
@@ -1117,7 +1149,10 @@ def build_unique_line_block_assignment(target_lines_fc, join_features_fc, out_fe
 
                 changed = False
                 for idx, value in enumerate(assigned_values):
+                    attr_name = attrs_present[idx]
                     if _is_missing_value(value):
+                        continue
+                    if attr_name in HEIGHT_ATTRIBUTES and _is_zero_like_value(value):
                         continue
 
                     current_value = row[idx + 1]
@@ -2382,7 +2417,7 @@ class HeightRegulationImport(object):
                     )
                     build_unique_line_block_assignment(
                         sc_cleaned,
-                        vr_join_features,
+                        vr_join_for_sj,
                         r"memory\sc_final_sj",
                         attrs_to_fix,
                         tolerance_meters=NOCAD_VR_ASSIGN_TOLERANCE_METERS,
@@ -2771,7 +2806,7 @@ class HeightRegulationImport(object):
                         )
                         build_unique_line_block_assignment(
                             sc_nocad_scope,
-                            vr_join_features,
+                            vr_join_for_sj,
                             r"memory\sc_nocad_sj",
                             attrs_to_fix,
                             tolerance_meters=NOCAD_VR_ASSIGN_TOLERANCE_METERS,
@@ -2835,7 +2870,6 @@ class HeightRegulationImport(object):
                 available_height_attrs_final = get_model_height_attributes(fields_in_final)
                 log_message(f"Dostupné výškové atributy ve finální vrstvě: {', '.join(available_height_attrs_final)}", "DEBUG")
 
-                # Kontrolní informace: segmenty bez přiřazeného výškového bloku.
                 if available_height_attrs_final:
                     without_block_count = 0
                     with arcpy.da.SearchCursor(sc_final_with_vr, available_height_attrs_final) as cursor:
