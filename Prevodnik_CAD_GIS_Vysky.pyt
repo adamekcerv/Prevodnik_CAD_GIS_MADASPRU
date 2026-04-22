@@ -2379,6 +2379,8 @@ class HeightRegulationImport(object):
                 # než typická grid odchylka; bezpečné pokud jsou SC linie > 20 cm od sebe).
                 vr_join_for_sj = vr_join_features
                 try:
+                    if arcpy.Exists(r"memory\vr_join_phase8"):
+                        arcpy.management.Delete(r"memory\vr_join_phase8")
                     arcpy.conversion.ExportFeatures(vr_join_features, r"memory\vr_join_phase8")
                     arcpy.edit.Snap(r"memory\vr_join_phase8", [[sc_cleaned, "EDGE", "0.1 Meters"]])
                     vr_join_for_sj = r"memory\vr_join_phase8"
@@ -2403,6 +2405,8 @@ class HeightRegulationImport(object):
                         cad_seed_count = int(arcpy.GetCount_management("vr_phase8_cad_lyr")[0])
                         log_message(f"VR bloků relevantních pro CAD větev: {cad_seed_count}", "DEBUG")
                         if cad_seed_count > 0:
+                            if arcpy.Exists(r"memory\vr_join_phase8_cad"):
+                                arcpy.management.Delete(r"memory\vr_join_phase8_cad")
                             arcpy.conversion.ExportFeatures("vr_phase8_cad_lyr", r"memory\vr_join_phase8_cad")
                             vr_join_for_cad = r"memory\vr_join_phase8_cad"
                     except Exception as _cad_scope_err:
@@ -3338,6 +3342,13 @@ class HeightRegulationImport(object):
             r"memory\rozhrani_endpoints",
             r"memory\sc_cleaned_fresh",
             r"memory\vr_join_phase8",
+            r"memory\vr_join_phase8_cad",
+            r"memory\vr_unique_candidates",
+            r"memory\sc_dissolve",
+            r"memory\sc_split_endpoints",
+            r"memory\false_endpoints",
+            r"memory\segments_to_merge",
+            r"memory\segments_merged",
         ]
         
         deleted = 0
