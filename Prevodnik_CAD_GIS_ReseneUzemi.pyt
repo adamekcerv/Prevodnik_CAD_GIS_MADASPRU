@@ -1065,7 +1065,7 @@ class CadFile(object):
                 elif target_attr == "VYSKA_MAX":
                     possible_keys.extend(["MAX_VYSKA", "VYSKAMAX", "VR_VYSKAMAX", "VYSKA", "VYSKA MAX", "VYSKA_TOTAL", "VYSKA_CELKEM"])
                 elif target_attr == "VYSKA_VB":
-                     possible_keys.extend(["VYSKAVB", "VR_VYSKAVB", "VYSKA VB"])
+                     possible_keys.extend(["VYSKAVB", "VR_VYSKAVB", "VYSKA VB", "VYSKA_VB_D"])
                 
                 src_field_name = None
                 for n in possible_keys:

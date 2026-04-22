@@ -19,7 +19,7 @@ HEIGHT_ATTRIBUTES = [
 ]
 
 VR_ATTRIBUTE_SOURCE_ALIASES = {
-    "VYSKA_VB": ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB"],
+    "VYSKA_VB": ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB", "VYSKA_VB_D"],
     "VYSKA_VB_I": ["VYSKA_VBI", "VYSKAVBI", "VR_VYSKA_VB_I", "VR_VYSKA_VBI", "VYSKA VB I"],
     "NP_MIN": ["MIN_NP", "NPMIN", "VR_NP_MIN", "VR_NPMIN", "NP MIN"],
     "NP_MAX": ["MAX_NP", "NPMAX", "VR_NP_MAX", "VR_NPMAX", "NP MAX"],
@@ -699,6 +699,22 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
 
     if fields_to_delete:
         arcpy.management.DeleteField(feature_class, fields_to_delete)
+
+    # 7) Převod prázdných řetězců na NULL u textových polí (VYSKA_VB_I a jiná nepovinná pole).
+    text_fields_to_clean = [
+        f.name for f in arcpy.ListFields(feature_class)
+        if f.type == "String" and f.name in allowed_set and f.name not in constants
+    ]
+    if text_fields_to_clean:
+        with arcpy.da.UpdateCursor(feature_class, text_fields_to_clean) as cursor:
+            for row in cursor:
+                changed = False
+                for i, val in enumerate(row):
+                    if isinstance(val, str) and val.strip() == "":
+                        row[i] = None
+                        changed = True
+                if changed:
+                    cursor.updateRow(row)
 
 
 def get_model_height_attributes(fields):
@@ -2602,12 +2618,11 @@ class HeightRegulationImport(object):
                                     if not _has_usable_geometry(fill_geom):
                                         continue
                                     
-                                    # Rychlý check disjoint (bounding box) - jen pro orientaci, distanceTo řeší vše
-                                    if null_geom.disjoint(fill_geom):
-                                        pass 
-
                                     # Check distance (tolerance 5cm pro napojení)
-                                    dist = null_geom.distanceTo(fill_geom)
+                                    try:
+                                        dist = null_geom.distanceTo(fill_geom)
+                                    except Exception:
+                                        continue
                                     
                                     if dist < 0.05: 
                                         # Kde se dotýkají?
