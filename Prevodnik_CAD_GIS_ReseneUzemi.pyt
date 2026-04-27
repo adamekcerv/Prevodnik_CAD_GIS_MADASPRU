@@ -2,6 +2,20 @@
 import arcpy
 import os
 
+def log_message(message, level="INFO"):
+    """Helper pro logování s úrovněmi - stejný styl jako v nástroji Výšky."""
+    prefix = {
+        "INFO": "ℹ️",
+        "OK": "✅",
+        "WARN": "⚠️",
+        "ERROR": "❌",
+        "DEBUG": "🔍",
+        "STEP": "▶️",
+        "CHECK": "📝"
+    }.get(level, "")
+    arcpy.AddMessage(f"{prefix} {message}")
+
+
 def parameter(displayName, name, datatype,
               parameterType='Required',
               direction='Input',
@@ -1850,7 +1864,7 @@ class CadFile(object):
             "Z_1011_ReseneUzemi": {
                 "SKNAZEV": "metadata dokumentace",
                 "OBTYPNAZEV": "řešené území",
-                "ATTRS": ["DOK_NAZEV"],
+                "ATTRS": ["DOK_NAZEV", "ID_LOKAL"],
                 "TARGET_NAME": "1011_ReseneUzemi_p"
             },
             "Z_2011_UlicniCara": {
@@ -1989,8 +2003,7 @@ class CadFile(object):
                     arcpy.AddWarning(f"[finalize_layer_attributes] Chyba při konverzi Polyline → Polygon pro Z_1011: {e}")
 
         # --- 3. Přidání a validace atributů ---
-        # Z_1011_ReseneUzemi nemá ID_LOKAL dle datového modelu
-        _raw_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV"] + ([] if found_key == "Z_1011_ReseneUzemi" else ["ID_LOKAL"])
+        _raw_attrs = current_def["ATTRS"] + ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"]
         # Deduplikace při zachování pořadí (např. ID_LOKAL může být i v ATTRS)
         seen_attrs = set()
         target_attrs = []
@@ -2119,7 +2132,7 @@ class CadFile(object):
                     arcpy.AddWarning(f"Selhalo přejmenování pole {attr_name}: {e}")
 
         # --- 4. Naplnění konstant ---
-        has_id_lokal = found_key != "Z_1011_ReseneUzemi" and "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)]
+        has_id_lokal = "ID_LOKAL" in [f.name for f in arcpy.ListFields(feature_class)]
         cursor_fields_4 = ["SKNAZEV", "OBTYPNAZEV"] + (["ID_LOKAL"] if has_id_lokal else [])
         with arcpy.da.UpdateCursor(feature_class, cursor_fields_4) as cursor:
             for row in cursor:
