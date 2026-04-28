@@ -735,7 +735,8 @@ def get_vr_attributes(vr_feature_class):
     excluded_fields = {
         "OBJECTID", "SHAPE", "SHAPE_LENGTH", "SHAPE_AREA", 
         "FID", "OID", "GLOBALID", "TARGET_FID", "SC_TYPE",
-        "JOIN_FID", "JOIN_COUNT"
+        "JOIN_FID", "JOIN_COUNT",
+        "ORIG_FID"  # interní pole generované ArcGIS při FeatureToPoint, není to atribut VR bloku
     }
     
     # CAD metadata - vyloučit (každý blok má unikátní hodnoty)
