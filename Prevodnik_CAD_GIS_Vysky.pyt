@@ -2,6 +2,22 @@
 import arcpy
 import os
 import re
+import datetime
+
+_log_buffer = []  # Zachytává zprávy log_message() pro zápis do souboru
+
+
+def write_log_file(log_path, buffer):
+    """Zapíše log buffer do textového souboru UTF-8."""
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Log - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 60 + "\n")
+            for line in buffer:
+                f.write(line + "\n")
+        arcpy.AddMessage(f"📄 Log uložen: {log_path}")
+    except Exception as e:
+        arcpy.AddWarning(f"Nepodařilo se zapsat log soubor: {e}")
 
 # Defaultní vrstvy pro MADASPRU project
 DEFAULT_LAYERS = [
@@ -165,8 +181,9 @@ def log_message(message, level="INFO"):
         "STEP": "▶️",
         "CHECK": "📝"
     }.get(level, "")
-    
-    arcpy.AddMessage(f"{prefix} {message}")
+    formatted = f"{prefix} {message}"
+    _log_buffer.append(formatted)
+    arcpy.AddMessage(formatted)
 
 
 
@@ -1387,6 +1404,8 @@ class HeightRegulationImport(object):
         return
 
     def execute(self, parameters, messages):
+        global _log_buffer
+        _log_buffer = []
         arcpy.env.overwriteOutput = True
         
         # ============================================================
@@ -2460,6 +2479,28 @@ class HeightRegulationImport(object):
                         seeded_count = sum(1 for row in cursor if row[0] and row[0] > 0)
                     log_message(f"Segmentů se seed atributy po finálním CAD joinu: {seeded_count}", "DEBUG")
 
+                    # Detekce VR bloků přidělených více SC segmentům bez rozhraní (úchopové body).
+                    # Pokud jeden VR blok pokrývá více sousedních segmentů a nebylo dogenerováno
+                    # rozhraní, výška se propaguje správně, ale v CAD mohlo jít o chybu.
+                    # Případ: jeden blok přiložen ke 2 SC pomocí úchopových bodů bez rozhraní.
+                    if "TARGET_FID" in fields_sj:
+                        join_fid_to_targets = {}
+                        join_fid_field = "JOIN_FID" if "JOIN_FID" in fields_sj else None
+                        if join_fid_field:
+                            with arcpy.da.SearchCursor(r"memory\sc_final_sj", ["TARGET_FID", join_fid_field, "Join_Count"]) as cursor:
+                                for row in cursor:
+                                    if row[2] and row[2] > 0 and row[1] is not None and int(row[1]) >= 0:
+                                        join_fid_to_targets.setdefault(int(row[1]), set()).add(row[0])
+                            multi_sc_vr_count = sum(1 for targets in join_fid_to_targets.values() if len(targets) > 1)
+                            if multi_sc_vr_count > 0:
+                                log_message(
+                                    f"V CAD nalezeno {multi_sc_vr_count} VR bloků přidělených více než 1 SC segmentu "
+                                    f"bez použití rozhraní (302211_PL_VR_na_linii_rozhrani). "
+                                    f"Výšková regulace byla přenesena, ale v CAD mohlo jít o nepřesnost "
+                                    f"— doporučujeme zkontrolovat.",
+                                    "WARN"
+                                )
+
                 # Diagnostika: které modelové výškové atributy nejsou ve zdroji VR dostupné.
                 missing_model_attrs = []
                 for attr in HEIGHT_ATTRIBUTES:
@@ -3402,4 +3443,14 @@ class HeightRegulationImport(object):
                 log_message(f"  • {os.path.basename(error_path)}", "CHECK")
         
         log_message(f"Output GDB: {output_gdb}", "INFO")
+
+        # Zápis logu do souboru vedle GDB
+        try:
+            log_folder = os.path.dirname(output_gdb)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_label = fd_name if fd_name else "vysky"
+            log_filename = f"{log_label}_{ts}_vysky_log.txt"
+            write_log_file(os.path.join(log_folder, log_filename), _log_buffer)
+        except Exception as _le:
+            arcpy.AddWarning(f"Log soubor nelze zapsat: {_le}")
 

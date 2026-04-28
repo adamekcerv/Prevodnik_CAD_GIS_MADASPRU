@@ -1,6 +1,23 @@
 # -*- coding: utf-8 -*-
 import arcpy
 import os
+import datetime
+
+_log_buffer = []  # Zachytává zprávy pro zápis do souboru
+
+
+def write_log_file(log_path, buffer):
+    """Zapíše log buffer do textového souboru UTF-8."""
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Log - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 60 + "\n")
+            for line in buffer:
+                f.write(line + "\n")
+        arcpy.AddMessage(f"📄 Log uložen: {log_path}")
+    except Exception as e:
+        arcpy.AddWarning(f"Nepodařilo se zapsat log soubor: {e}")
+
 
 def log_message(message, level="INFO"):
     """Helper pro logování s úrovněmi - stejný styl jako v nástroji Výšky."""
@@ -2232,6 +2249,23 @@ class CadFile(object):
         if fields_to_delete:
             arcpy.management.DeleteField(feature_class, fields_to_delete)
 
+        # --- 5b. Prázdné řetězce → NULL u textových polí (kromě DRUH_INFO, které se čistí zvlášť). ---
+        # DRUH_INFO smí zůstat NULL; ostatní textová pole by neměla mít prázdný řetězec místo NULL.
+        text_fields_to_clean = [
+            f.name for f in arcpy.ListFields(feature_class)
+            if f.type == "String" and f.name in allowed_set
+        ]
+        if text_fields_to_clean:
+            with arcpy.da.UpdateCursor(feature_class, text_fields_to_clean) as cursor:
+                for row in cursor:
+                    changed = False
+                    for i, val in enumerate(row):
+                        if isinstance(val, str) and val.strip() == "":
+                            row[i] = None
+                            changed = True
+                    if changed:
+                        cursor.updateRow(row)
+
         # --- 6. Souhrnný report ---
         if validation_report:
             arcpy.AddMessage(f"[finalize_layer_attributes] --- SOUHRN ÚPRAV ATRIBUTŮ: {os.path.basename(feature_class)} ---")
@@ -2545,6 +2579,24 @@ class ExportLayer(object):
         return
 
     def execute(self, parameters, messages):
+        global _log_buffer
+        _log_buffer = []
+
+        # Zachytávání všech zpráv do log bufferu pomocí monkey-patch
+        _real_add_message = arcpy.AddMessage
+        _real_add_warning = arcpy.AddWarning
+
+        def _patched_msg(msg):
+            _log_buffer.append(str(msg))
+            _real_add_message(msg)
+
+        def _patched_warn(msg):
+            _log_buffer.append(f"⚠️ VAROVÁNÍ: {msg}")
+            _real_add_warning(msg)
+
+        arcpy.AddMessage = _patched_msg
+        arcpy.AddWarning = _patched_warn
+
         arcpy.env.overwriteOutput = True
         
         input_cad = parameters[0].valueAsText
@@ -2628,3 +2680,15 @@ class ExportLayer(object):
                 arcpy.AddMessage(f"  - {layer}")
         else:
             arcpy.AddWarning("[execute] Žádné vrstvy nebyly exportovány.")
+
+        # Zápis logu do souboru vedle GDB + obnova arcpy.AddMessage/AddWarning
+        arcpy.AddMessage = _real_add_message
+        arcpy.AddWarning = _real_add_warning
+        try:
+            log_folder = os.path.dirname(output_gdb)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_label = fd_name if fd_name else "resene_uzemi"
+            log_filename = f"{log_label}_{ts}_resuzemi_log.txt"
+            write_log_file(os.path.join(log_folder, log_filename), _log_buffer)
+        except Exception as _le:
+            arcpy.AddWarning(f"Log soubor nelze zapsat: {_le}")
