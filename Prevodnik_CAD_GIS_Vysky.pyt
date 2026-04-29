@@ -2749,8 +2749,11 @@ class HeightRegulationImport(object):
                                         # Je tento bod chráněn bariérou?
                                         is_blocked = False
                                         if barrier_geom and connection_point:
-                                            cp_geom = arcpy.PointGeometry(connection_point, null_geom.spatialReference)
-                                            if any(bg and not bg.disjoint(cp_geom) for bg in barrier_geom):
+                                            try:
+                                                cp_geom = arcpy.PointGeometry(connection_point, null_geom.spatialReference)
+                                            except Exception:
+                                                cp_geom = None
+                                            if cp_geom and any(bg and not bg.disjoint(cp_geom) for bg in barrier_geom):
                                                 # Bariéra nalezena.
                                                 type_match = False
                                                 if null_type is not None and fill_type is not None:
