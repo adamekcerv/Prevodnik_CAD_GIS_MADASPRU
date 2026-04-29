@@ -3,6 +3,8 @@ import arcpy
 import os
 import re
 import datetime
+import shutil
+import tempfile
 
 _log_buffer = []  # Zachytává zprávy log_message() pro zápis do souboru
 
@@ -1407,6 +1409,7 @@ class HeightRegulationImport(object):
         global _log_buffer
         _log_buffer = []
         arcpy.env.overwriteOutput = True
+        arcpy.env.workspace = None  # Reset – předchozí nástroje mohou zanechat jiný workspace
         
         # ============================================================
         # FÁZE 0: NAČTENÍ PARAMETRŮ
@@ -1461,15 +1464,40 @@ class HeightRegulationImport(object):
         vr_na_bod_layer = None  # 302110 - VR bloky na bod
         exported_count = 0
         
+        # ArcGIS Pro cachuje CAD workspace reader na úrovni aplikace.
+        # Při opakovaném spuštění nástroje ve stejné session vrátí cache prázdné
+        # hodnoty extended atributů dynamických bloků (ATTRIB entity v DWG).
+        # ClearWorkspaceCache() ani přímá cesta tento cache neobejdou – jde o
+        # interní cache CAD readeru nad úrovní Python workspace poolu.
+        # Řešení: dočasná kopie DWG s unikátní cestou = nový cache záznam
+        # = čerstvé načtení všech ATTRIB entit.
+        _cad_temp_dir = None
+        try:
+            _cad_temp_dir = tempfile.mkdtemp(prefix="arcpy_cad_vysky_")
+            _cad_temp_dwg = os.path.join(_cad_temp_dir, "_import.dwg")
+            shutil.copy2(input_cad, _cad_temp_dwg)
+            # Zkopíruj i průvodní soubory DWG (zámky, záloha)
+            _dwg_dir = os.path.dirname(input_cad)
+            _dwg_stem = os.path.splitext(os.path.basename(input_cad))[0]
+            for _ext in (".bak", ".dwl", ".dwl2"):
+                _src = os.path.join(_dwg_dir, _dwg_stem + _ext)
+                if os.path.exists(_src):
+                    shutil.copy2(_src, os.path.join(_cad_temp_dir, "_import" + _ext))
+            cad_polyline_path = _cad_temp_dwg + "\\Polyline"
+            log_message("DWG zkopírováno do temp (bypass ArcGIS CAD cache)", "DEBUG")
+        except Exception as _cad_copy_err:
+            log_message(f"Kopírování DWG do temp selhalo, použiji originální cestu: {_cad_copy_err}", "WARN")
+            cad_polyline_path = input_cad + "\\Polyline"
+            _cad_temp_dir = None
+
         for layer_info in selected_layers:
             if " (Polyline)" in layer_info:
                 layer_name = layer_info.replace(" (Polyline)", "")
-                
-                arcpy.env.workspace = input_cad
-                
-                field_delimited = arcpy.AddFieldDelimiters("Polyline", "Layer")
-                where_clause = f"{field_delimited} = '{layer_name}'"
-                
+
+                # WHERE clause bez field delimiter – pro CAD/file-based zdroje
+                # není odlišování polí uvozovkami potřeba.
+                where_clause = f"Layer = '{layer_name}'"
+
                 if out_prefix:
                     base_name = f"{out_prefix}{layer_name}_LN"
                 else:
@@ -1480,7 +1508,7 @@ class HeightRegulationImport(object):
                 
                 try:
                     arcpy.FeatureClassToFeatureClass_conversion(
-                        in_features="Polyline",
+                        in_features=cad_polyline_path,
                         out_path=output_workspace,
                         out_name=output_name,
                         where_clause=where_clause
@@ -1514,6 +1542,13 @@ class HeightRegulationImport(object):
                     
                 except Exception as e:
                     log_message(f"Chyba při exportu {layer_name}: {e}", "ERROR")
+
+        # Smazat temp kopii DWG – ArcGIS Pro ji načetl, nadále nepotřebná
+        if _cad_temp_dir:
+            try:
+                shutil.rmtree(_cad_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         log_message(f"Celkem importováno: {exported_count} vrstev", "OK")
         log_message(f"SC vrstev: {len(sc_layers)}", "DEBUG")
@@ -1956,7 +1991,16 @@ class HeightRegulationImport(object):
                 with arcpy.da.SearchCursor(sc_with_vr, ["Join_Count"]) as cursor:
                     with_vr = sum(1 for row in cursor if row[0] and row[0] > 0)
                 log_message(f"Segmentů s připojeným VR blokem: {with_vr}", "DEBUG")
-                
+
+                # Přenést hodnoty z ATTR_1 → ATTR pokud ArcGIS přejmenoval pole z důvodu
+                # konfliktu jmen (SC linie z CAD sdílí schéma se VR bloky → VYSKA_VB_1 atd.)
+                if vr_circles and arcpy.Exists(vr_circles):
+                    _vr_attrs_p4 = get_vr_attributes(vr_circles)
+                    if _vr_attrs_p4:
+                        transfer_joined_attributes(sc_with_vr, _vr_attrs_p4)
+                        ensure_npu_from_nup(sc_with_vr)
+                        log_message("Přeneseny atributy z případných přejmenovaných polí po SpatialJoin", "DEBUG")
+
             except Exception as e:
                 log_message(f"Chyba při SpatialJoin: {e}", "ERROR")
                 sc_with_vr = sc_split_cad
@@ -2534,9 +2578,27 @@ class HeightRegulationImport(object):
                 
                 fields = [f.name for f in arcpy.ListFields(r"memory\sc_final_sj")]
                 available_height_attrs = [attr for attr in vr_attributes if attr in fields]
+                # Fallback: pokud VR atributy nejsou v sc_final_sj pod přímými jmény,
+                # přidej aspoň kanonická výšková pole datového modelu (mohou být přejmenovaná).
+                if not available_height_attrs:
+                    available_height_attrs = [attr for attr in HEIGHT_ATTRIBUTES if attr in fields]
                 has_cad_barriers = bool(rozhrani_body and arcpy.Exists(rozhrani_body) and get_feature_count(rozhrani_body) > 0)
                 do_propagation = has_cad_barriers
-                
+
+                # Debug: ukázat skutečný obsah prvního seedovaného záznamu
+                if available_height_attrs:
+                    _dbg_sample = []
+                    with arcpy.da.SearchCursor(r"memory\sc_final_sj", available_height_attrs[:4]) as _dbg_cur:
+                        for _dbg_row in _dbg_cur:
+                            if any(v is not None and str(v).strip() not in ("", "0") for v in _dbg_row):
+                                _dbg_sample.append(str(_dbg_row))
+                                if len(_dbg_sample) >= 2:
+                                    break
+                    if _dbg_sample:
+                        log_message(f"DEBUG sc_final_sj vzorky s daty: {'; '.join(_dbg_sample)}", "DEBUG")
+                    else:
+                        log_message(f"DEBUG sc_final_sj: žádný záznam s nenull hodnotami v {available_height_attrs[:4]}", "WARN")
+
                 if available_height_attrs:
                     if not do_propagation:
                         log_message("CAD rozhraní nejsou k dispozici - propagace vypnuta, zachovávám 1:1 připojení z VR bloků.", "INFO")
