@@ -2,6 +2,8 @@
 import arcpy
 import os
 import datetime
+import shutil
+import tempfile
 
 _log_buffer = []  # Zachytává zprávy pro zápis do souboru
 
@@ -2655,8 +2657,28 @@ class ExportLayer(object):
         else:
             final_workspace = output_gdb
 
+        # ArcGIS Pro cachuje CAD workspace reader na úrovni aplikace.
+        # Řešení: dočasná kopie DWG s unikátní cestou = nový cache záznam
+        _cad_temp_dir_ru = None
+        _input_cad_for_export = input_cad
+        try:
+            _cad_temp_dir_ru = tempfile.mkdtemp(prefix="arcpy_cad_resuzemi_")
+            _cad_temp_dwg_ru = os.path.join(_cad_temp_dir_ru, "_import.dwg")
+            shutil.copy2(input_cad, _cad_temp_dwg_ru)
+            _dwg_dir_ru = os.path.dirname(input_cad)
+            _dwg_stem_ru = os.path.splitext(os.path.basename(input_cad))[0]
+            for _ext in (".bak", ".dwl", ".dwl2"):
+                _src = os.path.join(_dwg_dir_ru, _dwg_stem_ru + _ext)
+                if os.path.exists(_src):
+                    shutil.copy2(_src, os.path.join(_cad_temp_dir_ru, "_import" + _ext))
+            _input_cad_for_export = _cad_temp_dwg_ru
+            arcpy.AddMessage("[execute] DWG zkopírováno do temp (bypass ArcGIS CAD cache)")
+        except Exception as _cad_copy_err:
+            arcpy.AddWarning(f"[execute] Kopírování DWG do temp selhalo, použiji originální cestu: {_cad_copy_err}")
+            _input_cad_for_export = input_cad
+
         # Vytvoření CAD objektu
-        cad_file_obj = CadFile(input_cad)
+        cad_file_obj = CadFile(_input_cad_for_export)
 
         # Zpracování vybraných vrstev
         if selected_layers_text:
@@ -2680,6 +2702,10 @@ class ExportLayer(object):
                 arcpy.AddMessage(f"  - {layer}")
         else:
             arcpy.AddWarning("[execute] Žádné vrstvy nebyly exportovány.")
+
+        # Cleanup temp DWG kopie
+        if _cad_temp_dir_ru:
+            shutil.rmtree(_cad_temp_dir_ru, ignore_errors=True)
 
         # Zápis logu do souboru vedle GDB + obnova arcpy.AddMessage/AddWarning
         arcpy.AddMessage = _real_add_message
