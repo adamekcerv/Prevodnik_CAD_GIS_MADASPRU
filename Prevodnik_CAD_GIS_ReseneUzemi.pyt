@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import arcpy
 import os
+import re
 import datetime
 import shutil
 import tempfile
@@ -32,7 +33,9 @@ def log_message(message, level="INFO"):
         "STEP": "▶️",
         "CHECK": "📝"
     }.get(level, "")
-    arcpy.AddMessage(f"{prefix} {message}")
+    formatted = f"{prefix} {message}"
+    _log_buffer.append(formatted)
+    arcpy.AddMessage(formatted)
 
 
 def parameter(displayName, name, datatype,
@@ -71,7 +74,7 @@ def get_all_fc_names(gdb_path):
         desc = arcpy.Describe(gdb_path)
         if desc.datatype == "FeatureDataset":
             search_root = os.path.dirname(gdb_path)
-    except:
+    except Exception:
         pass # Pokud nejde describe, necháme původní
 
     try:
@@ -867,7 +870,6 @@ class CadFile(object):
                                 
                                # Varianta 2: Bez prefixu nebo jiný formát - zkusíme najít první 6číslí
                                if not potential_code:
-                                   import re
                                    match = re.search(r"\d{6}", basename)
                                    if match:
                                        potential_code = match.group(0)
@@ -2123,7 +2125,7 @@ class CadFile(object):
                                         new_val = int(float(s_val))
                                     else:
                                         new_val = float(s_val)
-                            except:
+                            except Exception:
                                 errors.append(f"OID {oid}: '{val}'")
                         
                         row[2] = new_val
@@ -2285,7 +2287,7 @@ class CadFile(object):
         if source_col:
             try:
                 arcpy.management.CalculateField(feature_class, "OZNACENI", f"!{source_col}!", "PYTHON3")
-            except:
+            except Exception:
                 pass
 
     def _fill_dok_nazev_from_cad(self, feature_class, existing_field_names):
@@ -2511,13 +2513,13 @@ class ExportLayer(object):
             # Zkus použít Default.gdb z aktuálního projektu
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             self.parameters[2].value = aprx.defaultGeodatabase
-        except:
+        except Exception:
             # Fallback - pokud není projekt nebo selže
             try:
                 default_path = r"C:\GIS_Data\Output.gdb"
                 if arcpy.Exists(default_path):
                     self.parameters[2].value = default_path
-            except:
+            except Exception:
                 pass
 
         self.parameters[1].enabled = False

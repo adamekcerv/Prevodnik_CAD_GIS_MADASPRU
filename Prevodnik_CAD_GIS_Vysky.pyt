@@ -200,7 +200,7 @@ def get_feature_count(fc):
     """Bezpečné získání počtu prvků"""
     try:
         return int(arcpy.GetCount_management(fc)[0])
-    except:
+    except Exception:
         return 0
 
 
@@ -796,7 +796,7 @@ def get_vr_attributes(vr_feature_class):
             
             if not is_cad_metadata:
                 vr_attrs.append(field.name)
-    except:
+    except Exception:
         pass
     
     return vr_attrs
@@ -1265,13 +1265,13 @@ class HeightRegulationImport(object):
             # Zkus použít Default.gdb z aktuálního projektu
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             param2.value = aprx.defaultGeodatabase
-        except:
+        except Exception:
             # Fallback - pokud není projekt nebo selže
             try:
                 default_path = r"C:\GIS_Data\Output.gdb"
                 if arcpy.Exists(default_path):
                     param2.value = default_path
-            except:
+            except Exception:
                 pass
 
         # Output Feature Dataset
