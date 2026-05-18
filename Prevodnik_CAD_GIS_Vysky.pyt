@@ -3279,6 +3279,36 @@ class HeightRegulationImport(object):
                         log_message(f"Chyba při tvorbě vrstvy chyb Z_3022: {e_err}", "WARN")
 
                     finalize_vyska_output_attributes(vr_3022_fc, "Z_3022_VyskovaRegulaceNaLinii_l")
+
+                    # Vyloučí SC linie bez výškových atributů (všechna výšková pole null).
+                    # Takové linie jsou SC, které nebyly přiřazeny žádnému VR bloku.
+                    try:
+                        _height_fields_in_3022 = [
+                            f.name for f in arcpy.ListFields(vr_3022_fc)
+                            if f.name in HEIGHT_ATTRIBUTES
+                        ]
+                        if _height_fields_in_3022:
+                            _null_where = " AND ".join(
+                                f"{fn} IS NULL" for fn in _height_fields_in_3022
+                            )
+                            _lyr_3022 = "_vr3022_noattr_lyr"
+                            arcpy.management.MakeFeatureLayer(vr_3022_fc, _lyr_3022)
+                            try:
+                                arcpy.management.SelectLayerByAttribute(
+                                    _lyr_3022, "NEW_SELECTION", _null_where
+                                )
+                                _no_attr_count = int(arcpy.GetCount_management(_lyr_3022)[0])
+                                if _no_attr_count > 0:
+                                    arcpy.management.DeleteRows(_lyr_3022)
+                                    log_message(
+                                        f"Z_3022: odstraněno {_no_attr_count} SC linií bez výškových atributů",
+                                        "INFO"
+                                    )
+                            finally:
+                                arcpy.management.Delete(_lyr_3022)
+                    except Exception as _e_noattr:
+                        log_message(f"Chyba při filtrování SC linií bez atributů: {_e_noattr}", "WARN")
+
                     vr_3022_count = get_feature_count(vr_3022_fc)
                     log_message(f"Z_3022_VyskovaRegulaceNaLinii_l: {vr_3022_count} prvků → {vr_3022_name}", "OK")
                     final_outputs.append(vr_3022_fc)
@@ -3372,6 +3402,26 @@ class HeightRegulationImport(object):
                             fields_to_delete_bod.append(field.name)
                         if fields_to_delete_bod:
                             arcpy.management.DeleteField(out_fc_bod, fields_to_delete_bod)
+
+                        # Nuly → null pro numerická výšková pole.
+                        # ArcGIS inicializuje SHORT/FLOAT pole na 0, ale 0 není platná
+                        # hodnota výškové regulace (nulatá výška / nulatý počet pater).
+                        _numeric_vyska_fields = [
+                            f.name for f in arcpy.ListFields(out_fc_bod)
+                            if f.name in ("NP_MIN", "NP_MAX", "NPU_MAX",
+                                          "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX")
+                            and f.type in ("SmallInteger", "Integer", "Single", "Double")
+                        ]
+                        if _numeric_vyska_fields:
+                            with arcpy.da.UpdateCursor(out_fc_bod, _numeric_vyska_fields) as _cur:
+                                for _row in _cur:
+                                    _changed = False
+                                    for _i, _val in enumerate(_row):
+                                        if _val == 0:
+                                            _row[_i] = None
+                                            _changed = True
+                                    if _changed:
+                                        _cur.updateRow(_row)
 
                         finalize_vyska_output_attributes(out_fc_bod, "Z_3021_VyskovaRegulaceNaBod_b")
 

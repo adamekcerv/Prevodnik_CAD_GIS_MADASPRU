@@ -7,6 +7,7 @@ import shutil
 import tempfile
 
 _log_buffer = []  # Zachytává zprávy pro zápis do souboru
+_logging_active = False  # Zabraňuje dvojímu zápisu do _log_buffer při volání log_message
 
 
 def write_log_file(log_path, buffer):
@@ -24,6 +25,7 @@ def write_log_file(log_path, buffer):
 
 def log_message(message, level="INFO"):
     """Helper pro logování s úrovněmi - stejný styl jako v nástroji Výšky."""
+    global _logging_active
     prefix = {
         "INFO": "ℹ️",
         "OK": "✅",
@@ -35,7 +37,16 @@ def log_message(message, level="INFO"):
     }.get(level, "")
     formatted = f"{prefix} {message}"
     _log_buffer.append(formatted)
-    arcpy.AddMessage(formatted)
+    _logging_active = True
+    try:
+        if level == "WARN":
+            arcpy.AddWarning(formatted)
+        elif level == "ERROR":
+            arcpy.AddError(formatted)
+        else:
+            arcpy.AddMessage(formatted)
+    finally:
+        _logging_active = False
 
 
 def parameter(displayName, name, datatype,
@@ -2586,16 +2597,19 @@ class ExportLayer(object):
         global _log_buffer
         _log_buffer = []
 
-        # Zachytávání všech zpráv do log bufferu pomocí monkey-patch
+        # Zachytávání přímých arcpy.AddMessage/AddWarning volání (obchází log_message)
+        # do log bufferu. Volání z log_message se přeskočí (log_message zapisuje sám).
         _real_add_message = arcpy.AddMessage
         _real_add_warning = arcpy.AddWarning
 
         def _patched_msg(msg):
-            _log_buffer.append(str(msg))
+            if not _logging_active:
+                _log_buffer.append(str(msg))
             _real_add_message(msg)
 
         def _patched_warn(msg):
-            _log_buffer.append(f"⚠️ VAROVÁNÍ: {msg}")
+            if not _logging_active:
+                _log_buffer.append(f"⚠️ {msg}")
             _real_add_warning(msg)
 
         arcpy.AddMessage = _patched_msg
