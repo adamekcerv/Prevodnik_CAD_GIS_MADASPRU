@@ -10,29 +10,38 @@ import tempfile
 _log_buffer = []  # Zachytává zprávy log_message() pro zápis do souboru
 
 
+_config_load_warning = None  # Zpráva pro execute() – arcpy.AddWarning nelze volat při importu modulu
+
+
 def _load_config(config_path=None):
     """Načte konfiguraci datového modelu z JSON souboru.
 
     Hledá ``madaspru_vysky_config.json`` ve stejné složce jako tento .pyt soubor.
     Pokud soubor neexistuje nebo je poškozený, vrátí ``None`` a nástroj použije
     hardcoded výchozí hodnoty definované níže.
+    POZOR: Tato funkce nesmí volat arcpy.AddWarning/AddMessage – je volána při
+    importu modulu, kdy arcpy message systém ještě není připraven.
     """
+    global _config_load_warning
     if config_path is None:
-        config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "madaspru_vysky_config.json"
-        )
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "madaspru_vysky_config.json"
+            )
+        except Exception:
+            return None
     try:
         with open(config_path, "r", encoding="utf-8") as _f:
             return json.load(_f)
     except FileNotFoundError:
-        arcpy.AddWarning(
+        _config_load_warning = (
             f"Konfigurační soubor nenalezen: {config_path}. "
             "Používám výchozí (hardcoded) konfiguraci."
         )
         return None
     except Exception as _e:
-        arcpy.AddWarning(
+        _config_load_warning = (
             f"Chyba při načítání konfigurace ({config_path}): {_e}. "
             "Používám výchozí (hardcoded) konfiguraci."
         )
@@ -1500,6 +1509,10 @@ class HeightRegulationImport(object):
         global _log_buffer
         _log_buffer = []
         arcpy.env.overwriteOutput = True
+
+        # Varování z načítání konfigurace (nelze emitovat při importu modulu)
+        if _config_load_warning:
+            arcpy.AddWarning(_config_load_warning)
         arcpy.env.workspace = None  # Reset – předchozí nástroje mohou zanechat jiný workspace
         
         # ============================================================

@@ -1,0 +1,154 @@
+{
+    "_comment": "Konfigurace datového modelu pro nástroj Řešená území (Prevodnik_CAD_GIS_ReseneUzemi.pyt).",
+    "_version": "1.0",
+
+    "field_schema": {
+        "SKNAZEV":    {"type": "TEXT",  "length": 50,  "alias": "SKNAZEV"},
+        "OBTYPNAZEV": {"type": "TEXT",  "length": 50,  "alias": "OBTYPNAZEV"},
+        "DOK_NAZEV":  {"type": "TEXT",  "length": 255, "alias": "DOK_NAZEV"},
+        "ID_LOKAL":   {"type": "SHORT", "length": null, "alias": "ID_LOKAL"},
+        "OZNACENI":   {"type": "TEXT",  "length": 25,  "alias": "OZNACENI"},
+        "DRUH_UP":    {"type": "TEXT",  "length": 10,  "alias": "DRUH_UP"},
+        "DRUH_INFO":  {"type": "TEXT",  "length": 255, "alias": "DRUH_INFO"},
+        "PODTYP":     {"type": "TEXT",  "length": 255, "alias": "PODTYP"},
+        "DRUH_SC":    {"type": "TEXT",  "length": 10,  "alias": "DRUH_SC"},
+        "VYSKA_VB":   {"type": "TEXT",  "length": 10,  "alias": "VYSKA_VB"},
+        "VYSKA_VB_I": {"type": "TEXT",  "length": 255, "alias": "VYSKA_VB_I"},
+        "NP_MIN":     {"type": "SHORT", "length": null, "alias": "NP_MIN"},
+        "NP_MAX":     {"type": "SHORT", "length": null, "alias": "NP_MAX"},
+        "NPU_MAX":    {"type": "SHORT", "length": null, "alias": "NPU_MAX"},
+        "RIMSA_MIN":  {"type": "FLOAT", "length": null, "alias": "RIMSA_MIN"},
+        "RIMSA_MAX":  {"type": "FLOAT", "length": null, "alias": "RIMSA_MAX"},
+        "VYSKA_MAX":  {"type": "FLOAT", "length": null, "alias": "VYSKA_MAX"},
+        "bod":        {"type": "TEXT",  "length": 255, "alias": "bod"}
+    },
+
+    "height_attributes": [
+        "VYSKA_VB", "VYSKA_VB_I",
+        "NP_MIN", "NP_MAX", "NPU_MAX",
+        "RIMSA_MIN", "RIMSA_MAX",
+        "VYSKA_MAX"
+    ],
+
+    "output_layers": {
+        "Z_1011_ReseneUzemi": {
+            "SKNAZEV":    "metadata dokumentace",
+            "OBTYPNAZEV": "řešené území",
+            "ATTRS":       ["DOK_NAZEV", "ID_LOKAL"],
+            "TARGET_NAME": "1011_ReseneUzemi_p"
+        },
+        "Z_2011_UlicniCara": {
+            "SKNAZEV":    "členění území",
+            "OBTYPNAZEV": "uliční čára",
+            "ATTRS":       ["ID_LOKAL"],
+            "TARGET_NAME": "2011_UlicniCara_l"
+        },
+        "Z_2021_UlicniProstranstvi": {
+            "SKNAZEV":    "členění území",
+            "OBTYPNAZEV": "uliční prostranství",
+            "ATTRS":       ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"],
+            "TARGET_NAME": "2021_UlicniProstranstvi_p"
+        },
+        "Z_2031_StavebniBlok": {
+            "SKNAZEV":    "členění území",
+            "OBTYPNAZEV": "stavební blok",
+            "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+            "TARGET_NAME": "2031_StavebniBlok_p"
+        },
+        "Z_2041_NestavebniBlok": {
+            "SKNAZEV":    "členění území",
+            "OBTYPNAZEV": "nestavební blok",
+            "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+            "TARGET_NAME": "2041_NestavebniBlok_p"
+        },
+        "Z_2051_JinaCastUzemi": {
+            "SKNAZEV":    "členění území",
+            "OBTYPNAZEV": "jiná část území",
+            "ATTRS":       ["PODTYP", "OZNACENI", "ID_LOKAL"],
+            "TARGET_NAME": "2051_JinaCastUzemi_p"
+        },
+        "Z_3011_StavebniCara": {
+            "SKNAZEV":    "regulace struktury",
+            "OBTYPNAZEV": "stavební čára",
+            "ATTRS":       ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
+            "TARGET_NAME": "3011_StavebniCara_l"
+        },
+        "Z_3021_VyskovaRegulaceNaBod": {
+            "SKNAZEV":    "regulace struktury",
+            "OBTYPNAZEV": "výšková regulace na bod",
+            "ATTRS":       ["VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+                            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX", "ID_LOKAL"],
+            "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b"
+        },
+        "Z_3022_VyskovaRegulaceNaLinii": {
+            "SKNAZEV":    "regulace struktury",
+            "OBTYPNAZEV": "výšková regulace na linii",
+            "ATTRS":       ["VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+                            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX", "ID_LOKAL"],
+            "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l"
+        },
+        "Z_3023_VyskovaRegulaceNaPlochu": {
+            "SKNAZEV":    "regulace struktury",
+            "OBTYPNAZEV": "výšková regulace na plochu",
+            "ATTRS":       ["VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+                            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX", "ID_LOKAL"],
+            "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p"
+        },
+        "chyba_bod": {
+            "SKNAZEV":    "chyba",
+            "OBTYPNAZEV": "chyba bodu",
+            "ATTRS":       ["bod"],
+            "TARGET_NAME": "chyba_bod"
+        },
+        "chyba_resene_uzemi": {
+            "SKNAZEV":    "chyba",
+            "OBTYPNAZEV": "mimo řešené území",
+            "ATTRS":       [],
+            "TARGET_NAME": "chyba_resene_uzemi"
+        }
+    },
+
+    "domain_allowed_values": {
+        "DRUH_UP":  ["UL", "NM", "UP", "UPX"],
+        "DRUH_SC":  ["SCU", "SCPU", "SCO", "SCV", "SC", "SCX"],
+        "VYSKA_VB": ["ST", "CH", "BPV", "VBX"]
+    },
+
+    "domains": {
+        "DRUH_UP": {
+            "domain_name": "DRUH_ULICNIHO_PROSTRANSTVI",
+            "description": "Druh uličního prostranství dle GIS modelu",
+            "field_type": "TEXT",
+            "coded_values": {
+                "UL":  "ulice",
+                "NM":  "náměstí",
+                "UP":  "uliční prostranství bez rozlišení",
+                "UPX": "uliční prostranství jiné"
+            }
+        },
+        "DRUH_SC": {
+            "domain_name": "DRUH_STAVEBNI_CARY",
+            "description": "Druh stavební čáry dle GIS modelu",
+            "field_type": "TEXT",
+            "coded_values": {
+                "SCU":  "stavební čára uzavřená",
+                "SCPU": "stavební čára polouzavřená",
+                "SCO":  "stavební čára otevřená",
+                "SCV":  "stavební čára volná",
+                "SC":   "stavební čára bez rozlišení",
+                "SCX":  "stavební čára jiná"
+            }
+        },
+        "VYSKA_VB": {
+            "domain_name": "DRUH_VZTAZNEHO_BODU",
+            "description": "Druh vztažného bodu dle GIS modelu",
+            "field_type": "TEXT",
+            "coded_values": {
+                "ST":  "nejnižší bod přilehlého stávajícího terénu",
+                "CH":  "nejnižší bod přilehlého chodníku",
+                "BPV": "nula stupnice vodočtu Baltu po vyrovnání (Bpv)",
+                "VBX": "vztažný bod jiný"
+            }
+        }
+    }
+}

@@ -2,12 +2,50 @@
 import arcpy
 import os
 import re
+import json
 import datetime
 import shutil
 import tempfile
 
 _log_buffer = []  # Zachytává zprávy pro zápis do souboru
 _logging_active = False  # Zabraňuje dvojímu zápisu do _log_buffer při volání log_message
+_config_load_warning = None  # Zpráva pro execute() – arcpy.AddWarning nelze volat při importu modulu
+
+
+def _load_config(config_path=None):
+    """Načte konfiguraci datového modelu z JSON souboru.
+
+    Hledá ``madaspru_reseneuzemi_config.json`` ve stejné složce jako tento .pyt soubor.
+    Pokud soubor neexistuje nebo je poškozený, vrátí ``None`` a nástroj použije
+    hardcoded výchozí hodnoty definované níže.
+    POZOR: Tato funkce nesmí volat arcpy.AddWarning/AddMessage – je volána při
+    importu modulu, kdy arcpy message systém ještě není připraven.
+    """
+    global _config_load_warning
+    if config_path is None:
+        try:
+            config_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "madaspru_reseneuzemi_config.json"
+            )
+        except Exception:
+            return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as _f:
+            return json.load(_f)
+    except FileNotFoundError:
+        _config_load_warning = (
+            f"Konfigurační soubor nenalezen: {config_path}. "
+            "Používám výchozí (hardcoded) konfiguraci."
+        )
+        return None
+    except Exception as _e:
+        _config_load_warning = (
+            f"Chyba při načítání konfigurace ({config_path}): {_e}. "
+            "Používám výchozí (hardcoded) konfiguraci."
+        )
+        return None
+
 
 
 def write_log_file(log_path, buffer):
@@ -195,6 +233,165 @@ DOMAIN_MODEL_DEFINITIONS = {
         },
     },
 }
+
+# ---------------------------------------------------------------------------
+# GLOBÁLNÍ KONSTANTY DATOVÉHO MODELU – výchozí (hardcoded) hodnoty
+# Přepisují se konfiguračním souborem madaspru_reseneuzemi_config.json.
+# ---------------------------------------------------------------------------
+
+# Schéma polí: název -> (typ, délka, alias)
+FIELD_SCHEMA = {
+    "SKNAZEV":    ("TEXT",  50,   "SKNAZEV"),
+    "OBTYPNAZEV": ("TEXT",  50,   "OBTYPNAZEV"),
+    "DOK_NAZEV":  ("TEXT",  255,  "DOK_NAZEV"),
+    "ID_LOKAL":   ("SHORT", None, "ID_LOKAL"),
+    "OZNACENI":   ("TEXT",  25,   "OZNACENI"),
+    "DRUH_UP":    ("TEXT",  10,   "DRUH_UP"),
+    "DRUH_INFO":  ("TEXT",  255,  "DRUH_INFO"),
+    "PODTYP":     ("TEXT",  255,  "PODTYP"),
+    "DRUH_SC":    ("TEXT",  10,   "DRUH_SC"),
+    "VYSKA_VB":   ("TEXT",  10,   "VYSKA_VB"),
+    "VYSKA_VB_I": ("TEXT",  255,  "VYSKA_VB_I"),
+    "NP_MIN":     ("SHORT", None, "NP_MIN"),
+    "NP_MAX":     ("SHORT", None, "NP_MAX"),
+    "NPU_MAX":    ("SHORT", None, "NPU_MAX"),
+    "RIMSA_MIN":  ("FLOAT", None, "RIMSA_MIN"),
+    "RIMSA_MAX":  ("FLOAT", None, "RIMSA_MAX"),
+    "VYSKA_MAX":  ("FLOAT", None, "VYSKA_MAX"),
+    "bod":        ("TEXT",  255,  "bod"),
+}
+
+_VYSKOVA_REGULACE_ATTRS = [
+    "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+    "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
+]
+
+# Definice výstupních vrstev: klíč -> (SKNAZEV, OBTYPNAZEV, povolené atributy, cílový název)
+LAYER_DEFINITIONS = {
+    "Z_1011_ReseneUzemi": {
+        "SKNAZEV":    "metadata dokumentace",
+        "OBTYPNAZEV": "řešené území",
+        "ATTRS":       ["DOK_NAZEV", "ID_LOKAL"],
+        "TARGET_NAME": "1011_ReseneUzemi_p",
+    },
+    "Z_2011_UlicniCara": {
+        "SKNAZEV":    "členění území",
+        "OBTYPNAZEV": "uliční čára",
+        "ATTRS":       ["ID_LOKAL"],
+        "TARGET_NAME": "2011_UlicniCara_l",
+    },
+    "Z_2021_UlicniProstranstvi": {
+        "SKNAZEV":    "členění území",
+        "OBTYPNAZEV": "uliční prostranství",
+        "ATTRS":       ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"],
+        "TARGET_NAME": "2021_UlicniProstranstvi_p",
+    },
+    "Z_2031_StavebniBlok": {
+        "SKNAZEV":    "členění území",
+        "OBTYPNAZEV": "stavební blok",
+        "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+        "TARGET_NAME": "2031_StavebniBlok_p",
+    },
+    "Z_2041_NestavebniBlok": {
+        "SKNAZEV":    "členění území",
+        "OBTYPNAZEV": "nestavební blok",
+        "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+        "TARGET_NAME": "2041_NestavebniBlok_p",
+    },
+    "Z_2051_JinaCastUzemi": {
+        "SKNAZEV":    "členění území",
+        "OBTYPNAZEV": "jiná část území",
+        "ATTRS":       ["PODTYP", "OZNACENI", "ID_LOKAL"],
+        "TARGET_NAME": "2051_JinaCastUzemi_p",
+    },
+    "Z_3011_StavebniCara": {
+        "SKNAZEV":    "regulace struktury",
+        "OBTYPNAZEV": "stavební čára",
+        "ATTRS":       ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
+        "TARGET_NAME": "3011_StavebniCara_l",
+    },
+    "Z_3021_VyskovaRegulaceNaBod": {
+        "SKNAZEV":    "regulace struktury",
+        "OBTYPNAZEV": "výšková regulace na bod",
+        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b",
+    },
+    "Z_3022_VyskovaRegulaceNaLinii": {
+        "SKNAZEV":    "regulace struktury",
+        "OBTYPNAZEV": "výšková regulace na linii",
+        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l",
+    },
+    "Z_3023_VyskovaRegulaceNaPlochu": {
+        "SKNAZEV":    "regulace struktury",
+        "OBTYPNAZEV": "výšková regulace na plochu",
+        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p",
+    },
+    "chyba_bod": {
+        "SKNAZEV":    "chyba",
+        "OBTYPNAZEV": "chyba bodu",
+        "ATTRS":       ["bod"],
+        "TARGET_NAME": "chyba_bod",
+    },
+    "chyba_resene_uzemi": {
+        "SKNAZEV":    "chyba",
+        "OBTYPNAZEV": "mimo řešené území",
+        "ATTRS":       [],
+        "TARGET_NAME": "chyba_resene_uzemi",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# PŘEPSÁNÍ KONFIGURACE Z JSON (pokud existuje madaspru_reseneuzemi_config.json)
+# ---------------------------------------------------------------------------
+_CFG = _load_config()
+if _CFG is not None:
+    _fs = _CFG.get("field_schema")
+    if _fs is not None:
+        FIELD_SCHEMA = {
+            k: (v["type"], v.get("length"), v.get("alias", k))
+            for k, v in _fs.items()
+        }
+
+    _ol = _CFG.get("output_layers")
+    if _ol is not None:
+        LAYER_DEFINITIONS = dict(_ol)
+
+    _dav = _CFG.get("domain_allowed_values")
+    if _dav is not None:
+        DOMAIN_ALLOWED_VALUES = {k: set(v) for k, v in _dav.items()}
+
+    _domains = _CFG.get("domains")
+    if _domains is not None:
+        DOMAIN_MODEL_DEFINITIONS = dict(_domains)
+
+    del _fs, _ol, _dav, _domains  # vyčistit pomocné proměnné
+
+
+def process_output_layer(feature_class, layer_key, cad_file=None):
+    """Zpracuje výstupní vrstvu – finalizuje atributy podle datového modelu.
+
+    Tato funkce je veřejné API nástroje. Volá
+    ``CadFile.finalize_layer_attributes()`` přes dočasnou instanci třídy
+    (nebo přes předanou instanci ``cad_file``).
+
+    Args:
+        feature_class (str): Cesta k feature class (absolutní path v GDB).
+        layer_key (str): Klíč vrstvy z :data:`LAYER_DEFINITIONS`
+            (např. ``"Z_3011_StavebniCara"``).
+        cad_file (CadFile, optional): Existující instance pro zpracování.
+            Pokud není zadána, vytvoří se dočasná.
+    """
+    if layer_key not in LAYER_DEFINITIONS:
+        arcpy.AddWarning(
+            f"[process_output_layer] Neznámý klíč vrstvy '{layer_key}'. "
+            f"Dostupné klíče: {list(LAYER_DEFINITIONS.keys())}"
+        )
+        return
+    if cad_file is None:
+        cad_file = CadFile.__new__(CadFile)
+    cad_file.finalize_layer_attributes(feature_class, layer_key)
 
 
 def _get_root_gdb_path(feature_class):
@@ -1849,124 +2046,11 @@ class CadFile(object):
         """
         arcpy.AddMessage(f"[finalize_layer_attributes] Finalizuji atributy pro: {os.path.basename(feature_class)}")
         validation_report = []
-        
-        # --- 1. Definice metadat a schématu ---
-        
-        # Definice datových typů pro jednotlivé atributy
-        # (Název atributu) -> (Typ, Délka, Alias)
-        FIELD_SCHEMA = {
-            "SKNAZEV": ("TEXT", 50, "SKNAZEV"),
-            "OBTYPNAZEV": ("TEXT", 50, "OBTYPNAZEV"),
-            "DOK_NAZEV": ("TEXT", 255, "DOK_NAZEV"),
-            "ID_LOKAL": ("SHORT", None, "ID_LOKAL"),
-            "OZNACENI": ("TEXT", 25, "OZNACENI"),
-            "DRUH_UP": ("TEXT", 10, "DRUH_UP"),
-            "DRUH_INFO": ("TEXT", 255, "DRUH_INFO"),
-            "PODTYP": ("TEXT", 255, "PODTYP"),
-            "DRUH_SC": ("TEXT", 10, "DRUH_SC"),
-            
-            # Výškové atributy
-            "VYSKA_VB": ("TEXT", 10, "VYSKA_VB"),
-            "VYSKA_VB_I": ("TEXT", 255, "VYSKA_VB_I"),
-            "NP_MIN": ("SHORT", None, "NP_MIN"),
-            "NP_MAX": ("SHORT", None, "NP_MAX"),
-            "NPU_MAX": ("SHORT", None, "NPU_MAX"),
-            "RIMSA_MIN": ("FLOAT", None, "RIMSA_MIN"),
-            "RIMSA_MAX": ("FLOAT", None, "RIMSA_MAX"),
-            "VYSKA_MAX": ("FLOAT", None, "VYSKA_MAX"),
-            
-            # Chybové
-            "bod": ("TEXT", 255, "bod")
-        }
-        
-        # Slovník mapování: Název vrstvy (část) -> (SKNAZEV, OBTYPNAZEV, Seznam povolených atributů)
-        # Poznámka: ID_LOKAL je povinné u všech.
-        
-        # Společné atributy pro výškové regulace
-        VYSKOVA_REGULACE_ATTRS = [
-            "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX", 
-            "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"
-        ]
-        
-        # Společné atributy pro popis
-        COMMON_ATTRS = ["OZNACENI", "DOK_NAZEV"]
 
-        # Definice modelu
-        LAYER_DEFINITIONS = {
-            "Z_1011_ReseneUzemi": {
-                "SKNAZEV": "metadata dokumentace",
-                "OBTYPNAZEV": "řešené území",
-                "ATTRS": ["DOK_NAZEV", "ID_LOKAL"],
-                "TARGET_NAME": "1011_ReseneUzemi_p"
-            },
-            "Z_2011_UlicniCara": {
-                "SKNAZEV": "členění území",
-                "OBTYPNAZEV": "uliční čára",
-                "ATTRS": ["ID_LOKAL"],
-                "TARGET_NAME": "2011_UlicniCara_l"
-            },
-            "Z_2021_UlicniProstranstvi": {
-                "SKNAZEV": "členění území",
-                "OBTYPNAZEV": "uliční prostranství",
-                "ATTRS": ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"],
-                "TARGET_NAME": "2021_UlicniProstranstvi_p"
-            },
-            "Z_2031_StavebniBlok": {
-                "SKNAZEV": "členění území",
-                "OBTYPNAZEV": "stavební blok",
-                "ATTRS": ["OZNACENI", "ID_LOKAL"],
-                "TARGET_NAME": "2031_StavebniBlok_p"
-            },
-            "Z_2041_NestavebniBlok": {
-                "SKNAZEV": "členění území",
-                "OBTYPNAZEV": "nestavební blok",
-                "ATTRS": ["OZNACENI", "ID_LOKAL"],
-                "TARGET_NAME": "2041_NestavebniBlok_p"
-            },
-            "Z_2051_JinaCastUzemi": {
-                "SKNAZEV": "členění území",
-                "OBTYPNAZEV": "jiná část území",
-                "ATTRS": ["PODTYP", "OZNACENI", "ID_LOKAL"],
-                "TARGET_NAME": "2051_JinaCastUzemi_p"
-            },
-            "Z_3011_StavebniCara": {
-                "SKNAZEV": "regulace struktury",
-                "OBTYPNAZEV": "stavební čára",
-                "ATTRS": ["DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
-                "TARGET_NAME": "3011_StavebniCara_l"
-            },
-            "Z_3021_VyskovaRegulaceNaBod": {
-                "SKNAZEV": "regulace struktury",
-                "OBTYPNAZEV": "výšková regulace na bod",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
-                "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b"
-            },
-             "Z_3022_VyskovaRegulaceNaLinii": {
-                "SKNAZEV": "regulace struktury",
-                "OBTYPNAZEV": "výšková regulace na linii",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
-                "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l"
-            },
-            "Z_3023_VyskovaRegulaceNaPlochu": {
-                "SKNAZEV": "regulace struktury",
-                "OBTYPNAZEV": "výšková regulace na plochu",
-                "ATTRS": VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
-                "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p"
-            },
-            "chyba_bod": {
-                "SKNAZEV": "chyba",
-                "OBTYPNAZEV": "chyba bodu",
-                "ATTRS": ["bod"],
-                "TARGET_NAME": "chyba_bod"
-            },
-            "chyba_resene_uzemi": {
-                "SKNAZEV": "chyba",
-                "OBTYPNAZEV": "mimo řešené území",
-                "ATTRS": [],
-                "TARGET_NAME": "chyba_resene_uzemi"
-            }
-        }
-        
+        # --- 1. Schéma a definice vrstev jsou načteny z globálních konstant ---
+        # (FIELD_SCHEMA a LAYER_DEFINITIONS jsou definovány na úrovni modulu;
+        #  lze je přepsat souborem madaspru_reseneuzemi_config.json)
+
         # --- 2. Identifikace typu vrstvy podle názvu ---
         current_def = None
         found_key = None
@@ -2614,6 +2698,10 @@ class ExportLayer(object):
 
         arcpy.AddMessage = _patched_msg
         arcpy.AddWarning = _patched_warn
+
+        # Emit deferred configuration warning (arcpy nelze volat při importu modulu)
+        if _config_load_warning is not None:
+            arcpy.AddWarning(_config_load_warning)
 
         arcpy.env.overwriteOutput = True
         
