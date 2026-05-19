@@ -2,11 +2,41 @@
 import arcpy
 import os
 import re
+import json
 import datetime
 import shutil
 import tempfile
 
 _log_buffer = []  # Zachytává zprávy log_message() pro zápis do souboru
+
+
+def _load_config(config_path=None):
+    """Načte konfiguraci datového modelu z JSON souboru.
+
+    Hledá ``madaspru_vysky_config.json`` ve stejné složce jako tento .pyt soubor.
+    Pokud soubor neexistuje nebo je poškozený, vrátí ``None`` a nástroj použije
+    hardcoded výchozí hodnoty definované níže.
+    """
+    if config_path is None:
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "madaspru_vysky_config.json"
+        )
+    try:
+        with open(config_path, "r", encoding="utf-8") as _f:
+            return json.load(_f)
+    except FileNotFoundError:
+        arcpy.AddWarning(
+            f"Konfigurační soubor nenalezen: {config_path}. "
+            "Používám výchozí (hardcoded) konfiguraci."
+        )
+        return None
+    except Exception as _e:
+        arcpy.AddWarning(
+            f"Chyba při načítání konfigurace ({config_path}): {_e}. "
+            "Používám výchozí (hardcoded) konfiguraci."
+        )
+        return None
 
 
 def write_log_file(log_path, buffer):
@@ -28,6 +58,11 @@ DEFAULT_LAYERS = [
     "302211_PL_VR_na_linii_rozhrani"
 ]
 
+# ---------------------------------------------------------------------------
+# VÝCHOZÍ (HARDCODED) KONFIGURACE DATOVÉHO MODELU
+# Hodnoty níže slouží jako fallback pokud nelze načíst madaspru_vysky_config.json.
+# ---------------------------------------------------------------------------
+
 # Výškové atributy pro dissolve a přenos (VYSKOVA_REGULACE_SPOLECNE_ATRIBUTY)
 HEIGHT_ATTRIBUTES = [
     "VYSKA_VB", "VYSKA_VB_I",
@@ -37,61 +72,61 @@ HEIGHT_ATTRIBUTES = [
 ]
 
 VR_ATTRIBUTE_SOURCE_ALIASES = {
-    "VYSKA_VB": ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB", "VYSKA_VB_D"],
+    "VYSKA_VB":   ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB", "VYSKA_VB_D"],
     "VYSKA_VB_I": ["VYSKA_VBI", "VYSKAVBI", "VR_VYSKA_VB_I", "VR_VYSKA_VBI", "VYSKA VB I"],
-    "NP_MIN": ["MIN_NP", "NPMIN", "VR_NP_MIN", "VR_NPMIN", "NP MIN"],
-    "NP_MAX": ["MAX_NP", "NPMAX", "VR_NP_MAX", "VR_NPMAX", "NP MAX"],
-    "NPU_MAX": ["NUP_MAX", "NPUMAX", "NUPMAX", "VR_NPU_MAX", "VR_NUP_MAX", "MAX_NPU", "MAX_NUP", "NPU MAX", "NUP MAX"],
-    "RIMSA_MIN": ["MIN_RIMSA", "RIMSAMIN", "VR_RIMSA_MIN", "VR_RIMSAMIN", "RIMSA MIN", "RIMSA"],
-    "RIMSA_MAX": ["MAX_RIMSA", "RIMSAMAX", "VR_RIMSA_MAX", "VR_RIMSAMAX", "RIMSA MAX"],
-    "VYSKA_MAX": ["MAX_VYSKA", "VYSKAMAX", "VR_VYSKA_MAX", "VR_VYSKAMAX", "VYSKA MAX", "VYSKA", "VYSKA_TOTAL", "VYSKA_CELKEM"],
+    "NP_MIN":     ["MIN_NP", "NPMIN", "VR_NP_MIN", "VR_NPMIN", "NP MIN"],
+    "NP_MAX":     ["MAX_NP", "NPMAX", "VR_NP_MAX", "VR_NPMAX", "NP MAX"],
+    "NPU_MAX":    ["NUP_MAX", "NPUMAX", "NUPMAX", "VR_NPU_MAX", "VR_NUP_MAX", "MAX_NPU", "MAX_NUP", "NPU MAX", "NUP MAX"],
+    "RIMSA_MIN":  ["MIN_RIMSA", "RIMSAMIN", "VR_RIMSA_MIN", "VR_RIMSAMIN", "RIMSA MIN", "RIMSA"],
+    "RIMSA_MAX":  ["MAX_RIMSA", "RIMSAMAX", "VR_RIMSA_MAX", "VR_RIMSAMAX", "RIMSA MAX"],
+    "VYSKA_MAX":  ["MAX_VYSKA", "VYSKAMAX", "VR_VYSKA_MAX", "VR_VYSKAMAX", "VYSKA MAX", "VYSKA", "VYSKA_TOTAL", "VYSKA_CELKEM"],
 }
 
 FIELD_SCHEMA = {
-    "SKNAZEV": ("TEXT", 50),
-    "OBTYPNAZEV": ("TEXT", 50),
-    "ID_LOKAL": ("SHORT", None),
-    "DRUH_SC": ("TEXT", 10),
-    "DRUH_INFO": ("TEXT", 255),
-    "VYSKA_VB": ("TEXT", 10),
-    "VYSKA_VB_I": ("TEXT", 255),
-    "NP_MIN": ("SHORT", None),
-    "NP_MAX": ("SHORT", None),
-    "NPU_MAX": ("SHORT", None),
-    "RIMSA_MIN": ("FLOAT", None),
-    "RIMSA_MAX": ("FLOAT", None),
-    "VYSKA_MAX": ("FLOAT", None),
+    "SKNAZEV":    ("TEXT",  50),
+    "OBTYPNAZEV": ("TEXT",  50),
+    "ID_LOKAL":   ("SHORT", None),
+    "DRUH_SC":    ("TEXT",  10),
+    "DRUH_INFO":  ("TEXT",  255),
+    "VYSKA_VB":   ("TEXT",  10),
+    "VYSKA_VB_I": ("TEXT",  255),
+    "NP_MIN":     ("SHORT", None),
+    "NP_MAX":     ("SHORT", None),
+    "NPU_MAX":    ("SHORT", None),
+    "RIMSA_MIN":  ("FLOAT", None),
+    "RIMSA_MAX":  ("FLOAT", None),
+    "VYSKA_MAX":  ("FLOAT", None),
 }
 
 LAYER_MODEL_RULES = {
     "Z_3011_StavebniCara_l": {
         "constants": {
-            "SKNAZEV": "regulace struktury",
+            "SKNAZEV":    "regulace struktury",
             "OBTYPNAZEV": "stavební čára",
         },
         "required": ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "ID_LOKAL"],
-        "allowed": ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
+        "allowed":  ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "DRUH_INFO", "ID_LOKAL"],
     },
     "Z_3021_VyskovaRegulaceNaBod_b": {
         "constants": {
-            "SKNAZEV": "regulace struktury",
+            "SKNAZEV":    "regulace struktury",
             "OBTYPNAZEV": "výšková regulace na bod",
         },
         "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
-        "allowed": ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
+        "allowed":  ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
     },
     "Z_3022_VyskovaRegulaceNaLinii_l": {
         "constants": {
-            "SKNAZEV": "regulace struktury",
+            "SKNAZEV":    "regulace struktury",
             "OBTYPNAZEV": "výšková regulace na linii",
         },
         "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
-        "allowed": ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
+        "allowed":  ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL"] + HEIGHT_ATTRIBUTES,
     },
 }
 
 DOMAIN_ALLOWED_VALUES = {
-    "DRUH_SC": {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
+    "DRUH_SC":  {"SCU", "SCPU", "SCO", "SCV", "SC", "SCX"},
     "VYSKA_VB": {"ST", "CH", "BPV", "VBX"},
 }
 
@@ -101,12 +136,12 @@ DOMAIN_MODEL_DEFINITIONS = {
         "description": "Druh stavební čáry dle GIS modelu",
         "field_type": "TEXT",
         "coded_values": {
-            "SCU": "stavební čára uzavřená",
+            "SCU":  "stavební čára uzavřená",
             "SCPU": "stavební čára polouzavřená",
-            "SCO": "stavební čára otevřená",
-            "SCV": "stavební čára volná",
-            "SC": "stavební čára bez rozlišení",
-            "SCX": "stavební čára jiná",
+            "SCO":  "stavební čára otevřená",
+            "SCV":  "stavební čára volná",
+            "SC":   "stavební čára bez rozlišení",
+            "SCX":  "stavební čára jiná",
         },
     },
     "VYSKA_VB": {
@@ -114,8 +149,8 @@ DOMAIN_MODEL_DEFINITIONS = {
         "description": "Druh vztažného bodu dle GIS modelu",
         "field_type": "TEXT",
         "coded_values": {
-            "ST": "nejnižší bod přilehlého stávajícího terénu",
-            "CH": "nejnižší bod přilehlého chodníku",
+            "ST":  "nejnižší bod přilehlého stávajícího terénu",
+            "CH":  "nejnižší bod přilehlého chodníku",
             "BPV": "nula stupnice vodočtu Baltu po vyrovnání (Bpv)",
             "VBX": "vztažný bod jiný",
         },
@@ -133,6 +168,48 @@ SC_DRUH_MAPPING = {
     "301114": "SC",    # stavební čára bez rozlišení
     "301115": "SCX",   # stavební čára jiná
 }
+
+# ---------------------------------------------------------------------------
+# PŘEPSÁNÍ KONFIGURACE Z JSON (pokud existuje madaspru_vysky_config.json)
+# Zpracovatel může přidat/upravit výstupní vrstvu pouze úpravou JSON souboru,
+# bez zásahu do kódu tohoto toolboxu.
+# ---------------------------------------------------------------------------
+_CFG = _load_config()
+if _CFG is not None:
+    _ha = _CFG.get("height_attributes")
+    if _ha is not None:
+        HEIGHT_ATTRIBUTES = list(_ha)
+
+    _aliases = _CFG.get("vr_attribute_aliases")
+    if _aliases is not None:
+        VR_ATTRIBUTE_SOURCE_ALIASES = dict(_aliases)
+
+    _fs = _CFG.get("field_schema")
+    if _fs is not None:
+        FIELD_SCHEMA = {k: (v["type"], v.get("length")) for k, v in _fs.items()}
+
+    _ol = _CFG.get("output_layers")
+    if _ol is not None:
+        LAYER_MODEL_RULES = dict(_ol)
+
+    _dav = _CFG.get("domain_allowed_values")
+    if _dav is not None:
+        DOMAIN_ALLOWED_VALUES = {k: set(v) for k, v in _dav.items()}
+
+    _domains = _CFG.get("domains")
+    if _domains is not None:
+        DOMAIN_MODEL_DEFINITIONS = dict(_domains)
+
+    _sc = _CFG.get("sc_druh_mapping")
+    if _sc is not None:
+        SC_DRUH_MAPPING = dict(_sc)
+
+    _tol = _CFG.get("processing", {}).get("nocad_vr_tolerance_meters")
+    if _tol is not None:
+        NOCAD_VR_ASSIGN_TOLERANCE_METERS = float(_tol)
+
+    del _ha, _aliases, _fs, _ol, _dav, _domains, _sc, _tol  # vyčistit pomocné proměnné
+
 
 def get_druh_sc_from_sc_type(sc_type):
     """Vrátí kód DRUH_SC na základě názvu SC_TYPE (číslo vrstvy je prefix)."""
@@ -734,6 +811,20 @@ def finalize_vyska_output_attributes(feature_class, layer_model_key, keep_prefix
                         changed = True
                 if changed:
                     cursor.updateRow(row)
+
+
+def process_output_layer(feature_class, layer_key, keep_prefixes=None):
+    """Obecná funkce pro zpracování libovolné výstupní vrstvy dle konfigurace.
+
+    Zpracovatel přidá nový typ výstupní vrstvy pouze do ``madaspru_vysky_config.json``
+    (sekce ``output_layers``) — kód toolboxu se nemusí měnit.
+
+    Args:
+        feature_class (str): Cesta k feature class v geodatabázi.
+        layer_key (str): Klíč vrstvy v konfiguraci (např. ``"Z_3022_VyskovaRegulaceNaLinii_l"``).
+        keep_prefixes (list, optional): Prefixové výjimky — pole s tímto prefixem se neodstraní.
+    """
+    finalize_vyska_output_attributes(feature_class, layer_key, keep_prefixes)
 
 
 def get_model_height_attributes(fields):

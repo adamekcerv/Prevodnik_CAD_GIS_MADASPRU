@@ -1,0 +1,114 @@
+{
+    "_comment": "Konfigurace datového modelu pro nástroj Výšková regulace (Prevodnik_CAD_GIS_Vysky.pyt).",
+    "_version": "1.0",
+
+    "height_attributes": [
+        "VYSKA_VB", "VYSKA_VB_I",
+        "NP_MIN", "NP_MAX", "NPU_MAX",
+        "RIMSA_MIN", "RIMSA_MAX",
+        "VYSKA_MAX"
+    ],
+
+    "vr_attribute_aliases": {
+        "VYSKA_VB":   ["VYSKAVB", "VR_VYSKA_VB", "VR_VYSKAVB", "VYSKA VB", "VYSKA_VB_D"],
+        "VYSKA_VB_I": ["VYSKA_VBI", "VYSKAVBI", "VR_VYSKA_VB_I", "VR_VYSKA_VBI", "VYSKA VB I"],
+        "NP_MIN":     ["MIN_NP", "NPMIN", "VR_NP_MIN", "VR_NPMIN", "NP MIN"],
+        "NP_MAX":     ["MAX_NP", "NPMAX", "VR_NP_MAX", "VR_NPMAX", "NP MAX"],
+        "NPU_MAX":    ["NUP_MAX", "NPUMAX", "NUPMAX", "VR_NPU_MAX", "VR_NUP_MAX", "MAX_NPU", "MAX_NUP", "NPU MAX", "NUP MAX"],
+        "RIMSA_MIN":  ["MIN_RIMSA", "RIMSAMIN", "VR_RIMSA_MIN", "VR_RIMSAMIN", "RIMSA MIN", "RIMSA"],
+        "RIMSA_MAX":  ["MAX_RIMSA", "RIMSAMAX", "VR_RIMSA_MAX", "VR_RIMSAMAX", "RIMSA MAX"],
+        "VYSKA_MAX":  ["MAX_VYSKA", "VYSKAMAX", "VR_VYSKA_MAX", "VR_VYSKAMAX", "VYSKA MAX", "VYSKA", "VYSKA_TOTAL", "VYSKA_CELKEM"]
+    },
+
+    "field_schema": {
+        "SKNAZEV":    {"type": "TEXT",  "length": 50},
+        "OBTYPNAZEV": {"type": "TEXT",  "length": 50},
+        "ID_LOKAL":   {"type": "SHORT", "length": null},
+        "DRUH_SC":    {"type": "TEXT",  "length": 10},
+        "DRUH_INFO":  {"type": "TEXT",  "length": 255},
+        "VYSKA_VB":   {"type": "TEXT",  "length": 10},
+        "VYSKA_VB_I": {"type": "TEXT",  "length": 255},
+        "NP_MIN":     {"type": "SHORT", "length": null},
+        "NP_MAX":     {"type": "SHORT", "length": null},
+        "NPU_MAX":    {"type": "SHORT", "length": null},
+        "RIMSA_MIN":  {"type": "FLOAT", "length": null},
+        "RIMSA_MAX":  {"type": "FLOAT", "length": null},
+        "VYSKA_MAX":  {"type": "FLOAT", "length": null}
+    },
+
+    "domain_allowed_values": {
+        "DRUH_SC":  ["SCU", "SCPU", "SCO", "SCV", "SC", "SCX"],
+        "VYSKA_VB": ["ST", "CH", "BPV", "VBX"]
+    },
+
+    "domains": {
+        "DRUH_SC": {
+            "domain_name": "DRUH_STAVEBNI_CARY",
+            "description": "Druh stavební čáry dle GIS modelu",
+            "field_type": "TEXT",
+            "coded_values": {
+                "SCU":  "stavební čára uzavřená",
+                "SCPU": "stavební čára polouzavřená",
+                "SCO":  "stavební čára otevřená",
+                "SCV":  "stavební čára volná",
+                "SC":   "stavební čára bez rozlišení",
+                "SCX":  "stavební čára jiná"
+            }
+        },
+        "VYSKA_VB": {
+            "domain_name": "DRUH_VZTAZNEHO_BODU",
+            "description": "Druh vztažného bodu dle GIS modelu",
+            "field_type": "TEXT",
+            "coded_values": {
+                "ST":  "nejnižší bod přilehlého stávajícího terénu",
+                "CH":  "nejnižší bod přilehlého chodníku",
+                "BPV": "nula stupnice vodočtu Baltu po vyrovnání (Bpv)",
+                "VBX": "vztažný bod jiný"
+            }
+        }
+    },
+
+    "output_layers": {
+        "Z_3011_StavebniCara_l": {
+            "constants": {
+                "SKNAZEV":    "regulace struktury",
+                "OBTYPNAZEV": "stavební čára"
+            },
+            "required": ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "ID_LOKAL"],
+            "allowed":  ["SKNAZEV", "OBTYPNAZEV", "DRUH_SC", "DRUH_INFO", "ID_LOKAL"]
+        },
+        "Z_3021_VyskovaRegulaceNaBod_b": {
+            "constants": {
+                "SKNAZEV":    "regulace struktury",
+                "OBTYPNAZEV": "výšková regulace na bod"
+            },
+            "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
+            "allowed":  ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL",
+                         "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+                         "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"]
+        },
+        "Z_3022_VyskovaRegulaceNaLinii_l": {
+            "constants": {
+                "SKNAZEV":    "regulace struktury",
+                "OBTYPNAZEV": "výšková regulace na linii"
+            },
+            "required": ["SKNAZEV", "OBTYPNAZEV", "VYSKA_VB", "ID_LOKAL"],
+            "allowed":  ["SKNAZEV", "OBTYPNAZEV", "ID_LOKAL",
+                         "VYSKA_VB", "VYSKA_VB_I", "NP_MIN", "NP_MAX", "NPU_MAX",
+                         "RIMSA_MIN", "RIMSA_MAX", "VYSKA_MAX"]
+        }
+    },
+
+    "sc_druh_mapping": {
+        "301110": "SCU",
+        "301111": "SCPU",
+        "301112": "SCO",
+        "301113": "SCV",
+        "301114": "SC",
+        "301115": "SCX"
+    },
+
+    "processing": {
+        "nocad_vr_tolerance_meters": 0.30
+    }
+}
