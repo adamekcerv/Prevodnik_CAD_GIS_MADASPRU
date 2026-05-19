@@ -283,25 +283,25 @@ LAYER_DEFINITIONS = {
     "Z_2021_UlicniProstranstvi": {
         "SKNAZEV":    "členění území",
         "OBTYPNAZEV": "uliční prostranství",
-        "ATTRS":       ["DRUH_UP", "DRUH_INFO", "OZNACENI", "ID_LOKAL"],
+        "ATTRS":       ["DRUH_UP", "DRUH_INFO", "ID_LOKAL", "OZNACENI"],
         "TARGET_NAME": "2021_UlicniProstranstvi_p",
     },
     "Z_2031_StavebniBlok": {
         "SKNAZEV":    "členění území",
         "OBTYPNAZEV": "stavební blok",
-        "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+        "ATTRS":       ["ID_LOKAL", "OZNACENI"],
         "TARGET_NAME": "2031_StavebniBlok_p",
     },
     "Z_2041_NestavebniBlok": {
         "SKNAZEV":    "členění území",
         "OBTYPNAZEV": "nestavební blok",
-        "ATTRS":       ["OZNACENI", "ID_LOKAL"],
+        "ATTRS":       ["ID_LOKAL", "OZNACENI"],
         "TARGET_NAME": "2041_NestavebniBlok_p",
     },
     "Z_2051_JinaCastUzemi": {
         "SKNAZEV":    "členění území",
         "OBTYPNAZEV": "jiná část území",
-        "ATTRS":       ["PODTYP", "OZNACENI", "ID_LOKAL"],
+        "ATTRS":       ["PODTYP", "ID_LOKAL", "OZNACENI"],
         "TARGET_NAME": "2051_JinaCastUzemi_p",
     },
     "Z_3011_StavebniCara": {
@@ -313,19 +313,19 @@ LAYER_DEFINITIONS = {
     "Z_3021_VyskovaRegulaceNaBod": {
         "SKNAZEV":    "regulace struktury",
         "OBTYPNAZEV": "výšková regulace na bod",
-        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "ATTRS":       ["ID_LOKAL"] + _VYSKOVA_REGULACE_ATTRS,
         "TARGET_NAME": "3021_VyskovaRegulaceNaBod_b",
     },
     "Z_3022_VyskovaRegulaceNaLinii": {
         "SKNAZEV":    "regulace struktury",
         "OBTYPNAZEV": "výšková regulace na linii",
-        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "ATTRS":       ["ID_LOKAL"] + _VYSKOVA_REGULACE_ATTRS,
         "TARGET_NAME": "3022_VyskovaRegulaceNaLinii_l",
     },
     "Z_3023_VyskovaRegulaceNaPlochu": {
         "SKNAZEV":    "regulace struktury",
         "OBTYPNAZEV": "výšková regulace na plochu",
-        "ATTRS":       _VYSKOVA_REGULACE_ATTRS + ["ID_LOKAL"],
+        "ATTRS":       ["ID_LOKAL"] + _VYSKOVA_REGULACE_ATTRS,
         "TARGET_NAME": "3023_VyskovaRegulaceNaPlochu_p",
     },
     "chyba_bod": {
